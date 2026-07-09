@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { choosePipeline, ModelTierSchema, RiskLevelSchema, RuntimeContextSchema, WorkerFindingSchema } from './zenos-runtime';
+import { loadRuntimeSessionsFromDisk, runtimeFileStoreInfo, saveRuntimeSessionsToDisk } from './zenos-runtime-file-store';
 
 export const AgentRoleSchema = z.enum(['host', 'boss', 'worker']);
 export const WorkerEventTypeSchema = z.enum(['progress', 'finding', 'risk', 'conflict', 'tool_result', 'done', 'error']);
@@ -96,6 +97,17 @@ export type BossDecision = z.infer<typeof BossDecisionSchema>;
 export type QualityGateResult = z.infer<typeof QualityGateResultSchema>;
 
 const sessions = new Map<string, RuntimeSessionState>();
+let loadedStore = false;
+
+function loadStore(): void {
+  if (loadedStore) return;
+  loadedStore = true;
+  for (const session of loadRuntimeSessionsFromDisk()) sessions.set(session.sessionId, session);
+}
+
+function saveStore(): void {
+  saveRuntimeSessionsToDisk([...sessions.values()]);
+}
 
 function now(): string {
   return new Date().toISOString();
@@ -120,6 +132,7 @@ export const workerTemplates = {
 } as const;
 
 export function createRuntimeSession(input: z.input<typeof RuntimeContextSchema>): RuntimeSessionState {
+  loadStore();
   const context = RuntimeContextSchema.parse(input);
   const decision = choosePipeline(context);
   const started = now();
@@ -145,18 +158,22 @@ export function createRuntimeSession(input: z.input<typeof RuntimeContextSchema>
     updatedAt: started,
   });
   sessions.set(session.sessionId, session);
+  saveStore();
   return session;
 }
 
 export function getRuntimeSession(sessionId: string): RuntimeSessionState | undefined {
+  loadStore();
   return sessions.get(sessionId);
 }
 
 export function listRuntimeSessions(): RuntimeSessionState[] {
+  loadStore();
   return [...sessions.values()].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
 
 export function dispatchWorker(sessionId: string, templateName: keyof typeof workerTemplates, task: string): RuntimeSessionState {
+  loadStore();
   const session = sessions.get(sessionId);
   if (!session) throw new Error('Runtime session not found');
   const template = workerTemplates[templateName];
@@ -175,10 +192,12 @@ export function dispatchWorker(sessionId: string, templateName: keyof typeof wor
     updatedAt: now(),
   });
   sessions.set(sessionId, updated);
+  saveStore();
   return updated;
 }
 
 export function recordWorkerEvent(input: z.input<typeof WorkerEventSchema>): RuntimeSessionState {
+  loadStore();
   const event = WorkerEventSchema.parse({ ...input, createdAt: input.createdAt || now() });
   const session = sessions.get(event.sessionId);
   if (!session) throw new Error('Runtime session not found');
@@ -198,6 +217,7 @@ export function recordWorkerEvent(input: z.input<typeof WorkerEventSchema>): Run
     updatedAt: now(),
   });
   sessions.set(event.sessionId, updated);
+  saveStore();
   return updated;
 }
 
@@ -219,6 +239,7 @@ export function runQualityGate(input: z.input<typeof QualityGateInputSchema>): Q
 }
 
 export function buildEscalationPacket(sessionId: string, hostAssessment = 'Host requests Boss review.'): EscalationPacket {
+  loadStore();
   const session = sessions.get(sessionId);
   if (!session) throw new Error('Runtime session not found');
   const triggeringEvents = session.events.filter((event) => event.needsBoss || event.severity === 'high' || event.severity === 'critical' || event.type === 'conflict' || event.type === 'risk');
@@ -238,6 +259,7 @@ export function buildEscalationPacket(sessionId: string, hostAssessment = 'Host 
 }
 
 export function applyBossDecision(sessionId: string, decisionInput: z.input<typeof BossDecisionSchema>): RuntimeSessionState {
+  loadStore();
   const decision = BossDecisionSchema.parse(decisionInput);
   const session = sessions.get(sessionId);
   if (!session) throw new Error('Runtime session not found');
@@ -264,7 +286,23 @@ export function applyBossDecision(sessionId: string, decisionInput: z.input<type
     updatedAt: now(),
   });
   sessions.set(sessionId, updated);
+  saveStore();
   return updated;
+}
+
+export function completeRuntimeSession(sessionId: string): RuntimeSessionState {
+  loadStore();
+  const session = sessions.get(sessionId);
+  if (!session) throw new Error('Runtime session not found');
+  const updated = RuntimeSessionStateSchema.parse({ ...session, status: 'done', updatedAt: now() });
+  sessions.set(sessionId, updated);
+  saveStore();
+  return updated;
+}
+
+export function runtimeStoreInfo() {
+  loadStore();
+  return { ...runtimeFileStoreInfo(), sessions: sessions.size };
 }
 
 export function getRuntimeModels() {

@@ -494,6 +494,7 @@ export function runtimeReadinessReport(): RuntimeReadinessReport {
       '/api/runtime/boss-review',
       '/api/runtime/quality-gate',
       '/api/runtime/models',
+      '/api/runtime/stream/[sessionId]',
     ],
   });
 }

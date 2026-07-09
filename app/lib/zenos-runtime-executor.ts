@@ -208,7 +208,7 @@ export function getRuntimeModelConfigSummary() {
   };
 }
 
-async function callRuntimeModel(
+export async function callRuntimeModel(
   role: RuntimeModelRole,
   messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
   options: { json?: boolean; maxTokens?: number } = {},
@@ -281,6 +281,18 @@ async function callRuntimeModel(
       error: message,
     };
   }
+}
+
+
+export async function runBossReviewModel(packet: unknown): Promise<RuntimeModelResult> {
+  return callRuntimeModel('host', [
+    {
+      role: 'system',
+      content: `You are the premium Zenos Boss Agent. Review only the escalation packet.
+Return concise JSON: {"verdict":"approve|revise|block|ask_user|delegate","confidence":0.0,"reasoningSummary":"...","requiredChanges":["..."],"allowedActions":["..."],"forbiddenActions":["..."]}`,
+    },
+    { role: 'user', content: JSON.stringify(packet, null, 2) },
+  ], { json: true, maxTokens: 900 });
 }
 
 function compactSourceContext(input: z.infer<typeof RuntimeRunRequestSchema>): string {

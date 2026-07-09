@@ -26,6 +26,8 @@ const {
   buildEscalationPacket,
   applyBossDecision,
   getRuntimeModels,
+  runtimeStoreInfo,
+  completeRuntimeSession,
 } = await import(threeAgentPath);
 
 const cases = [
@@ -181,6 +183,12 @@ assert.equal(afterBoss.status, 'working');
 const runtimeModels = getRuntimeModels();
 assert.equal(runtimeModels.roles.length, 3);
 assert.ok(runtimeModels.workerTemplates.coding_brief);
+
+const completed = completeRuntimeSession(session.sessionId);
+assert.equal(completed.status, 'done');
+const storeInfo = runtimeStoreInfo();
+assert.equal(typeof storeInfo.durable, 'boolean');
+assert.ok(storeInfo.sessions >= 1);
 
 const modelSummary = getRuntimeModelConfigSummary();
 assert.ok(modelSummary.hostModel, 'host model should resolve from env or Hermes config');
