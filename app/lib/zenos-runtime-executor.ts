@@ -2,6 +2,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { z } from 'zod';
+import { readRuntimeModelSlots } from './zenos-runtime-model-config';
 import {
   buildRouteEvent,
   choosePipeline,
@@ -137,7 +138,7 @@ function loadHermesModelConfig(): HermesModelConfig {
   };
 }
 
-function readRuntimeOverrideConfig(): Partial<HermesModelConfig> {
+export function readRuntimeOverrideConfig(): Partial<HermesModelConfig> {
   const explicit = process.env.ZENOS_RUNTIME_CONFIG_PATH;
   const candidates = [
     explicit,
@@ -159,14 +160,14 @@ function readRuntimeOverrideConfig(): Partial<HermesModelConfig> {
 
 function runtimeModelConfig(): HermesModelConfig {
   const hermes = loadHermesModelConfig();
-  const override = readRuntimeOverrideConfig();
+  const override = { ...readRuntimeModelSlots(), ...readRuntimeOverrideConfig() };
   return {
     baseUrl: process.env.ZENOS_LLM_BASE_URL || process.env.MEMORY_LLM_BASE_URL || override.baseUrl || hermes.baseUrl,
     apiKey: process.env.ZENOS_LLM_API_KEY || process.env.MEMORY_LLM_API_KEY || override.apiKey || hermes.apiKey,
-    hostModel: process.env.ZENOS_HOST_MODEL || process.env.MEMORY_LLM_MODEL || override.hostModel || hermes.hostModel,
-    workerModel: process.env.ZENOS_WORKER_MODEL || process.env.MEMORY_LLM_FALLBACK_MODEL || override.workerModel || hermes.workerModel,
-    bossModel: process.env.ZENOS_BOSS_MODEL || process.env.ZENOS_HOST_MODEL || process.env.MEMORY_LLM_MODEL || override.bossModel || hermes.bossModel || hermes.hostModel,
-    verifierModel: process.env.ZENOS_VERIFIER_MODEL || process.env.MEMORY_LLM_FALLBACK_MODEL || override.verifierModel || hermes.verifierModel,
+    hostModel: override.hostModel || process.env.ZENOS_HOST_MODEL || process.env.MEMORY_LLM_MODEL || hermes.hostModel,
+    workerModel: override.workerModel || process.env.ZENOS_WORKER_MODEL || process.env.MEMORY_LLM_FALLBACK_MODEL || hermes.workerModel,
+    bossModel: override.bossModel || process.env.ZENOS_BOSS_MODEL || process.env.ZENOS_HOST_MODEL || process.env.MEMORY_LLM_MODEL || hermes.bossModel || hermes.hostModel,
+    verifierModel: override.verifierModel || process.env.ZENOS_VERIFIER_MODEL || process.env.MEMORY_LLM_FALLBACK_MODEL || hermes.verifierModel,
   };
 }
 

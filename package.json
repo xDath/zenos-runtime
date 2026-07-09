@@ -10,7 +10,8 @@
     "smoke:runtime": "tsx scripts/smoke-runtime.mjs",
     "runtime:config": "node scripts/zenos-runtime-cli.mjs",
     "start:local": "node scripts/load-env-and-start.mjs",
-    "runtime:local": "node scripts/zenos-runtime-local-client.mjs"
+    "runtime:local": "node scripts/zenos-runtime-local-client.mjs",
+    "wmodel": "node scripts/wmodel.mjs"
   },
   "dependencies": {
     "next": "16.2.10",
