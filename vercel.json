@@ -1,0 +1,14 @@
+{
+  "buildCommand": "next build",
+  "installCommand": "npm install",
+  "framework": "nextjs",
+  "env": {
+    "USE_LOCAL_STORE": "false"
+  },
+  "crons": [
+    {
+      "path": "/api/memory/scheduler?namespace=zenos",
+      "schedule": "0 3 * * *"
+    }
+  ]
+}

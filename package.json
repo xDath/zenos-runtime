@@ -1,0 +1,31 @@
+{
+  "name": "zenos-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev -p 3090",
+    "build": "next build",
+    "start": "next start -p 3090",
+    "lint": "eslint",
+    "smoke:runtime": "tsx scripts/smoke-runtime.mjs",
+    "runtime:config": "node scripts/zenos-runtime-cli.mjs"
+  },
+  "dependencies": {
+    "next": "16.2.10",
+    "react": "19.2.4",
+    "react-dom": "19.2.4",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "16.2.10",
+    "tailwindcss": "^4",
+    "tsx": "^4.22.5",
+    "typescript": "^5"
+  },
+  "description": "Standalone Zenos Runtime orchestration layer for routing, host/worker/verifier pipelines, and runtime telemetry."
+}
