@@ -20,7 +20,7 @@ export const RuntimeRunRequestSchema = RuntimeContextSchema.extend({
   dryRun: z.boolean().optional().default(false),
 });
 
-export const RuntimeModelRoleSchema = z.enum(['host', 'worker', 'verifier']);
+export const RuntimeModelRoleSchema = z.enum(['host', 'worker', 'boss', 'verifier']);
 
 export type RuntimeRunRequest = z.input<typeof RuntimeRunRequestSchema>;
 export type RuntimeModelRole = z.infer<typeof RuntimeModelRoleSchema>;
@@ -81,6 +81,7 @@ interface HermesModelConfig {
   apiKey: string;
   hostModel: string;
   workerModel: string;
+  bossModel: string;
   verifierModel: string;
 }
 
@@ -131,6 +132,7 @@ function loadHermesModelConfig(): HermesModelConfig {
     apiKey: extractYamlScalar(providerBlock, 'api_key'),
     hostModel: agentModel || defaultModel,
     workerModel: defaultModel || agentModel,
+    bossModel: agentModel || defaultModel,
     verifierModel: defaultModel || agentModel,
   };
 }
@@ -163,6 +165,7 @@ function runtimeModelConfig(): HermesModelConfig {
     apiKey: process.env.ZENOS_LLM_API_KEY || process.env.MEMORY_LLM_API_KEY || override.apiKey || hermes.apiKey,
     hostModel: process.env.ZENOS_HOST_MODEL || process.env.MEMORY_LLM_MODEL || override.hostModel || hermes.hostModel,
     workerModel: process.env.ZENOS_WORKER_MODEL || process.env.MEMORY_LLM_FALLBACK_MODEL || override.workerModel || hermes.workerModel,
+    bossModel: process.env.ZENOS_BOSS_MODEL || process.env.ZENOS_HOST_MODEL || process.env.MEMORY_LLM_MODEL || override.bossModel || hermes.bossModel || hermes.hostModel,
     verifierModel: process.env.ZENOS_VERIFIER_MODEL || process.env.MEMORY_LLM_FALLBACK_MODEL || override.verifierModel || hermes.verifierModel,
   };
 }
@@ -171,6 +174,7 @@ function modelForRole(role: RuntimeModelRole): string {
   const cfg = runtimeModelConfig();
   if (role === 'host') return cfg.hostModel;
   if (role === 'worker') return cfg.workerModel;
+  if (role === 'boss') return cfg.bossModel;
   return cfg.verifierModel;
 }
 
@@ -203,6 +207,7 @@ export function getRuntimeModelConfigSummary() {
     hasApiKey: Boolean(cfg.apiKey),
     hostModel: cfg.hostModel,
     workerModel: cfg.workerModel,
+    bossModel: cfg.bossModel,
     verifierModel: cfg.verifierModel,
     source: process.env.ZENOS_LLM_BASE_URL || process.env.ZENOS_HOST_MODEL ? 'env' : 'hermes-config',
   };
@@ -285,7 +290,7 @@ export async function callRuntimeModel(
 
 
 export async function runBossReviewModel(packet: unknown): Promise<RuntimeModelResult> {
-  return callRuntimeModel('host', [
+  return callRuntimeModel('boss', [
     {
       role: 'system',
       content: `You are the premium Zenos Boss Agent. Review only the escalation packet.
@@ -330,7 +335,7 @@ export async function runHostSynthesis(
   const workerBlock = workerResult ? JSON.stringify(workerResult, null, 2) : '(no worker result)';
   const focusedContext = workerResult ? workerBlock : compactSourceContext(input).slice(0, 10_000);
 
-  return callRuntimeModel('host', [
+  return callRuntimeModel('boss', [
     {
       role: 'system',
       content: `You are the premium Zenos Host. Your job is judgment and final synthesis, not raw context grinding.

@@ -1,29 +1,31 @@
 import * as crypto from 'crypto';
 
+function bearerOrApiKey(request: Request): string {
+  const authHeader = request.headers.get('authorization') || '';
+  return authHeader.replace(/^Bearer\s+/i, '').trim() || request.headers.get('x-api-key') || '';
+}
+
 export function validateApiKey(request: Request): boolean {
+  const runtimeApiKey = process.env.ZENOS_RUNTIME_API_KEY;
+  const memoryApiKey = process.env.ZENOS_MEMORY_API_KEY;
+  const providedKey = bearerOrApiKey(request);
+
+  if (runtimeApiKey && providedKey === runtimeApiKey) return true;
+  if (memoryApiKey && providedKey === memoryApiKey) return true;
+
   const etlaSecret = process.env.ETLA_MASTER_SECRET;
   if (etlaSecret) {
-    // Prefer short-lived token if provided
     const token = request.headers.get('x-etla-token') || '';
-    if (token && verifyEtlaToken(token, etlaSecret)) {
-      return true;
-    }
-    // Fallback to master signature for token exchange
+    if (token && verifyEtlaToken(token, etlaSecret)) return true;
     return verifyEtlaSignature(request, etlaSecret);
   }
 
-  // Fallback to static API key
-  const apiKey = process.env.ZENOS_MEMORY_API_KEY;
-  if (!apiKey) {
-    console.warn('[ZenosMemory] No API key set in env - allowing all (dev only)');
+  if (!runtimeApiKey && !memoryApiKey) {
+    console.warn('[ZenosRuntime] No API key set in env - allowing all (dev only)');
     return true;
   }
 
-  const authHeader = request.headers.get('authorization') || '';
-  const providedKey = authHeader.replace('Bearer ', '').trim() || 
-                      request.headers.get('x-api-key') || '';
-
-  return providedKey === apiKey;
+  return false;
 }
 
 export function verifyEtlaSignature(request: Request, secret: string): boolean {

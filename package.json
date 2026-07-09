@@ -9,7 +9,7 @@
     "lint": "eslint",
     "smoke:runtime": "tsx scripts/smoke-runtime.mjs",
     "runtime:config": "node scripts/zenos-runtime-cli.mjs",
-    "start:local": "ETLA_MASTER_SECRET=${ETLA_MASTER_SECRET:-} ZENOS_RUNTIME_API_KEY=${ZENOS_RUNTIME_API_KEY:-local-dev} ZENOS_MEMORY_API_KEY=${ZENOS_MEMORY_API_KEY:-local-dev} next start -p 3090",
+    "start:local": "node scripts/load-env-and-start.mjs",
     "runtime:local": "node scripts/zenos-runtime-local-client.mjs"
   },
   "dependencies": {
