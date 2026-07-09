@@ -21,13 +21,19 @@ export type RuntimeModelSlots = z.infer<typeof RuntimeModelSlotsSchema>;
 export const MODEL_SLOT_KEYS = ['host', 'worker', 'boss', 'verifier'] as const;
 export type RuntimeModelSlot = typeof MODEL_SLOT_KEYS[number];
 
+const SESSION_MODEL_DIR = process.env.ZENOS_RUNTIME_SESSION_MODEL_DIR
+  || path.join(os.homedir(), '.hermes/profiles/zenos/runtime-session-models');
+
 export function runtimeConfigPath(): string {
   return process.env.ZENOS_RUNTIME_CONFIG_PATH
     || path.join(os.homedir(), '.hermes/profiles/zenos/zenos-runtime.json');
 }
 
-export function readRuntimeModelSlots(): RuntimeModelSlots {
-  const file = runtimeConfigPath();
+export function runtimeSessionConfigPath(sessionId: string): string {
+  return path.join(SESSION_MODEL_DIR, `${sessionId.replace(/[^A-Za-z0-9_.-]/g, '_')}.json`);
+}
+
+function readSlotsFile(file: string): RuntimeModelSlots {
   try {
     if (!fs.existsSync(file)) return {};
     return RuntimeModelSlotsSchema.parse(JSON.parse(fs.readFileSync(file, 'utf8')));
@@ -36,13 +42,32 @@ export function readRuntimeModelSlots(): RuntimeModelSlots {
   }
 }
 
-export function writeRuntimeModelSlots(update: RuntimeModelSlots): RuntimeModelSlots {
-  const file = runtimeConfigPath();
-  const current = readRuntimeModelSlots();
+function writeSlotsFile(file: string, update: RuntimeModelSlots): RuntimeModelSlots {
+  const current = readSlotsFile(file);
   const next = RuntimeModelSlotsSchema.parse({ ...current, ...update });
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify(next, null, 2) + '\n');
   return next;
+}
+
+export function readRuntimeModelSlots(): RuntimeModelSlots {
+  return readSlotsFile(runtimeConfigPath());
+}
+
+export function writeRuntimeModelSlots(update: RuntimeModelSlots): RuntimeModelSlots {
+  return writeSlotsFile(runtimeConfigPath(), update);
+}
+
+export function readSessionModelSlots(sessionId?: string): RuntimeModelSlots {
+  return sessionId ? readSlotsFile(runtimeSessionConfigPath(sessionId)) : {};
+}
+
+export function writeSessionModelSlots(sessionId: string, update: RuntimeModelSlots): RuntimeModelSlots {
+  return writeSlotsFile(runtimeSessionConfigPath(sessionId), update);
+}
+
+export function mergeModelSlots(globalConfig: RuntimeModelSlots, sessionConfig: RuntimeModelSlots = {}): RuntimeModelSlots {
+  return RuntimeModelSlotsSchema.parse({ ...globalConfig, ...sessionConfig });
 }
 
 export function providerForSlot(config: RuntimeModelSlots, slot: RuntimeModelSlot): string {

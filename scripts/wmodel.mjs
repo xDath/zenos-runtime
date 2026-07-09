@@ -5,7 +5,7 @@ const apiKey = process.env.ZENOS_RUNTIME_API_KEY || process.env.ZENOS_MEMORY_API
 const slots = ['host', 'worker', 'boss', 'verifier'];
 
 function authHeaders() {
-  return { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` };
+  return { 'Content-Type': 'application/json', Authorization: 'Bearer ' + apiKey };
 }
 
 async function request(path, body, method = 'GET') {
@@ -24,6 +24,26 @@ function normalizeSlot(slot) {
   if (lower === 'v') return 'verifier';
   if (slots.includes(lower)) return lower;
   throw new Error(`Unknown slot: ${slot}`);
+}
+
+function parseArgs(rawArgs) {
+  const args = [...rawArgs];
+  let sessionId = process.env.ZENOS_RUNTIME_SESSION_ID || '';
+  let global = false;
+  const filtered = [];
+
+  for (let i = 0; i < args.length; i += 1) {
+    if (args[i] === '--session') {
+      sessionId = args[i + 1] || '';
+      i += 1;
+    } else if (args[i] === '--global') {
+      global = true;
+    } else {
+      filtered.push(args[i]);
+    }
+  }
+
+  return { sessionId: global ? '' : sessionId, args: filtered };
 }
 
 function parseSegments(args) {
@@ -50,29 +70,39 @@ function parseSegments(args) {
   return update;
 }
 
-function printStatus(config) {
+function modelButtonLabel(slot, config) {
+  const model = config[`${slot}Model`] || '-';
+  return `${slot[0].toUpperCase()}${slot.slice(1)}: ${model}`;
+}
+
+function printStatus(config, sessionId = '') {
   const lines = [
-    `Host: ${config.hostModel || '-'}`,
-    `Worker: ${config.workerModel || '-'}`,
-    `Boss: ${config.bossModel || '-'}`,
-    `Verifier: ${config.verifierModel || '-'}`,
+    sessionId ? `Session: ${sessionId}` : 'Scope: global default',
+    modelButtonLabel('host', config),
+    modelButtonLabel('worker', config),
+    modelButtonLabel('boss', config),
+    modelButtonLabel('verifier', config),
   ];
   console.log(lines.join('\n'));
 }
 
-const args = process.argv.slice(2);
-if (args[0] === 'help') {
-  console.log(`Usage:\n  wmodel\n  wmodel host:model --provider provider; worker:model2 --provider provider2; boss:model3; verifier:model4\n  wmodel modelHost --provider provider; modelWorker --provider provider; modelBoss --provider provider; modelVerifier --provider provider`);
+function pathWithSession(path, sessionId) {
+  return sessionId ? `${path}?sessionId=${encodeURIComponent(sessionId)}` : path;
+}
+
+const parsed = parseArgs(process.argv.slice(2));
+if (parsed.args[0] === 'help') {
+  console.log(`Usage:\n  wmodel [--session sessionId]\n  wmodel --session sessionId host:model --provider provider; worker:model2 --provider provider2; boss:model3; verifier:model4\n  wmodel --global modelHost --provider provider; modelWorker --provider provider; modelBoss --provider provider; modelVerifier --provider provider\n\nDefault scope is per-session when --session or ZENOS_RUNTIME_SESSION_ID is set. Use --global to change defaults.`);
   process.exit(0);
 }
 
-if (!args.length) {
-  const data = await request('/api/runtime/models');
-  printStatus(data.config);
+if (!parsed.args.length) {
+  const data = await request(pathWithSession('/api/runtime/models', parsed.sessionId));
+  printStatus(data.config, parsed.sessionId);
   process.exit(0);
 }
 
-const update = parseSegments(args);
-const saved = await request('/api/runtime/models', update, 'POST');
-printStatus(saved.config);
-console.log('\nSaved.');
+const update = parseSegments(parsed.args);
+const saved = await request(pathWithSession('/api/runtime/models', parsed.sessionId), update, 'POST');
+printStatus(saved.config, parsed.sessionId);
+console.log(`\nSaved ${saved.scope}.`);

@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { choosePipeline, ModelTierSchema, RiskLevelSchema, RuntimeContextSchema, WorkerFindingSchema } from './zenos-runtime';
 import { loadRuntimeSessionsFromDisk, runtimeFileStoreInfo, saveRuntimeSessionsToDisk } from './zenos-runtime-file-store';
+import { RuntimeModelSlotsSchema } from './zenos-runtime-model-config';
 
 export const AgentRoleSchema = z.enum(['host', 'boss', 'worker']);
 export const WorkerEventTypeSchema = z.enum(['progress', 'finding', 'risk', 'conflict', 'tool_result', 'done', 'error']);
@@ -45,6 +46,7 @@ export const RuntimeSessionStateSchema = z.object({
   status: RuntimeSessionStatusSchema.default('routing'),
   hostModel: z.string().default('standard'),
   bossModel: z.string().optional(),
+  modelOverrides: RuntimeModelSlotsSchema.default({}),
   routeDecision: z.unknown().optional(),
   workers: z.array(WorkerLeaseSchema).default([]),
   events: z.array(WorkerEventSchema).default([]),
@@ -142,6 +144,7 @@ export function createRuntimeSession(input: z.input<typeof RuntimeContextSchema>
     status: decision.useWorker ? 'working' : 'routing',
     hostModel: decision.hostTier,
     bossModel: decision.allowEscalation ? 'premium' : undefined,
+    modelOverrides: {},
     routeDecision: decision,
     workers: [],
     events: [],
@@ -303,6 +306,18 @@ export function completeRuntimeSession(sessionId: string): RuntimeSessionState {
 export function runtimeStoreInfo() {
   loadStore();
   return { ...runtimeFileStoreInfo(), sessions: sessions.size };
+}
+
+
+export function updateSessionModelOverrides(sessionId: string, update: z.input<typeof RuntimeModelSlotsSchema>): RuntimeSessionState {
+  loadStore();
+  const session = sessions.get(sessionId);
+  if (!session) throw new Error('Runtime session not found');
+  const modelOverrides = RuntimeModelSlotsSchema.parse({ ...session.modelOverrides, ...update });
+  const updated = RuntimeSessionStateSchema.parse({ ...session, modelOverrides, updatedAt: now() });
+  sessions.set(sessionId, updated);
+  saveStore();
+  return updated;
 }
 
 export function getRuntimeModels() {
