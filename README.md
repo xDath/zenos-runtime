@@ -49,6 +49,7 @@ The model base URL may be either a complete endpoint (`/model` or `/chat/complet
 - Three-agent architecture roadmap: `docs/zenos-runtime-three-agent-roadmap.md`
 - Cheap-worker quality amplification roadmap: `docs/zenos-runtime-quality-amplification-roadmap.md`
 - Production v1 readiness: `docs/zenos-runtime-production-v1.md`
+- Hermes mandatory host protocol: `docs/zenos-runtime-hermes-protocol.md`
 
 ## Local Development
 
