@@ -47,7 +47,7 @@ function parseJsonArg(value, fallback = {}) {
 
 const [command, ...args] = process.argv.slice(2);
 if (!command || command === 'help') {
-  console.log(`Zenos Runtime local client\n\nCommands:\n  health\n  readiness\n  eval\n  metrics\n  tracker [today|24h|7d|30d|60d]\n  route <request-or-json>\n  run <request-or-json>\n  run-key <idempotencyKey> <request-or-json>\n  run-status <runId>\n  gateway-preflight <json>\n  gateway-postflight <json>\n  remote-validate <json>\n  session <request-or-json>\n  session-get <sessionId>\n  dispatch <sessionId> <template> <task>\n  event <json>\n  escalate <sessionId> [hostAssessment]\n  boss-review <sessionId> <decision-json>\n  quality-gate <json>\n  models [sessionId]\n  budget <sessionId>\n`);
+  console.log(`Zenos Runtime local client\n\nCommands:\n  health\n  readiness\n  eval\n  metrics\n  tracker [today|24h|7d|30d|60d]\n  outcomes [limit]\n  outcome-feedback <json>\n  route <request-or-json>\n  run <request-or-json>\n  run-key <idempotencyKey> <request-or-json>\n  run-status <runId>\n  gateway-preflight <json>\n  gateway-postflight <json>\n  remote-validate <json>\n  session <request-or-json>\n  session-get <sessionId>\n  dispatch <sessionId> <template> <task>\n  event <json>\n  escalate <sessionId> [hostAssessment]\n  boss-review <sessionId> <decision-json>\n  quality-gate <json>\n  models [sessionId]\n  budget <sessionId>\n`);
   process.exit(0);
 }
 
@@ -57,6 +57,12 @@ switch (command) {
   case 'readiness': output = await request('/api/runtime/readiness', null, 'GET'); break;
   case 'eval': output = await request('/api/runtime/eval', null, 'GET'); break;
   case 'metrics': output = await request('/api/runtime/metrics', null, 'GET'); break;
+  case 'outcomes': {
+    const limit = Math.min(Math.max(Number(args[0] || '20'), 1), 500);
+    output = await request(`/api/runtime/outcomes?limit=${limit}`, null, 'GET');
+    break;
+  }
+  case 'outcome-feedback': output = await request('/api/runtime/outcomes', JSON.parse(args.join(' '))); break;
   case 'tracker': {
     const range = args[0] || 'today';
     if (!['today', '24h', '7d', '30d', '60d'].includes(range)) throw new Error('tracker range must be today, 24h, 7d, 30d, or 60d');
