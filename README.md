@@ -17,7 +17,7 @@ Deterministic intent + risk policy
 SQLite WAL state + route telemetry + optional Zenos Memory
 ```
 
-## What v0.2 guarantees
+## What v0.4 guarantees
 
 - **Real four-role execution.** Host, Worker, Verifier, and Boss use distinct configurable model slots.
 - **Real revision semantics.** A `revise` verdict produces a new Host draft and another verification pass.
@@ -29,6 +29,11 @@ SQLite WAL state + route telemetry + optional Zenos Memory
 - **Per-session model isolation.** Global defaults remain intact while individual sessions can override role models and providers.
 - **Operational evidence.** Structured logs, request IDs, readiness checks, dependency probes, JSON metrics, Prometheus metrics, tests, and policy regression cases.
 - **Memory integration.** Runtime can recall non-secret context and persist route outcomes through Zenos Memory without importing its engine.
+- **Non-root control plane.** Production runs from a root-owned read-only release under `/opt`; local mutation is denied and writable state is restricted to `/var/lib/zenos-runtime`.
+- **Task-aware latency budgets.** Memory, repository inspection, Host, Worker, Verifier, Boss, and total wall-clock time are independently measured against task-class budgets.
+- **Outcome Passports.** Every governed gateway outcome receives an immutable versioned passport containing route, token/cache usage, latency, quality, and evidence coverage.
+- **No-Regret Routing Board.** Shadow routing aggregates outcomes and surfaces cheaper or stronger candidates, but cannot promote a route automatically without sufficient evidence and explicit human approval.
+- **Modular orchestration.** Gateway contracts, continuity, planning, rendering, accounting, latency, and outcome intelligence live in bounded modules instead of one orchestration god-file.
 
 ## Current default role models
 
@@ -63,6 +68,8 @@ Defaults can be changed globally or per session without changing source code.
 | `GET /api/runtime/eval` | Routing regression report | `runtime:read` |
 | `GET /api/runtime/readiness` | Actual readiness and dependencies | `runtime:read` |
 | `GET /api/runtime/metrics` | JSON or Prometheus metrics | `runtime:metrics` |
+| `GET /api/runtime/outcomes` | Outcome Passports and No-Regret shadow analytics | `runtime:read` |
+| `POST /api/runtime/outcomes` | Append human feedback as a new immutable outcome revision | `runtime:admin` |
 | `POST /api/runtime/token` | Mint scoped short-lived token | `runtime:admin` |
 | `GET /api/health` | Public liveness only | public |
 
@@ -111,11 +118,13 @@ Repeating the same request with the same key returns the stored result. Reusing 
 
 ## Model configuration
 
-Global model slots live in:
+Global model slots in the hardened production service live in:
 
 ```text
-/root/.hermes/profiles/zenos/zenos-runtime.json
+/etc/zenos-runtime/models.json
 ```
+
+The development checkout may continue using the legacy profile path under `~/.hermes/profiles/zenos/`.
 
 Session overrides can be set through:
 
@@ -154,14 +163,23 @@ This is intentionally optimized for a **single active VPS process**. Horizontal 
 
 Production refuses to start without Runtime authentication and all four model roles. The hardened systemd unit:
 
+- runs as the dedicated `zenos-runtime` system user, never as root;
+- loads a root-owned read-only release from `/opt/zenos-runtime/current`;
+- operates in explicit `control-plane` execution mode;
+- denies local patch, rollback, and production mutations;
 - binds only to loopback;
 - disables legacy path-only HMAC;
-- uses a private temporary directory and device namespace;
-- enables `NoNewPrivileges`;
-- protects kernel and system paths;
-- restricts writable paths;
-- creates `/var/lib/zenos-runtime` with mode `0700`;
-- applies umask `0077`.
+- drops all Linux capabilities and enables `NoNewPrivileges`;
+- uses private temporary/device namespaces and a closed device policy;
+- protects home, kernel, proc, hostname, clock, and system paths;
+- restricts writable paths to Runtime state and cache directories;
+- creates `/var/lib/zenos-runtime` with mode `0700` and applies umask `0077`.
+
+Install or upgrade the hardened service after a successful production build:
+
+```bash
+sudo scripts/install-control-plane-service.sh
+```
 
 See [`SECURITY.md`](./SECURITY.md) for the protocol and threat boundaries.
 
@@ -194,7 +212,7 @@ curl -sS http://127.0.0.1:3090/api/runtime/readiness \
   -H "Authorization: Bearer $ZENOS_RUNTIME_API_KEY"
 ```
 
-The readiness endpoint tests the policy suite, SQLite integrity, fail-closed authentication, all role-model slots, 9Router reachability, and optional Zenos Memory reachability. It does not return a hardcoded success label.
+The readiness endpoint tests the policy suite, SQLite integrity, fail-closed authentication, execution-mode boundary, schema-v4 Outcome Passport ledger, all role-model slots, 9Router reachability, and optional Zenos Memory reachability. It does not return a hardcoded success label.
 
 ## Product boundary
 

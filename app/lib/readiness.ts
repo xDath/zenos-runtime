@@ -1,10 +1,11 @@
 import { authConfigurationStatus } from './auth';
+import { executionBoundaryStatus } from './execution-boundary';
 import { getRuntimeModelConfigSummary, hasRuntimeModels } from './zenos-runtime-executor';
 import { memoryConfigurationSummary, memoryDependencyHealth } from './zenos-memory-client';
 import { runtimeReadinessReport } from './zenos-runtime';
 import { getRuntimeStore } from './zenos-runtime-store';
 
-export const ZENOS_RUNTIME_VERSION = '0.3.0';
+export const ZENOS_RUNTIME_VERSION = '0.4.0';
 
 export type ReadinessCheck = {
   name: string;
@@ -46,6 +47,7 @@ export async function buildRuntimeReadiness(options: { includeDependencies?: boo
   const store = getRuntimeStore().health();
   const auth = authConfigurationStatus();
   const models = getRuntimeModelConfigSummary();
+  const execution = executionBoundaryStatus();
   const checks: ReadinessCheck[] = [
     {
       name: 'routing policy regression',
@@ -70,6 +72,18 @@ export async function buildRuntimeReadiness(options: { includeDependencies?: boo
       required: true,
       passed: hasRuntimeModels(),
       evidence: `host=${models.hostModel || 'missing'}, worker=${models.workerModel || 'missing'}, boss=${models.bossModel || 'missing'}, verifier=${models.verifierModel || 'missing'}`,
+    },
+    {
+      name: 'execution privilege boundary',
+      required: true,
+      passed: process.env.NODE_ENV !== 'production' || execution.mode === 'control-plane',
+      evidence: `mode=${execution.mode}, localMutation=${execution.localMutationEnabled}, remoteValidation=${execution.remoteValidationEnabled}`,
+    },
+    {
+      name: 'versioned outcome ledger',
+      required: true,
+      passed: store.schemaVersion >= 4,
+      evidence: `SQLite schema ${store.schemaVersion} includes immutable outcome revisions and shadow-route passports`,
     },
     {
       name: 'legacy HMAC compatibility',

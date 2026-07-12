@@ -109,7 +109,8 @@ if (process.env.NODE_ENV === 'production') {
     && process.env.ZENOS_VERIFIER_MODEL,
   );
   if (!authConfigured) throw new Error('Production startup refused: configure ZENOS_RUNTIME_API_KEY or ETLA_MASTER_SECRET');
-  if (!modelsConfigured && !existsSync('/root/.hermes/profiles/zenos/zenos-runtime.json')) {
+  const modelConfigPath = process.env.ZENOS_RUNTIME_CONFIG_PATH || '/root/.hermes/profiles/zenos/zenos-runtime.json';
+  if (!modelsConfigured && !existsSync(modelConfigPath)) {
     throw new Error('Production startup refused: configure all four runtime model roles');
   }
 }

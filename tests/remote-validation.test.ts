@@ -8,6 +8,9 @@ import { resetRuntimeStoreForTests } from '../app/lib/zenos-runtime-store';
 
 test.beforeEach(() => {
   resetRuntimeStoreForTests(':memory:');
+  process.env.ZENOS_RUNTIME_EXECUTION_MODE = 'isolated-executor';
+  process.env.ZENOS_RUNTIME_REMOTE_VALIDATION_ENABLED = 'true';
+  process.env.ZENOS_RUNTIME_VALIDATION_ROOTS = os.tmpdir();
 });
 
 test('remote dispatcher refuses to create or push a branch without explicit approval', async () => {

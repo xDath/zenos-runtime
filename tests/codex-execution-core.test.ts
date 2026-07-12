@@ -88,7 +88,8 @@ test('coding task state persists and rejects invalid phase transitions', (contex
   assert.throws(() => transitionCodingTask(state.taskId, 'targeted_validation', { summary: 'skip inspect' }, store), /Invalid coding phase transition/);
   const loaded = loadCodingTask(state.taskId, store);
   assert.equal(loaded?.version, planned.version);
-  assert.equal(store.health().schemaVersion, 3);
+  assert.ok(store.health().schemaVersion >= 4);
+  assert.deepEqual(store.listOutcomes(10), []);
 });
 
 test('Codex preparation creates repository-aware inspect state and checkpoint', async (context) => {

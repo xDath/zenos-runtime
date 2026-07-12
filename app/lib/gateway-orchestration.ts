@@ -3,10 +3,8 @@ import { z } from 'zod';
 import {
   RouteDecision,
   RouteDecisionSchema,
-  RuntimeContextSchema,
   VerifierResult,
   WorkerResult,
-  WorkerResultSchema,
   choosePipeline,
 } from './zenos-runtime';
 import {
@@ -27,132 +25,32 @@ import {
 } from './zenos-runtime-three-agent';
 import { BossDecision, BossDecisionSchema } from './zenos-runtime-state';
 import { getRuntimeStore } from './zenos-runtime-store';
-import { createTokenBudgetPlan, estimateTokenCount, truncateToTokenBudget } from './token-economy';
+import { createTokenBudgetPlan } from './token-economy';
 import {
-  bootstrapMemoryContext,
-  compactMemoryHandoff,
-  MemoryCoverage,
-  recallMemoryContext,
-} from './zenos-memory-client';
+  GatewayHostPlan,
+  GatewayMemoryBrief,
+  GatewayTurnPostflightInput,
+  GatewayTurnPostflightRequestSchema,
+  GatewayTurnPreflightInput,
+  GatewayTurnPreflightRequest,
+  GatewayTurnPreflightRequestSchema,
+  GatewayTurnReceipt,
+  StoredGatewayPreflight,
+  StoredGatewayPreflightSchema,
+} from './gateway-contracts';
+import { accountGatewayModelUsage, callIdentity, gatewayHostCallCount } from './gateway-accounting';
+import { prepareGatewayContexts } from './gateway-continuity';
+import { compactHostPlan, runGatewayHostPlanning } from './gateway-planning';
+import { askUserAnswer, blockedAnswer, renderHostContext } from './gateway-rendering';
 import {
-  analyzeChangeImpact,
-  buildRepositoryIndex,
-  renderRepositoryContext,
-} from './repository-intelligence';
+  LatencyObservation,
+  createLatencyBudgetPlan,
+  observeLatency,
+  roleLatencyTimeout,
+} from './latency-budget';
+import { recordOutcomePassport } from './outcome-ledger';
 
-const GatewayModelIdentitySchema = z.object({
-  model: z.string().trim().min(1).max(500),
-  provider: z.string().trim().min(1).max(200),
-});
-
-const GatewayContextMessageSchema = z.object({
-  role: z.enum(['user', 'assistant', 'tool', 'system']),
-  content: z.string().max(24_000),
-  name: z.string().trim().max(200).optional(),
-  tool_call_id: z.string().trim().max(500).optional(),
-});
-
-export const GatewayTurnPreflightRequestSchema = RuntimeContextSchema.extend({
-  sessionId: z.string().trim().min(1).max(220),
-  turnId: z.string().trim().min(1).max(220),
-  platform: z.string().trim().min(1).max(80).default('gateway'),
-  host: GatewayModelIdentitySchema,
-  context: z.string().max(120_000).optional().default(''),
-  handoffMessages: z.array(GatewayContextMessageSchema).max(400).optional().default([]),
-  workspaceRoot: z.string().trim().min(1).max(4_096).optional(),
-  approvalGranted: z.boolean().optional().default(false),
-  modelOverrides: z.object({
-    baseUrl: z.string().trim().min(1).optional(),
-    apiKey: z.string().trim().min(1).optional(),
-    hostModel: z.string().trim().min(1).optional(),
-    hostProvider: z.string().trim().min(1).optional(),
-    workerModel: z.string().trim().min(1).optional(),
-    workerProvider: z.string().trim().min(1).optional(),
-    bossModel: z.string().trim().min(1).optional(),
-    bossProvider: z.string().trim().min(1).optional(),
-    verifierModel: z.string().trim().min(1).optional(),
-    verifierProvider: z.string().trim().min(1).optional(),
-  }).optional().default({}),
-});
-
-export const GatewayTurnPostflightRequestSchema = z.object({
-  sessionId: z.string().trim().min(1).max(220),
-  runId: z.string().trim().min(1).max(220),
-  turnId: z.string().trim().min(1).max(220),
-  draft: z.string().max(200_000),
-  host: GatewayModelIdentitySchema,
-  toolSummary: z.string().max(80_000).optional().default(''),
-  failed: z.boolean().optional().default(false),
-  hostUsage: z.object({
-    inputTokens: z.number().int().nonnegative().default(0),
-    cacheReadTokens: z.number().int().nonnegative().default(0),
-    cacheWriteTokens: z.number().int().nonnegative().default(0),
-    outputTokens: z.number().int().nonnegative().default(0),
-    reasoningTokens: z.number().int().nonnegative().default(0),
-    calls: z.number().int().nonnegative().max(500).default(1),
-  }).optional().default({
-    inputTokens: 0,
-    cacheReadTokens: 0,
-    cacheWriteTokens: 0,
-    outputTokens: 0,
-    reasoningTokens: 0,
-    calls: 1,
-  }),
-  hostDurationMs: z.number().int().nonnegative().max(86_400_000).optional().default(0),
-});
-
-const GatewayHostPlanSchema = z.object({
-  intentSummary: z.string().trim().min(1).max(4_000),
-  useWorker: z.boolean(),
-  workerTask: z.string().trim().max(8_000).default(''),
-  useVerifier: z.boolean(),
-  useBoss: z.boolean(),
-  confidence: z.number().min(0).max(1),
-  rationale: z.string().trim().min(1).max(4_000),
-  acceptanceCriteria: z.array(z.string().trim().min(1).max(2_000)).max(10).default([]),
-  constraints: z.array(z.string().trim().min(1).max(2_000)).max(10).default([]),
-});
-
-type GatewayHostPlan = z.infer<typeof GatewayHostPlanSchema>;
-
-type GatewayMemoryBrief = {
-  context: string;
-  source: 'none' | 'handoff' | 'recall' | 'bootstrap';
-  coverage?: MemoryCoverage;
-  degraded?: boolean;
-  cacheHit?: boolean;
-  latencyMs?: number;
-};
-
-const StoredGatewayPreflightSchema = z.object({
-  kind: z.literal('gateway_preflight_v1'),
-  input: RuntimeRunRequestSchema,
-  turnId: z.string(),
-  platform: z.string(),
-  host: GatewayModelIdentitySchema,
-  hostPlan: GatewayHostPlanSchema.optional(),
-  hostPlanCall: z.unknown().optional(),
-  workerResult: WorkerResultSchema.optional(),
-  workerCall: z.unknown().optional(),
-  bossPreflight: BossDecisionSchema.optional(),
-  bossCall: z.unknown().optional(),
-  repositoryContext: z.string().optional(),
-  holdFinalDelivery: z.boolean(),
-});
-
-type GatewayTurnPreflightRequest = z.output<typeof GatewayTurnPreflightRequestSchema>;
-type GatewayTurnPreflightInput = z.input<typeof GatewayTurnPreflightRequestSchema>;
-type GatewayTurnPostflightInput = z.input<typeof GatewayTurnPostflightRequestSchema>;
-type StoredGatewayPreflight = z.infer<typeof StoredGatewayPreflightSchema>;
-
-export type GatewayTurnReceipt = {
-  pipeline: RouteDecision['pipelineMode'];
-  host: { model: string; provider: string; invoked: boolean; plannerInvoked?: boolean; calls?: number };
-  worker: { model?: string; provider?: string; invoked: boolean; ok?: boolean };
-  verifier: { model?: string; provider?: string; invoked: boolean; verdict?: string; ok?: boolean };
-  boss: { model?: string; provider?: string; invoked: boolean; verdict?: string; ok?: boolean };
-  transformed: boolean;
-};
+export { GatewayTurnPostflightRequestSchema, GatewayTurnPreflightRequestSchema } from './gateway-contracts';
 
 function now(): string {
   return new Date().toISOString();
@@ -213,391 +111,41 @@ function recordActivity(
   });
 }
 
-function callIdentity(call?: RuntimeModelResult): { model?: string; provider?: string; invoked: boolean; ok?: boolean } {
-  return call
-    ? { model: call.model, provider: call.provider, invoked: true, ok: call.ok }
-    : { invoked: false };
-}
-
-function modelCallTokens(call: RuntimeModelResult): number {
-  const usage = call.usage;
-  if (!usage) return 0;
-  return Math.max(0, Math.round(
-    usage.totalTokens
-      || usage.inputTokens + (usage.cacheReadTokens || 0) + (usage.cacheWriteTokens || 0) + usage.outputTokens,
-  ));
-}
-
-function accountGatewayModelUsage(
-  sessionId: string,
-  calls: RuntimeModelResult[],
-  hostUsage: {
-    inputTokens: number;
-    cacheReadTokens: number;
-    cacheWriteTokens: number;
-    outputTokens: number;
-    reasoningTokens: number;
-    calls: number;
-  },
-): void {
-  const session = getRuntimeSession(sessionId);
-  if (!session) return;
-  const byRole = (role: RuntimeModelResult['role']) => calls
-    .filter((call) => call.role === role)
-    .reduce((sum, call) => sum + modelCallTokens(call), 0);
-  const hermesHostTokens = Math.max(0, Math.round(
-    hostUsage.inputTokens
-      + hostUsage.cacheReadTokens
-      + hostUsage.cacheWriteTokens
-      + hostUsage.outputTokens,
-  ));
-  updateRuntimeSession(sessionId, {
-    budget: {
-      ...session.budget,
-      premiumTokensUsed: session.budget.premiumTokensUsed + byRole('boss'),
-      hostTokensUsed: session.budget.hostTokensUsed + hermesHostTokens + byRole('host'),
-      workerTokensUsed: session.budget.workerTokensUsed + byRole('worker'),
-      verifierTokensUsed: session.budget.verifierTokensUsed + byRole('verifier'),
-      modelCallsUsed: session.budget.modelCallsUsed + Math.max(0, hostUsage.calls) + calls.length,
-    },
-  });
-}
-
-function gatewayHostCallCount(
-  calls: RuntimeModelResult[],
-  hostUsage: { calls: number },
-): number {
-  return Math.max(0, hostUsage.calls) + calls.filter((call) => call.role === 'host').length;
-}
-
-function compactWorkerBrief(worker?: WorkerResult): string {
-  if (!worker) return '';
-  const findings = worker.findings.slice(0, 8).map((finding) =>
-    `- ${finding.claim} [confidence=${finding.confidence.toFixed(2)}; evidence=${finding.evidence.join(', ') || 'none'}]`,
-  );
-  return [
-    'Worker summary:',
-    ...worker.summary.slice(0, 8).map((item) => `- ${item}`),
-    findings.length ? 'Evidence-backed findings:' : '',
-    ...findings,
-    worker.contradictions.length ? `Contradictions: ${worker.contradictions.join('; ')}` : '',
-    worker.unknowns.length ? `Unknowns: ${worker.unknowns.join('; ')}` : '',
-    worker.needsHostAttention.length ? `Host attention: ${worker.needsHostAttention.join('; ')}` : '',
-    `Suggested next step: ${worker.suggestedNextStep}`,
-  ].filter(Boolean).join('\n');
-}
-
-function compactBossGuardrails(boss?: BossDecision): string {
-  if (!boss) return '';
-  return [
-    `Boss preflight verdict: ${boss.verdict} (${boss.confidence.toFixed(2)})`,
-    `Reason: ${boss.reasoningSummary}`,
-    boss.allowedActions.length ? `Allowed actions: ${boss.allowedActions.join('; ')}` : '',
-    boss.forbiddenActions.length ? `Forbidden actions: ${boss.forbiddenActions.join('; ')}` : '',
-    boss.requiredChanges.length ? `Required changes: ${boss.requiredChanges.join('; ')}` : '',
-  ].filter(Boolean).join('\n');
-}
-
-function renderHostContext(
-  decision: RouteDecision,
-  hostPlan: GatewayHostPlan | undefined,
-  worker: WorkerResult | undefined,
-  boss: BossDecision | undefined,
-  memory: GatewayMemoryBrief,
-  runId: string,
-): string {
-  return [
-    '[Zenos Runtime native turn brief — internal execution context]',
-    `Run: ${runId}`,
-    `Route: ${decision.pipelineMode}; task=${decision.taskType}; risk=${decision.risk}`,
-    `Roles required: worker=${decision.useWorker}; verifier=${decision.useVerifier}; boss=${decision.useBoss}`,
-    compactHostPlan(hostPlan),
-    decision.useWorker ? '' : 'Worker skipped by Host orchestration and safety policy.',
-    decision.useVerifier ? '' : 'Verifier skipped by Host orchestration and safety policy.',
-    decision.useBoss ? '' : 'Boss skipped by Host orchestration and safety policy.',
-    `Route reasons: ${decision.reasons.join('; ')}`,
-    memory.context ? truncateToTokenBudget(memory.context, 3_000, '\n[MEMORY CONTEXT TRUNCATED]') : '',
-    memory.coverage && !memory.coverage.complete
-      ? 'Memory handoff coverage is partial. Preserve the recent raw conversation tail and retrieve archived evidence before relying on missing details.'
-      : '',
-    compactWorkerBrief(worker),
-    compactBossGuardrails(boss),
-    'Use this brief as bounded supporting context. Do not claim a tool, file, test, or source was inspected unless Hermes actually inspected it during this turn.',
-    'The user-facing response must not reveal raw internal packets unless the user explicitly asks for execution details.',
-  ].filter(Boolean).join('\n\n');
-}
-
-async function repositoryContextFor(input: GatewayTurnPreflightRequest, decision: RouteDecision): Promise<string> {
-  if (!input.workspaceRoot || !decision.useTools) return '';
-  if (!['repo_question', 'coding_change', 'debugging', 'security_or_secret'].includes(decision.taskType)) return '';
-  try {
-    const index = await buildRepositoryIndex(input.workspaceRoot);
-    return renderRepositoryContext(index, analyzeChangeImpact(index));
-  } catch (error) {
-    return `Repository intelligence unavailable: ${error instanceof Error ? error.message : 'unknown error'}`;
-  }
-}
-
-async function gatewayMemoryContextFor(
-  request: GatewayTurnPreflightRequest,
-  decision: RouteDecision,
-  existingSession: boolean,
-): Promise<GatewayMemoryBrief> {
-  const namespace = process.env.ZENOS_MEMORY_NAMESPACE || 'zenos';
-  const softLimit = Math.max(40_000, Number(process.env.ZENOS_HOST_CONTEXT_SOFT_LIMIT_TOKENS || 160_000));
-  const underPressure = request.estimatedContextTokens >= softLimit;
-  const hasHandoffSource = request.handoffMessages.length >= 4;
-
-  if (underPressure && hasHandoffSource) {
-    const compact = await compactMemoryHandoff({
-      messages: request.handoffMessages,
-      namespace,
-      sessionId: request.sessionId,
-      conversationId: request.turnId,
-      approxTokens: request.estimatedContextTokens,
-      maxChars: 10_000,
-      inputMaxChars: 240_000,
-      reason: 'hermes-host-working-set-pressure',
-    });
-    if (compact.ok && compact.value?.context) {
-      let context = compact.value.context;
-      if (decision.taskType === 'memory_question') {
-        const recalled = await recallMemoryContext({
-          query: request.request,
-          namespace,
-          limit: Math.max(4, decision.maxMemoryItems),
-          maxChars: 5_000,
-        });
-        if (recalled.ok && recalled.value) context = `${context}\n\n${recalled.value}`;
-      }
-      return {
-        context: truncateToTokenBudget(context, 4_000, '\n[MEMORY BRIEF TRUNCATED]'),
-        source: 'handoff',
-        coverage: compact.value.coverage,
-        degraded: compact.degraded,
-        cacheHit: compact.cacheHit,
-        latencyMs: compact.latencyMs,
-      };
-    }
-  }
-
-  if (!decision.useMemory) return { context: '', source: 'none' };
-
-  if (!existingSession) {
-    const bootstrap = await bootstrapMemoryContext({
-      namespace,
-      queries: [request.request, 'current active project goal decisions blockers pending work'],
-      limit: Math.max(8, decision.maxMemoryItems),
-      maxChars: 6_000,
-    });
-    if (bootstrap.ok && bootstrap.value) {
-      return {
-        context: bootstrap.value,
-        source: 'bootstrap',
-        degraded: bootstrap.degraded,
-        cacheHit: bootstrap.cacheHit,
-        latencyMs: bootstrap.latencyMs,
-      };
-    }
-  }
-
-  const recalled = await recallMemoryContext({
-    query: request.request,
-    namespace,
-    limit: Math.max(1, decision.maxMemoryItems),
-    maxChars: 8_000,
-  });
-  if (recalled.ok && recalled.value) {
-    return {
-      context: recalled.value,
-      source: 'recall',
-      degraded: recalled.degraded,
-      cacheHit: recalled.cacheHit,
-      latencyMs: recalled.latencyMs,
-    };
-  }
-  return { context: '', source: 'none', degraded: true, latencyMs: recalled.latencyMs };
-}
-
 function safeBossDecision(call: RuntimeModelResult): BossDecision | undefined {
   if (!call.ok || !call.parsed) return undefined;
   const parsed = BossDecisionSchema.safeParse(call.parsed);
   return parsed.success ? parsed.data : undefined;
 }
 
-function safeHostPlan(call: RuntimeModelResult): GatewayHostPlan | undefined {
-  if (!call.ok || !call.parsed) return undefined;
-  const parsed = GatewayHostPlanSchema.safeParse(call.parsed);
-  return parsed.success ? parsed.data : undefined;
-}
-
-function needsHostPlanning(request: GatewayTurnPreflightRequest, decision: RouteDecision): boolean {
-  if (request.userRequestedBoss || request.userRequestedVerification) return true;
-  if (decision.risk === 'high' || decision.risk === 'critical' || request.confidence < 0.7) return true;
-  if (['planning_or_architecture', 'summarization', 'eval_or_benchmark', 'security_or_secret', 'deploy_or_destructive_action'].includes(decision.taskType)) return true;
-  if (decision.useWorker && !['repo_question', 'coding_change', 'debugging'].includes(decision.taskType)) return true;
-  return false;
-}
-
-function pipelineForHostPlan(
-  decision: RouteDecision,
-  plan: GatewayHostPlan,
-  request: GatewayTurnPreflightRequest,
-): RouteDecision {
-  const safetyVerifier = request.userRequestedVerification
-    || decision.requiresApproval
-    || decision.risk === 'high'
-    || decision.risk === 'critical';
-  const safetyBoss = request.userRequestedBoss
-    || decision.requiresApproval
-    || decision.risk === 'critical';
-  const useWorker = plan.useWorker;
-  const useVerifier = safetyVerifier || plan.useVerifier;
-  const useBoss = safetyBoss || plan.useBoss;
-  const pipelineMode: RouteDecision['pipelineMode'] = useBoss
-    ? 'escalated_deep_path'
-    : useVerifier
-      ? 'verified_path'
-      : useWorker
-        ? 'worker_compression_path'
-        : decision.useTools || decision.useMemory
-          ? 'grounded_path'
-          : 'direct_fast_path';
-
-  return RouteDecisionSchema.parse({
-    ...decision,
-    pipelineMode,
-    useWorker,
-    useVerifier,
-    useBoss,
-    allowEscalation: decision.allowEscalation || useBoss || plan.confidence < 0.55,
-    workerTier: useWorker ? (decision.workerTier === 'none' ? 'standard' : decision.workerTier) : 'none',
-    verifierTier: useVerifier ? (decision.verifierTier === 'none' ? 'cheap' : decision.verifierTier) : 'none',
-    maxWorkerCalls: useWorker ? Math.max(1, decision.maxWorkerCalls) : 0,
-    maxRevisionAttempts: useVerifier ? Math.max(1, decision.maxRevisionAttempts) : 0,
-    reasons: [
-      ...decision.reasons,
-      `host-plan:${plan.rationale}`,
-      useWorker ? 'Host delegated bounded work to Worker' : 'Host retained the task without Worker delegation',
-      useBoss ? 'Boss authority requested by Host or mandatory safety policy' : 'Boss not required by Host or safety policy',
-    ],
-  });
-}
-
-function hostPlanningFallback(
-  decision: RouteDecision,
-  request: GatewayTurnPreflightRequest,
-): RouteDecision {
-  const useVerifier = request.userRequestedVerification
-    || decision.requiresApproval
-    || decision.risk === 'high'
-    || decision.risk === 'critical';
-  const useBoss = request.userRequestedBoss
-    || decision.requiresApproval
-    || decision.risk === 'critical';
-  return RouteDecisionSchema.parse({
-    ...decision,
-    useWorker: false,
-    workerTier: 'none',
-    maxWorkerCalls: 0,
-    useVerifier,
-    verifierTier: useVerifier ? (decision.verifierTier === 'none' ? 'cheap' : decision.verifierTier) : 'none',
-    useBoss,
-    allowEscalation: decision.allowEscalation || useBoss,
-    pipelineMode: useBoss
-      ? 'escalated_deep_path'
-      : useVerifier
-        ? 'verified_path'
-        : decision.useTools || decision.useMemory
-          ? 'grounded_path'
-          : 'direct_fast_path',
-    reasons: [
-      ...decision.reasons,
-      'Host planner unavailable; Worker delegation disabled rather than letting Worker lead the turn',
-    ],
-  });
-}
-
-async function runGatewayHostPlanning(
-  request: GatewayTurnPreflightRequest,
-  input: z.infer<typeof RuntimeRunRequestSchema>,
-  baseline: RouteDecision,
-  repositoryContext: string,
-  memory: GatewayMemoryBrief,
-  runId: string,
-): Promise<{ plan?: GatewayHostPlan; call?: RuntimeModelResult; decision: RouteDecision }> {
-  if (!needsHostPlanning(request, baseline)) return { decision: baseline };
-
-  const complexPlanner = baseline.risk === 'high'
-    || baseline.risk === 'critical'
-    || baseline.taskType === 'planning_or_architecture'
-    || request.estimatedContextTokens >= 40_000;
-  const plannerPromptTokens = estimateTokenCount([
-    request.request,
-    request.context.slice(-12_000),
-    repositoryContext.slice(0, 16_000),
-    memory.context.slice(0, 10_000),
-  ].join('\n\n'));
-
-  const call = await callRuntimeModel('host', [
-    {
-      role: 'system',
-      content: `You are the Zenos Host Planner, the primary brain and orchestrator for this user turn.
-Understand the user's goal before any Worker or Boss is invoked. Do not answer the user yet.
-Delegate to Worker only for bounded inspection, evidence extraction, compression, or implementation support.
-Use Verifier when independent checking materially improves reliability.
-Boss is the highest decision authority, but invoke Boss only for explicit user requests, critical/high-stakes uncertainty, unresolved conflict, or when your confidence is genuinely insufficient.
-Return ONLY JSON matching:
-{"intentSummary":"...","useWorker":true,"workerTask":"...","useVerifier":false,"useBoss":false,"confidence":0.0,"rationale":"...","acceptanceCriteria":["..."],"constraints":["..."]}`,
-    },
-    {
-      role: 'user',
-      content: `User request:\n${request.request}\n\nDeterministic safety baseline:\n${JSON.stringify(baseline)}\n\nConversation context (bounded):\n${request.context.slice(-12_000) || '(none)'}\n\nDurable Memory context (bounded):\n${memory.context.slice(0, 10_000) || '(none)'}\n\nRepository context (bounded):\n${repositoryContext.slice(0, 16_000) || '(none)'}\n\nChoose the minimum sufficient delegation while keeping Host responsible for the final decision.`,
-    },
-  ], {
-    json: true,
-    maxTokens: complexPlanner ? 600 : 400,
-    maxInputTokens: complexPlanner
-      ? 6_000
-      : Math.max(1_800, Math.min(3_500, plannerPromptTokens + 500)),
-    sessionId: request.sessionId,
-    modelOverrides: input.modelOverrides,
-    requestId: `${runId}:gateway-host-plan`,
-    trigger: 'host_planning',
-  });
-  const plan = safeHostPlan(call);
-  return {
-    plan,
-    call,
-    decision: plan
-      ? pipelineForHostPlan(baseline, plan, request)
-      : hostPlanningFallback(baseline, request),
-  };
-}
-
-function compactHostPlan(plan?: GatewayHostPlan): string {
-  if (!plan) return '';
-  return [
-    `Host intent: ${plan.intentSummary}`,
-    `Host orchestration: worker=${plan.useWorker}; verifier=${plan.useVerifier}; boss=${plan.useBoss}; confidence=${plan.confidence.toFixed(2)}`,
-    plan.workerTask ? `Worker delegation: ${plan.workerTask}` : '',
-    plan.acceptanceCriteria.length ? `Acceptance criteria: ${plan.acceptanceCriteria.join('; ')}` : '',
-    plan.constraints.length ? `Constraints: ${plan.constraints.join('; ')}` : '',
-    `Host rationale: ${plan.rationale}`,
-  ].filter(Boolean).join('\n');
+function memoryCoverageScore(memory: GatewayMemoryBrief): number | undefined {
+  if (!memory.coverage) return undefined;
+  const checks = [
+    memory.coverage.goal,
+    memory.coverage.decisions,
+    memory.coverage.pendingWork,
+    memory.coverage.questions,
+    memory.coverage.artifacts,
+  ];
+  return checks.filter(Boolean).length / checks.length;
 }
 
 export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
+  const turnStartedAtMs = Date.now();
   const request = GatewayTurnPreflightRequestSchema.parse(raw);
   reconcileStaleRuntimeSessions({ excludeSessionId: request.sessionId });
   const runId = `gateway_${crypto.randomUUID()}`;
   const baselineDecision = choosePipeline(request);
+  const latencyPlan = createLatencyBudgetPlan(baselineDecision);
   let decision = baselineDecision;
   const existingSession = Boolean(getRuntimeSession(request.sessionId));
-  const [repositoryContext, memoryBrief] = await Promise.all([
-    repositoryContextFor(request, baselineDecision),
-    gatewayMemoryContextFor(request, baselineDecision, existingSession),
-  ]);
+  const preparedContexts = await prepareGatewayContexts({
+    request,
+    decision: baselineDecision,
+    existingSession,
+    latencyPlan,
+  });
+  const { repositoryContext, memoryBrief } = preparedContexts;
+  const preflightLatency: LatencyObservation[] = [...preparedContexts.observations];
   const input = RuntimeRunRequestSchema.parse({
     ...request,
     sessionId: request.sessionId,
@@ -675,7 +223,11 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
     repositoryContext,
     memoryBrief,
     runId,
+    latencyPlan,
   );
+  if (hostPlanning.call) {
+    preflightLatency.push(observeLatency('host', hostPlanning.call.latencyMs, latencyPlan.hostMs));
+  }
   const hostPlan = hostPlanning.plan;
   const hostPlanCall = hostPlanning.call;
   decision = hostPlanning.decision;
@@ -696,7 +248,14 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
     errors: hostPlanCall && !hostPlan ? ['Host planning failed; deterministic safety route retained'] : [],
     startedAt: now(),
   });
-  const budget = createTokenBudgetPlan(decision, input, { userPriority: input.tokenPriority });
+  const baseBudget = createTokenBudgetPlan(decision, input, { userPriority: input.tokenPriority });
+  const budget = {
+    ...baseBudget,
+    host: { ...baseBudget.host, timeoutMs: roleLatencyTimeout(latencyPlan, 'host') },
+    worker: { ...baseBudget.worker, timeoutMs: roleLatencyTimeout(latencyPlan, 'worker') },
+    verifier: { ...baseBudget.verifier, timeoutMs: roleLatencyTimeout(latencyPlan, 'verifier') },
+    boss: { ...baseBudget.boss, timeoutMs: roleLatencyTimeout(latencyPlan, 'boss') },
+  };
 
   let workerResult: WorkerResult | undefined;
   let workerCall: RuntimeModelResult | undefined;
@@ -712,6 +271,7 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
     });
     workerResult = worker.result;
     workerCall = worker.call;
+    preflightLatency.push(observeLatency('worker', worker.call.latencyMs, latencyPlan.workerMs));
     recordActivity(
       request.sessionId,
       'worker',
@@ -757,9 +317,11 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
       requestId: `${runId}:gateway-boss-preflight`,
       maxInputTokens: 1_800,
       maxOutputTokens: 600,
+      timeoutMs: roleLatencyTimeout(latencyPlan, 'boss'),
       trigger: request.userRequestedBoss ? 'user_requested_boss' : 'host_or_safety_escalation',
     });
     bossPreflight = safeBossDecision(bossCall);
+    preflightLatency.push(observeLatency('boss', bossCall.latencyMs, latencyPlan.bossMs));
     recordActivity(
       request.sessionId,
       'boss',
@@ -807,7 +369,7 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
 
   const holdFinalDelivery = decision.useVerifier || decision.useBoss || decision.requiresApproval;
   const stored: StoredGatewayPreflight = {
-    kind: 'gateway_preflight_v1',
+    kind: 'gateway_preflight_v2',
     input,
     turnId: request.turnId,
     platform: request.platform,
@@ -819,6 +381,11 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
     bossPreflight,
     bossCall,
     repositoryContext: repositoryContext || undefined,
+    memorySource: memoryBrief.source,
+    memoryCoverage: memoryCoverageScore(memoryBrief),
+    latencyPlan,
+    preflightLatency,
+    turnStartedAtMs,
     holdFinalDelivery,
   };
   store.saveRun({
@@ -856,20 +423,6 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
   };
 }
 
-function blockedAnswer(reason: string, requiredChanges: string[] = []): string {
-  return [
-    `Gue belum bisa melanjutkan hasil itu karena Runtime memblokirnya: ${reason}`,
-    requiredChanges.length ? `Yang perlu dibereskan dulu: ${requiredChanges.join('; ')}` : '',
-  ].filter(Boolean).join('\n\n');
-}
-
-function askUserAnswer(reason: string, requiredChanges: string[] = []): string {
-  return [
-    `Sebelum lanjut, gue butuh konfirmasi atau detail tambahan: ${reason}`,
-    requiredChanges.length ? requiredChanges.join('; ') : '',
-  ].filter(Boolean).join('\n\n');
-}
-
 export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
   const request = GatewayTurnPostflightRequestSchema.parse(raw);
   const store = getRuntimeStore();
@@ -877,6 +430,8 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
   if (!run || run.sessionId !== request.sessionId) throw new Error('Gateway Runtime run was not found for this session');
   const decision = RouteDecisionSchema.parse(run.decision);
   const stored = StoredGatewayPreflightSchema.parse(run.result);
+  const latencyPlan = stored.latencyPlan || createLatencyBudgetPlan(decision);
+  const turnStartedAtMs = stored.turnStartedAtMs || Date.parse(run.startedAt) || Date.now();
   const input = RuntimeRunRequestSchema.parse({
     ...stored.input,
     sessionId: request.sessionId,
@@ -886,7 +441,18 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
       request.toolSummary,
     ].filter(Boolean).join('\n\n'),
   });
-  const budget = createTokenBudgetPlan(decision, input, { userPriority: input.tokenPriority });
+  const baseBudget = createTokenBudgetPlan(decision, input, { userPriority: input.tokenPriority });
+  const budget = {
+    ...baseBudget,
+    host: { ...baseBudget.host, timeoutMs: roleLatencyTimeout(latencyPlan, 'host') },
+    worker: { ...baseBudget.worker, timeoutMs: roleLatencyTimeout(latencyPlan, 'worker') },
+    verifier: { ...baseBudget.verifier, timeoutMs: roleLatencyTimeout(latencyPlan, 'verifier') },
+    boss: { ...baseBudget.boss, timeoutMs: roleLatencyTimeout(latencyPlan, 'boss') },
+  };
+  const postflightLatency: LatencyObservation[] = [
+    ...stored.preflightLatency,
+    observeLatency('host', request.hostDurationMs, latencyPlan.hostMs),
+  ];
   const calls: RuntimeModelResult[] = [];
   if (stored.hostPlanCall) {
     const parsed = stored.hostPlanCall as RuntimeModelResult;
@@ -935,6 +501,24 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
 
   if (request.failed) {
     accountGatewayModelUsage(request.sessionId, calls, request.hostUsage);
+    recordOutcomePassport({
+      runId: request.runId,
+      sessionId: request.sessionId,
+      request: input.request,
+      decision,
+      verdict: 'failed',
+      transformed: false,
+      calls,
+      hostUsage: request.hostUsage,
+      latencyObservations: [
+        ...postflightLatency,
+        observeLatency('total', Date.now() - turnStartedAtMs, latencyPlan.totalMs),
+      ],
+      bossVerdict: stored.bossPreflight?.verdict,
+      bossConfidence: stored.bossPreflight?.confidence,
+      evidenceCoverage: stored.memoryCoverage,
+      memorySource: stored.memorySource,
+    });
     store.saveRun({
       ...run,
       status: 'failed',
@@ -978,6 +562,7 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
     verifierResult = verifier.result;
     verifierCall = verifier.call;
     calls.push(verifier.call);
+    postflightLatency.push(observeLatency('verifier', verifier.call.latencyMs, latencyPlan.verifierMs));
     recordActivity(
       request.sessionId,
       'verifier',
@@ -1002,6 +587,7 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
         budget,
       });
       calls.push(revision);
+      postflightLatency.push(observeLatency('host', revision.latencyMs, latencyPlan.hostMs));
       if (revision.ok && revision.content) {
         finalAnswer = revision.content;
         transformed = finalAnswer !== request.draft;
@@ -1059,9 +645,11 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
       requestId: `${request.runId}:gateway-boss-postflight`,
       maxInputTokens: 2_400,
       maxOutputTokens: 700,
+      timeoutMs: roleLatencyTimeout(latencyPlan, 'boss'),
       trigger: verifierResult?.verdict === 'escalate' ? 'verifier_escalation' : 'critical_postflight_authority',
     });
     calls.push(finalBossCall);
+    postflightLatency.push(observeLatency('boss', finalBossCall.latencyMs, latencyPlan.bossMs));
     const parsedBoss = safeBossDecision(finalBossCall);
     if (parsedBoss) {
       bossDecision = parsedBoss;
@@ -1090,6 +678,7 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
         budget,
       });
       calls.push(revision);
+      postflightLatency.push(observeLatency('host', revision.latencyMs, latencyPlan.hostMs));
       if (revision.ok && revision.content) {
         finalAnswer = revision.content;
         transformed = finalAnswer !== request.draft;
@@ -1128,6 +717,7 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
       budget,
     });
     calls.push(finalVerifier.call);
+    postflightLatency.push(observeLatency('verifier', finalVerifier.call.latencyMs, latencyPlan.verifierMs));
     if (finalVerifier.result) verifierResult = finalVerifier.result;
     recordActivity(
       request.sessionId,
@@ -1189,6 +779,31 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
     completedAt: now(),
   });
   accountGatewayModelUsage(request.sessionId, calls, request.hostUsage);
+  const outcomeVerdict = bossDecision?.verdict === 'block' || verifierResult?.verdict === 'block'
+    ? 'blocked'
+    : transformed || verifierResult?.verdict === 'revise' || bossDecision?.verdict === 'revise'
+      ? 'revised'
+      : 'success';
+  recordOutcomePassport({
+    runId: request.runId,
+    sessionId: request.sessionId,
+    request: input.request,
+    decision,
+    verdict: outcomeVerdict,
+    transformed,
+    calls,
+    hostUsage: request.hostUsage,
+    latencyObservations: [
+      ...postflightLatency,
+      observeLatency('total', Date.now() - turnStartedAtMs, latencyPlan.totalMs),
+    ],
+    verifierVerdict: verifierResult?.verdict,
+    verifierConfidence: verifierResult?.confidence,
+    bossVerdict: bossDecision?.verdict,
+    bossConfidence: bossDecision?.confidence,
+    evidenceCoverage: stored.memoryCoverage,
+    memorySource: stored.memorySource,
+  });
   completeRuntimeSession(request.sessionId, finalAnswer);
 
   return {

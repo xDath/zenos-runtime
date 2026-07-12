@@ -13,7 +13,7 @@ import {
 } from './zenos-runtime-state';
 import { log } from './logger';
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 function defaultDatabasePath(): string {
   if (process.env.ZENOS_RUNTIME_DB_PATH) return process.env.ZENOS_RUNTIME_DB_PATH;
@@ -68,6 +68,19 @@ export type CodingTaskRecord = {
   state: unknown;
   createdAt: string;
   updatedAt: string;
+};
+
+export type OutcomeLedgerRecord = {
+  outcomeId: string;
+  runId: string;
+  sessionId?: string;
+  revision: number;
+  ledgerVersion: string;
+  verdict: string;
+  taskType: string;
+  pipelineMode: string;
+  record: unknown;
+  createdAt: string;
 };
 
 export class RuntimeStore {
@@ -218,6 +231,25 @@ export class RuntimeStore {
       CREATE INDEX IF NOT EXISTS idx_coding_tasks_run ON coding_tasks(run_id, updated_at DESC);
       CREATE INDEX IF NOT EXISTS idx_coding_tasks_session ON coding_tasks(session_id, updated_at DESC);
       CREATE INDEX IF NOT EXISTS idx_coding_tasks_status ON coding_tasks(status, updated_at DESC);
+
+      CREATE TABLE IF NOT EXISTS outcome_ledger (
+        outcome_id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        session_id TEXT,
+        revision INTEGER NOT NULL,
+        ledger_version TEXT NOT NULL,
+        verdict TEXT NOT NULL,
+        task_type TEXT NOT NULL,
+        pipeline_mode TEXT NOT NULL,
+        record_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(run_id, revision)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_outcomes_run ON outcome_ledger(run_id, revision DESC);
+      CREATE INDEX IF NOT EXISTS idx_outcomes_session ON outcome_ledger(session_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_outcomes_task ON outcome_ledger(task_type, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_outcomes_verdict ON outcome_ledger(verdict, created_at DESC);
     `);
 
     const current = this.db.prepare('SELECT value FROM runtime_meta WHERE key = ?').get('schema_version');
@@ -703,6 +735,56 @@ export class RuntimeStore {
       this.db.prepare('INSERT INTO auth_nonces(nonce, client_id, expires_at) VALUES(?, ?, ?)').run(nonce, clientId, expiresAt);
       return true;
     });
+  }
+
+  appendOutcome(input: Omit<OutcomeLedgerRecord, 'revision'>): OutcomeLedgerRecord {
+    return this.transaction(() => {
+      const latest = this.db.prepare('SELECT MAX(revision) AS revision FROM outcome_ledger WHERE run_id = ?').get(input.runId);
+      const revision = asNumber(latest?.revision, 0) + 1;
+      const record: OutcomeLedgerRecord = { ...input, revision };
+      this.db.prepare(`
+        INSERT INTO outcome_ledger(
+          outcome_id, run_id, session_id, revision, ledger_version, verdict,
+          task_type, pipeline_mode, record_json, created_at
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        record.outcomeId,
+        record.runId,
+        record.sessionId || null,
+        record.revision,
+        record.ledgerVersion,
+        record.verdict,
+        record.taskType,
+        record.pipelineMode,
+        json(record.record),
+        record.createdAt,
+      );
+      return record;
+    });
+  }
+
+  listOutcomes(limit = 100, filters: { runId?: string; sessionId?: string; taskType?: string; verdict?: string } = {}): OutcomeLedgerRecord[] {
+    const safeLimit = Math.min(Math.max(limit, 1), 500);
+    const clauses: string[] = [];
+    const values: Array<string | number> = [];
+    if (filters.runId) { clauses.push('run_id = ?'); values.push(filters.runId); }
+    if (filters.sessionId) { clauses.push('session_id = ?'); values.push(filters.sessionId); }
+    if (filters.taskType) { clauses.push('task_type = ?'); values.push(filters.taskType); }
+    if (filters.verdict) { clauses.push('verdict = ?'); values.push(filters.verdict); }
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    const rows = this.db.prepare(`SELECT * FROM outcome_ledger ${where} ORDER BY created_at DESC, revision DESC LIMIT ?`).all(...values, safeLimit);
+    return rows.map((row) => ({
+      outcomeId: asString(row.outcome_id),
+      runId: asString(row.run_id),
+      sessionId: row.session_id ? asString(row.session_id) : undefined,
+      revision: asNumber(row.revision),
+      ledgerVersion: asString(row.ledger_version),
+      verdict: asString(row.verdict),
+      taskType: asString(row.task_type),
+      pipelineMode: asString(row.pipeline_mode),
+      record: parseJson(row.record_json, null),
+      createdAt: asString(row.created_at),
+    }));
   }
 
   saveRouteEvent(input: {

@@ -5,6 +5,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { z } from 'zod';
 import { loadCodingTask, recordRemoteValidationResult } from './codex-execution-core';
+import { assertExecutionBoundary } from './execution-boundary';
 
 const execFileAsync = promisify(execFile);
 
@@ -174,11 +175,12 @@ export async function dispatchRemoteValidation(
   dependencies: RemoteValidationDependencies = {},
 ): Promise<RemoteValidationResult> {
   const request = RemoteValidationRequestSchema.parse(raw);
-  if (!request.approvalGranted) {
-    throw new Error('Remote validation requires explicit approval before creating or pushing a temporary branch');
-  }
-
   const root = path.resolve(request.workspaceRoot);
+  assertExecutionBoundary({
+    action: 'remote_validation',
+    workspaceRoot: root,
+    approvalGranted: request.approvalGranted,
+  });
   const stat = fs.statSync(root);
   if (!stat.isDirectory()) throw new Error(`Workspace root is not a directory: ${root}`);
   const runCommand = dependencies.runCommand || defaultRunCommand;

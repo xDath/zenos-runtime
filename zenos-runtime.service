@@ -1,6 +1,6 @@
 [Unit]
-Description=Zenos Runtime v0.3 - Host Worker Verifier Boss Memory Continuity
-Documentation=file:/root/openclaw-projects/zenos-runtime/README.md
+Description=Zenos Runtime v0.4 - Non-root Control Plane and Outcome Intelligence
+Documentation=file:/opt/zenos-runtime/current/README.md
 After=network-online.target 9router.service
 Wants=network-online.target
 Requires=9router.service
@@ -9,23 +9,36 @@ StartLimitBurst=8
 
 [Service]
 Type=simple
-User=root
-Group=root
-WorkingDirectory=/root/openclaw-projects/zenos-runtime
-Environment=HOME=/root
+User=zenos-runtime
+Group=zenos-runtime
+WorkingDirectory=/opt/zenos-runtime/current
+EnvironmentFile=-/etc/zenos-runtime/runtime.env
+EnvironmentFile=-/etc/zenos-runtime/profile.env
+EnvironmentFile=-/etc/zenos-runtime/global.env
+Environment=HOME=/var/lib/zenos-runtime
 Environment=NODE_ENV=production
 Environment=NODE_OPTIONS=--disable-warning=ExperimentalWarning
 Environment=PORT=3090
 Environment=ZENOS_BIND_HOST=127.0.0.1
 Environment=ZENOS_RUNTIME_DB_PATH=/var/lib/zenos-runtime/runtime.db
 Environment=ZENOS_RUNTIME_LEGACY_STORE_PATH=/var/lib/zenos-runtime/legacy-sessions.json
+Environment=ZENOS_RUNTIME_CONFIG_PATH=/etc/zenos-runtime/models.json
+Environment=ZENOS_RUNTIME_SESSION_MODEL_DIR=/var/lib/zenos-runtime/session-models
+Environment=HERMES_CONFIG_PATH=/etc/zenos-runtime/hermes-config.yaml
+Environment=ZENOS_RUNTIME_EXECUTION_MODE=control-plane
+Environment=ZENOS_RUNTIME_REMOTE_VALIDATION_ENABLED=false
+Environment=ZENOS_RUNTIME_READ_ROOTS=/opt/zenos-runtime/current:/usr/local/lib/hermes-agent:/var/lib/zenos-runtime/validation-workspaces
+Environment=ZENOS_RUNTIME_VALIDATION_ROOTS=/var/lib/zenos-runtime/validation-workspaces
+Environment=ZENOS_RUNTIME_MUTATION_ROOTS=/var/lib/zenos-runtime/executor-workspaces
 Environment=ZENOS_ALLOW_LEGACY_HMAC=false
-Environment=PATH=/root/openclaw-projects/zenos-runtime/node_modules/.bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=/opt/zenos-runtime/current/node_modules/.bin:/usr/local/bin:/usr/bin:/bin
 StateDirectory=zenos-runtime
 StateDirectoryMode=0700
+CacheDirectory=zenos-runtime
+CacheDirectoryMode=0700
 UMask=0077
-ExecStartPre=/usr/bin/test -s /root/openclaw-projects/zenos-runtime/.next/BUILD_ID
-ExecStart=/usr/bin/node /root/openclaw-projects/zenos-runtime/scripts/load-env-and-start.mjs
+ExecStartPre=/usr/bin/test -s /opt/zenos-runtime/current/.next/BUILD_ID
+ExecStart=/usr/bin/node /opt/zenos-runtime/current/scripts/load-env-and-start.mjs
 Restart=on-failure
 RestartSec=3
 TimeoutStartSec=45
@@ -34,15 +47,25 @@ KillSignal=SIGTERM
 KillMode=mixed
 SuccessExitStatus=143 SIGTERM
 NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
 PrivateTmp=true
 PrivateDevices=true
-ProtectSystem=full
-ProtectHome=read-only
-ReadWritePaths=/var/lib/zenos-runtime /root/.hermes/profiles/zenos
+DevicePolicy=closed
+ProtectSystem=strict
+ProtectHome=true
+ProtectHostname=true
+ProtectClock=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectKernelLogs=true
 ProtectControlGroups=true
+ProtectProc=invisible
+ProcSubset=pid
+ReadOnlyPaths=/opt/zenos-runtime/current /etc/zenos-runtime
+ReadWritePaths=/var/lib/zenos-runtime /var/cache/zenos-runtime
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
 RestrictSUIDSGID=true
 LockPersonality=true
 RestrictRealtime=true

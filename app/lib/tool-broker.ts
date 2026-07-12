@@ -2,6 +2,7 @@ import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { z } from 'zod';
+import { assertExecutionBoundary } from './execution-boundary';
 import { incrementMetric, observeDuration } from './metrics';
 import {
   buildRepositoryIndex,
@@ -104,6 +105,26 @@ export class ToolBroker {
         status: 'blocked',
         summary: 'Production tools are disabled for this runtime request.',
         details: { risk: definition.risk },
+        durationMs: 0,
+        cacheable: false,
+        evidence: true,
+      });
+    }
+    try {
+      if (definition.risk === 'write_local' && !definition.remotePreferred) {
+        assertExecutionBoundary({ action: 'local_mutation', workspaceRoot: context.cwd, approvalGranted: context.approvalGranted });
+      } else if (definition.risk === 'destructive') {
+        assertExecutionBoundary({ action: 'rollback', workspaceRoot: context.cwd, approvalGranted: context.approvalGranted });
+      } else if (definition.risk === 'production') {
+        assertExecutionBoundary({ action: 'production_action', workspaceRoot: context.cwd, approvalGranted: context.approvalGranted });
+      }
+    } catch (error) {
+      incrementMetric('runtime_tool_calls_total', { tool: name, status: 'blocked' });
+      return ToolEvidenceSchema.parse({
+        tool: name,
+        status: 'blocked',
+        summary: error instanceof Error ? error.message : String(error),
+        details: { risk: definition.risk, boundary: 'execution-mode' },
         durationMs: 0,
         cacheable: false,
         evidence: true,
