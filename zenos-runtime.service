@@ -1,5 +1,5 @@
 [Unit]
-Description=Zenos Runtime v0.4 - Non-root Control Plane and Outcome Intelligence
+Description=Zenos Runtime v0.5 - Non-root Control Plane and Outcome Intelligence
 Documentation=file:/opt/zenos-runtime/current/README.md
 After=network-online.target 9router.service
 Wants=network-online.target

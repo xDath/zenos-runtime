@@ -79,7 +79,7 @@ function runtimeApiKey(): string {
 }
 
 function legacyHmacAllowed(): boolean {
-  return process.env.ZENOS_ALLOW_LEGACY_HMAC !== 'false';
+  return process.env.ZENOS_ALLOW_LEGACY_HMAC === 'true';
 }
 
 function insecureDevelopmentAllowed(): boolean {

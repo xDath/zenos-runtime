@@ -5,7 +5,7 @@ import { memoryConfigurationSummary, memoryDependencyHealth } from './zenos-memo
 import { runtimeReadinessReport } from './zenos-runtime';
 import { getRuntimeStore } from './zenos-runtime-store';
 
-export const ZENOS_RUNTIME_VERSION = '0.4.0';
+export const ZENOS_RUNTIME_VERSION = '0.5.0';
 
 export type ReadinessCheck = {
   name: string;

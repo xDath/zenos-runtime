@@ -3,7 +3,9 @@ name: Zenos Runtime Remote Validation
 on:
   push:
     branches:
+      - "main"
       - "etla/runtime/**"
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -36,8 +38,8 @@ jobs:
       - name: Lint
         run: npm run lint -- --quiet
 
-      - name: Unit and integration tests
-        run: npm test
+      - name: Unit, route integration, and coverage tests
+        run: npm run test:coverage
 
       - name: Runtime smoke with isolated model slots
         run: npm run smoke:runtime

@@ -1,4 +1,5 @@
 import * as crypto from 'node:crypto';
+import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { z } from 'zod';
 
@@ -35,8 +36,26 @@ function configuredRoots(name: string, fallback: string[]): string[] {
   const roots = (raw ? raw.split(path.delimiter) : fallback)
     .map((value) => value.trim())
     .filter(Boolean)
-    .map((value) => path.resolve(value));
+    .map((value) => canonicalPath(value));
   return [...new Set(roots)];
+}
+
+function canonicalPath(value: string): string {
+  const resolved = path.resolve(value);
+  try {
+    return fs.realpathSync.native(resolved);
+  } catch {
+    let ancestor = resolved;
+    const missing: string[] = [];
+    while (!fs.existsSync(ancestor)) {
+      const parent = path.dirname(ancestor);
+      if (parent === ancestor) return resolved;
+      missing.unshift(path.basename(ancestor));
+      ancestor = parent;
+    }
+    const canonicalAncestor = fs.realpathSync.native(ancestor);
+    return path.join(canonicalAncestor, ...missing);
+  }
 }
 
 function mutationRoots(): string[] {
@@ -72,12 +91,12 @@ function isInside(root: string, candidate: string): boolean {
 }
 
 function allowedByRoots(candidate: string, roots: string[]): boolean {
-  const resolved = path.resolve(candidate);
+  const resolved = canonicalPath(candidate);
   return roots.some((root) => isInside(root, resolved));
 }
 
 export function workspaceFingerprint(workspaceRoot: string): string {
-  return crypto.createHash('sha256').update(path.resolve(workspaceRoot)).digest('hex').slice(0, 24);
+  return crypto.createHash('sha256').update(canonicalPath(workspaceRoot)).digest('hex').slice(0, 24);
 }
 
 export function executionBoundaryStatus() {
@@ -99,7 +118,7 @@ export function evaluateExecutionBoundary(input: {
   const action = ExecutionActionSchema.parse(input.action);
   const mode = configuredMode();
   const requiresApproval = action !== 'workspace_read';
-  const resolved = input.workspaceRoot ? path.resolve(input.workspaceRoot) : undefined;
+  const resolved = input.workspaceRoot ? canonicalPath(input.workspaceRoot) : undefined;
   const base = {
     mode,
     action,

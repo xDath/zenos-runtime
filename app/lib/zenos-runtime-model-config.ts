@@ -103,7 +103,13 @@ export function deleteSessionModelSlots(sessionId: string): boolean {
 }
 
 export function mergeModelSlots(...configs: RuntimeModelSlots[]): RuntimeModelSlots {
-  return RuntimeModelSlotsSchema.parse(Object.assign({}, ...configs));
+  const merged: Record<string, string> = {};
+  for (const config of configs) {
+    for (const [key, value] of Object.entries(config)) {
+      if (value !== undefined) merged[key] = value;
+    }
+  }
+  return RuntimeModelSlotsSchema.parse(merged);
 }
 
 export function providerForSlot(config: RuntimeModelSlots, slot: RuntimeModelSlot): string {

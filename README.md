@@ -17,7 +17,7 @@ Deterministic intent + risk policy
 SQLite WAL state + route telemetry + optional Zenos Memory
 ```
 
-## What v0.4 guarantees
+## What v0.5 guarantees
 
 - **Real four-role execution.** Host, Worker, Verifier, and Boss use distinct configurable model slots.
 - **Real revision semantics.** A `revise` verdict produces a new Host draft and another verification pass.
@@ -34,6 +34,8 @@ SQLite WAL state + route telemetry + optional Zenos Memory
 - **Outcome Passports.** Every governed gateway outcome receives an immutable versioned passport containing route, token/cache usage, latency, quality, and evidence coverage.
 - **No-Regret Routing Board.** Shadow routing aggregates outcomes and surfaces cheaper or stronger candidates, but cannot promote a route automatically without sufficient evidence and explicit human approval.
 - **Modular orchestration.** Gateway contracts, continuity, planning, rendering, accounting, latency, and outcome intelligence live in bounded modules instead of one orchestration god-file.
+- **Verified HTTP execution plane.** Health, routing, durable sessions, scoped auth, dry-run orchestration, idempotent replay, and conflict responses are exercised through the actual Next.js Route Handlers.
+- **Canonical filesystem boundaries.** Read, mutation, and remote-validation roots resolve real paths and reject symlink escapes before tools or Git operations run.
 
 ## Current default role models
 
@@ -211,6 +213,14 @@ Protected readiness:
 curl -sS http://127.0.0.1:3090/api/runtime/readiness \
   -H "Authorization: Bearer $ZENOS_RUNTIME_API_KEY"
 ```
+
+Real four-role live evidence (uses the configured production models and incurs model calls):
+
+```bash
+ZENOS_RUNTIME_API_KEY=... npm run smoke:live
+```
+
+The smoke fails unless the actual HTTP control plane returns a completed execution receipt with Host, Worker, Verifier, and Boss calls.
 
 The readiness endpoint tests the policy suite, SQLite integrity, fail-closed authentication, execution-mode boundary, schema-v4 Outcome Passport ledger, all role-model slots, 9Router reachability, and optional Zenos Memory reachability. It does not return a hardcoded success label.
 

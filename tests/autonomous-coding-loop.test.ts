@@ -1,4 +1,4 @@
-import test from 'node:test';
+import test, { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
@@ -35,6 +35,19 @@ function createFixture(): string {
   fs.writeFileSync(path.join(root, 'src', 'value.ts'), 'export const value = 1;\n');
   fs.writeFileSync(path.join(root, 'tests', 'value.test.ts'), "import { value } from '../src/value';\nvoid value;\n");
   return root;
+}
+
+function configureFixtureBoundary(root: string, context: TestContext): void {
+  const originalMode = process.env.ZENOS_RUNTIME_EXECUTION_MODE;
+  const originalRoots = process.env.ZENOS_RUNTIME_MUTATION_ROOTS;
+  process.env.ZENOS_RUNTIME_EXECUTION_MODE = 'isolated-executor';
+  process.env.ZENOS_RUNTIME_MUTATION_ROOTS = root;
+  context.after(() => {
+    if (originalMode === undefined) delete process.env.ZENOS_RUNTIME_EXECUTION_MODE;
+    else process.env.ZENOS_RUNTIME_EXECUTION_MODE = originalMode;
+    if (originalRoots === undefined) delete process.env.ZENOS_RUNTIME_MUTATION_ROOTS;
+    else process.env.ZENOS_RUNTIME_MUTATION_ROOTS = originalRoots;
+  });
 }
 
 function evidence(tool: string, status: 'success' | 'failed' | 'remote_required', summary: string, details: Record<string, unknown> = {}) {
@@ -183,6 +196,7 @@ function invokerForFixture(root: string): AutonomousModelInvoker {
 
 test('autonomous coding loop plans, patches, validates, and stops at remote build boundary', async (context) => {
   const root = createFixture();
+  configureFixtureBoundary(root, context);
   resetRuntimeStoreForTests(':memory:');
   context.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const prepared = await prepareCodexExecution({
@@ -200,7 +214,7 @@ test('autonomous coding loop plans, patches, validates, and stops at remote buil
     requestIdPrefix: 'run-test',
   });
 
-  assert.equal(outcome.status, 'remote_required');
+  assert.equal(outcome.status, 'remote_required', JSON.stringify(outcome, null, 2));
   assert.equal(fs.readFileSync(path.join(root, 'src', 'value.ts'), 'utf8'), 'export const value = 2;\n');
   assert.ok(outcome.task.filesChanged.includes('src/value.ts'));
   assert.ok(outcome.toolEvidence.some((item) => item.tool === 'repo.patch' && item.status === 'success'));
@@ -213,6 +227,7 @@ test('autonomous coding loop plans, patches, validates, and stops at remote buil
 
 test('autonomous coding loop rolls back a patch when validation exhausts its revision budget', async (context) => {
   const root = createFixture();
+  configureFixtureBoundary(root, context);
   resetRuntimeStoreForTests(':memory:');
   context.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const prepared = await prepareCodexExecution({
@@ -230,7 +245,7 @@ test('autonomous coding loop rolls back a patch when validation exhausts its rev
     requestIdPrefix: 'run-rollback',
   });
 
-  assert.equal(outcome.status, 'validation_failed');
+  assert.equal(outcome.status, 'validation_failed', JSON.stringify(outcome, null, 2));
   assert.equal(fs.readFileSync(path.join(root, 'src', 'value.ts'), 'utf8'), 'export const value = 1;\n');
   assert.match(outcome.summary, /checkpoint was restored/i);
   assert.ok(outcome.hostUpdates.some((item) => /rolled back/i.test(item)));
@@ -238,6 +253,7 @@ test('autonomous coding loop rolls back a patch when validation exhausts its rev
 
 test('autonomous coding loop inspects but never patches without approval', async (context) => {
   const root = createFixture();
+  configureFixtureBoundary(root, context);
   resetRuntimeStoreForTests(':memory:');
   context.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const prepared = await prepareCodexExecution({

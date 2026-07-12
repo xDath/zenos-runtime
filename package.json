@@ -1,6 +1,6 @@
 {
   "name": "zenos-runtime",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": true,
   "description": "Production-grade Zenos orchestration control plane with Host, Worker, Verifier, Boss, durable sessions, and policy-driven model routing.",
   "scripts": {
@@ -10,7 +10,9 @@
     "lint": "eslint",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test --test-concurrency=1 tests/*.test.ts",
+    "test:coverage": "tsx --test --test-concurrency=1 --experimental-test-coverage --test-coverage-lines=85 --test-coverage-branches=70 --test-coverage-functions=80 tests/*.test.ts",
     "smoke:runtime": "tsx scripts/smoke-runtime.mjs",
+    "smoke:live": "node scripts/smoke-live-orchestration.mjs",
     "validate:production": "npm run typecheck && npm run lint -- --quiet && npm run test && npm run smoke:runtime && npm run build",
     "validate:remote": "tsx scripts/run-remote-validation-gate.mts",
     "runtime:config": "node scripts/zenos-runtime-cli.mjs",

@@ -151,9 +151,19 @@ function isInsideRoot(root: string, candidate: string): boolean {
 }
 
 export function resolveRepositoryPath(root: string, relativePath: string): string {
-  const absoluteRoot = path.resolve(root);
-  const candidate = path.resolve(absoluteRoot, relativePath);
-  if (!isInsideRoot(absoluteRoot, candidate)) throw new Error(`Path escapes repository root: ${relativePath}`);
+  const absoluteRoot = fs.realpathSync.native(path.resolve(root));
+  const unresolved = path.resolve(absoluteRoot, relativePath);
+  if (!isInsideRoot(absoluteRoot, unresolved)) throw new Error(`Path escapes repository root: ${relativePath}`);
+  let ancestor = unresolved;
+  const missing: string[] = [];
+  while (!fs.existsSync(ancestor)) {
+    const parent = path.dirname(ancestor);
+    if (parent === ancestor) throw new Error(`Could not resolve repository path: ${relativePath}`);
+    missing.unshift(path.basename(ancestor));
+    ancestor = parent;
+  }
+  const candidate = path.join(fs.realpathSync.native(ancestor), ...missing);
+  if (!isInsideRoot(absoluteRoot, candidate)) throw new Error(`Path resolves outside repository root: ${relativePath}`);
   return candidate;
 }
 
