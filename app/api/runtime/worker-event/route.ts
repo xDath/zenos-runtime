@@ -1,17 +1,20 @@
-import { NextRequest, NextResponse } from 'next/server';
-import { recordWorkerEvent, WorkerEventSchema } from '@/app/lib/zenos-runtime-three-agent';
-import { validateApiKey, unauthorizedResponse } from '@/app/lib/auth';
-import { rateLimit } from '@/app/lib/rate-limit';
+import { recordWorkerEvent } from '@/app/lib/zenos-runtime-three-agent';
+import { WorkerEventSchema } from '@/app/lib/zenos-runtime-state';
+import { parseJsonBody, routeErrorResponse, routeSuccessResponse, secureRequest } from '@/app/lib/http';
+import { RATE_LIMITS } from '@/app/lib/rate-limit';
 
-export async function POST(req: NextRequest) {
-  const ip = req.headers.get('x-forwarded-for') || 'unknown';
-  if (!rateLimit(ip)) return NextResponse.json({ error: 'Rate limit exceeded' }, { status: 429 });
-  if (!validateApiKey(req)) return unauthorizedResponse();
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
+
+const ROUTE = 'runtime.worker-event';
+
+export async function POST(req: Request) {
+  const secured = await secureRequest(req, { scope: 'runtime:worker', rateLimit: RATE_LIMITS.write, maxBodyBytes: 512_000, routeName: ROUTE });
+  if (!secured.ok) return secured.response;
   try {
-    const event = WorkerEventSchema.parse(await req.json());
-    return NextResponse.json({ ok: true, session: recordWorkerEvent(event) });
+    const event = await parseJsonBody(req, WorkerEventSchema, 512_000);
+    return routeSuccessResponse({ ok: true, session: recordWorkerEvent(event) }, secured.context, ROUTE, 201);
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Invalid worker event request';
-    return NextResponse.json({ ok: false, error: message }, { status: 400 });
+    return routeErrorResponse(error, secured.context, ROUTE);
   }
 }

@@ -1,17 +1,20 @@
-import { NextRequest, NextResponse } from 'next/server';
-import { QualityGateInputSchema, runQualityGate } from '@/app/lib/zenos-runtime-three-agent';
-import { validateApiKey, unauthorizedResponse } from '@/app/lib/auth';
-import { rateLimit } from '@/app/lib/rate-limit';
+import { runQualityGate } from '@/app/lib/zenos-runtime-three-agent';
+import { QualityGateInputSchema } from '@/app/lib/zenos-runtime-state';
+import { parseJsonBody, routeErrorResponse, routeSuccessResponse, secureRequest } from '@/app/lib/http';
+import { RATE_LIMITS } from '@/app/lib/rate-limit';
 
-export async function POST(req: NextRequest) {
-  const ip = req.headers.get('x-forwarded-for') || 'unknown';
-  if (!rateLimit(ip)) return NextResponse.json({ error: 'Rate limit exceeded' }, { status: 429 });
-  if (!validateApiKey(req)) return unauthorizedResponse();
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
+
+const ROUTE = 'runtime.quality-gate';
+
+export async function POST(req: Request) {
+  const secured = await secureRequest(req, { scope: 'runtime:worker', rateLimit: RATE_LIMITS.write, maxBodyBytes: 1_000_000, routeName: ROUTE });
+  if (!secured.ok) return secured.response;
   try {
-    const parsed = QualityGateInputSchema.parse(await req.json());
-    return NextResponse.json({ ok: true, result: runQualityGate(parsed) });
+    const parsed = await parseJsonBody(req, QualityGateInputSchema, 1_000_000);
+    return routeSuccessResponse({ ok: true, result: runQualityGate(parsed) }, secured.context, ROUTE);
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Invalid quality gate request';
-    return NextResponse.json({ ok: false, error: message }, { status: 400 });
+    return routeErrorResponse(error, secured.context, ROUTE);
   }
 }

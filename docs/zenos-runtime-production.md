@@ -1,85 +1,83 @@
-# Zenos Runtime Production Readiness
+# Zenos Runtime v0.2 Production Contract
 
-**Status:** production-ready v1 foundation, not full roadmap completion.
+## Supported topology
 
-This does not mean every future roadmap idea is complete. It means the current runtime layer is safe, testable, authenticated, measurable, and integrated enough to operate as a v1 production foundation beside Hermes/Codex. The earlier phrase "production mature" should be read as "production-ready foundation", not as a finished learned router/control-plane product.
+Zenos Runtime v0.2 is production-ready for one active process on one trusted VPS. It binds to loopback, uses 9Router as its OpenAI-compatible model gateway, and stores orchestration state in SQLite WAL.
 
-## Production Surface
+This claim is deliberately narrower than “distributed platform.” Horizontal replicas require shared persistence, queues, nonces, rate limits, and idempotency before they are safe.
 
-- `POST /api/runtime/route`
-  - authenticated route decision API;
-  - returns task type, pipeline mode, model tiers, tool/memory/worker/verifier policy, and token estimate event.
-
-- `POST /api/runtime/route-event`
-  - authenticated route event persistence API;
-  - stores high-signal routing outcomes into Zenos Memory as event memories.
-
-- `GET /api/runtime/eval`
-  - authenticated regression suite for routing policy.
-
-- `GET /api/runtime/readiness`
-  - authenticated production readiness report.
-
-## Production Guarantees
-
-- No local LLM requirement.
-- No Hermes rebuild.
-- Auth and rate-limit wrappers on runtime APIs.
-- Zod validation on runtime inputs and contracts.
-- Worker outputs are capped and structured.
-- Verifier outputs are structured for pass/revise/escalate/block.
-- Route events can be stored in Zenos Memory for long-term routing learning.
-- Built-in eval covers fast, memory, worker, coding, security, and deploy paths.
-- Smoke test verifies schemas, eval, memory serialization, and readiness status.
-
-## Operating Procedure
-
-Run local validation:
-
-```bash
-npm run smoke:runtime
-npm run build
-npm run lint
-```
-
-Expected:
-
-- smoke passes;
-- build passes;
-- lint has no errors. Existing warnings may remain until separately cleaned.
-
-Check runtime readiness through API:
-
-```bash
-GET /api/runtime/readiness
-```
-
-Expected status:
+## Runtime contract
 
 ```text
-production_ready_v1
+request
+  -> deterministic intent/risk policy
+  -> optional Zenos Memory recall
+  -> bounded Worker passes
+  -> Host synthesis
+  -> Verifier gate
+      pass      -> answer
+      revise    -> Host revision -> verify again
+      escalate  -> Boss packet -> decision
+      block     -> stop
+  -> durable run/session/telemetry
 ```
 
-## Route Event Persistence Policy
+The four default model roles remain:
 
-Persist route events when they are useful for learning:
+```text
+Host      grok
+Worker    build
+Boss      codex
+Verifier  grok
+```
 
-- verifier failed;
-- route escalated;
-- task was high-risk;
-- user corrected the result;
-- task represented a reusable procedure;
-- model performance matters for future routing.
+## Production gates
 
-Do not persist trivial fast-path chat noise.
+`npm run validate:production` must pass all of:
 
-## Remaining Future Enhancements
+- strict TypeScript validation;
+- ESLint with zero errors;
+- deterministic policy, persistence, auth, and mocked model integration tests;
+- runtime smoke suite;
+- Next.js production build without ignored type errors.
 
-These are not required for production-mature v1, but they are the next upgrades:
+Live deployment must additionally pass:
 
-- provider-specific live cost pricing;
-- learned router from stored route events;
-- dashboard visualization for route quality/cost/latency;
-- direct Hermes hook/plugin packaging;
-- broader benchmark dataset;
-- RAG/worker evals with real model calls.
+- `systemctl is-active zenos-runtime.service`;
+- public liveness on `/api/health`;
+- authenticated `/api/runtime/readiness`;
+- SQLite `quick_check`;
+- 9Router dependency probe;
+- one real Host model pipeline call;
+- confirmation that all four default model slots are unchanged.
+
+## Durable state
+
+The systemd deployment uses `/var/lib/zenos-runtime/runtime.db` with:
+
+- WAL journal mode;
+- `synchronous=FULL`;
+- foreign keys;
+- immediate write transactions;
+- persisted idempotency and replay nonces;
+- database schema versioning;
+- readiness integrity checks.
+
+## Failure semantics
+
+- Missing authentication: reject.
+- Invalid body/schema: reject before model execution.
+- Duplicate nonce: reject.
+- Duplicate idempotency key with same request: replay stored response.
+- Duplicate key with different request: conflict.
+- Worker failure: warn and allow Host to continue only when safe.
+- Host failure: fail the run.
+- Verifier revise: revise and re-check.
+- Verifier/Boss block: fail closed.
+- Critical Boss failure: fail the run.
+- Optional Memory failure: degrade with explicit warning; do not invent recall.
+- SQLite integrity failure: readiness fails.
+
+## Operational endpoints
+
+See [`../README.md`](../README.md) for the complete scoped endpoint table. `/api/health` is liveness only. `/api/runtime/readiness` is the production readiness source of truth and is authenticated.

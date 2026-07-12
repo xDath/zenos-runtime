@@ -1,0 +1,56 @@
+[Unit]
+Description=Zenos Runtime v0.2 - Host Worker Verifier Boss Orchestration
+Documentation=file:/root/openclaw-projects/zenos-runtime/README.md
+After=network-online.target 9router.service
+Wants=network-online.target
+Requires=9router.service
+StartLimitIntervalSec=60
+StartLimitBurst=8
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/root/openclaw-projects/zenos-runtime
+Environment=HOME=/root
+Environment=NODE_ENV=production
+Environment=NODE_OPTIONS=--disable-warning=ExperimentalWarning
+Environment=PORT=3090
+Environment=ZENOS_BIND_HOST=127.0.0.1
+Environment=ZENOS_RUNTIME_DB_PATH=/var/lib/zenos-runtime/runtime.db
+Environment=ZENOS_RUNTIME_LEGACY_STORE_PATH=/var/lib/zenos-runtime/legacy-sessions.json
+Environment=ZENOS_ALLOW_LEGACY_HMAC=false
+Environment=PATH=/root/openclaw-projects/zenos-runtime/node_modules/.bin:/usr/local/bin:/usr/bin:/bin
+StateDirectory=zenos-runtime
+StateDirectoryMode=0700
+UMask=0077
+ExecStartPre=/usr/bin/test -s /root/openclaw-projects/zenos-runtime/.next/BUILD_ID
+ExecStart=/usr/bin/node /root/openclaw-projects/zenos-runtime/scripts/load-env-and-start.mjs
+Restart=on-failure
+RestartSec=3
+TimeoutStartSec=45
+TimeoutStopSec=30
+KillSignal=SIGTERM
+KillMode=mixed
+SuccessExitStatus=143 SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/var/lib/zenos-runtime /root/.hermes/profiles/zenos
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zenos-runtime
+
+[Install]
+WantedBy=multi-user.target

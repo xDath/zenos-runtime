@@ -1,33 +1,29 @@
-import * as fs from 'node:fs';
-import { z } from 'zod';
-import { RuntimeSessionState, RuntimeSessionStateSchema } from './zenos-runtime-three-agent';
-
-const STORE_PATH = process.env.ZENOS_RUNTIME_STORE_PATH || '/tmp/zenos-runtime-sessions.json';
+/**
+ * @deprecated Zenos Runtime v0.2 uses the transactional SQLite store in
+ * `zenos-runtime-store.ts`. This compatibility module remains only so older
+ * local imports fail safely instead of silently reviving the former JSON store.
+ */
+import { getRuntimeStore } from './zenos-runtime-store';
+import { RuntimeSessionState } from './zenos-runtime-state';
 
 export function loadRuntimeSessionsFromDisk(): RuntimeSessionState[] {
-  if (process.env.ZENOS_RUNTIME_DISABLE_FILE_STORE === 'true') return [];
-  try {
-    if (!fs.existsSync(STORE_PATH)) return [];
-    const raw = JSON.parse(fs.readFileSync(STORE_PATH, 'utf8')) as unknown;
-    return z.array(RuntimeSessionStateSchema).parse(raw);
-  } catch {
-    return [];
-  }
+  return getRuntimeStore().listSessions(500);
 }
 
 export function saveRuntimeSessionsToDisk(sessions: RuntimeSessionState[]): void {
-  if (process.env.ZENOS_RUNTIME_DISABLE_FILE_STORE === 'true') return;
-  try {
-    fs.mkdirSync(STORE_PATH.slice(0, STORE_PATH.lastIndexOf('/')) || '.', { recursive: true });
-    fs.writeFileSync(STORE_PATH, JSON.stringify(sessions, null, 2));
-  } catch {
-    // Persistence is best-effort so API calls do not fail on filesystem issues.
-  }
+  const store = getRuntimeStore();
+  store.transaction(() => {
+    for (const session of sessions) store.saveSession(session);
+  });
 }
 
 export function runtimeFileStoreInfo() {
+  const health = getRuntimeStore().health();
   return {
-    durable: process.env.ZENOS_RUNTIME_DISABLE_FILE_STORE !== 'true',
-    path: STORE_PATH,
+    durable: health.ok,
+    engine: 'sqlite-wal',
+    path: health.path,
+    integrity: health.integrity,
+    schemaVersion: health.schemaVersion,
   };
 }

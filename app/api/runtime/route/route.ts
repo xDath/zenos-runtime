@@ -1,40 +1,29 @@
-import { NextRequest, NextResponse } from 'next/server';
 import { buildRouteEvent, choosePipeline, RuntimeContextSchema } from '@/app/lib/zenos-runtime';
-import { validateApiKey, unauthorizedResponse } from '@/app/lib/auth';
-import { rateLimit } from '@/app/lib/rate-limit';
+import { parseJsonBody, routeErrorResponse, routeSuccessResponse, secureRequest } from '@/app/lib/http';
+import { RATE_LIMITS } from '@/app/lib/rate-limit';
 
-export async function POST(req: NextRequest) {
-  const ip = req.headers.get('x-forwarded-for') || 'unknown';
-  if (!rateLimit(ip)) {
-    return NextResponse.json({ error: 'Rate limit exceeded' }, { status: 429 });
-  }
-  if (!validateApiKey(req)) {
-    return unauthorizedResponse();
-  }
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
 
+const ROUTE = 'runtime.route';
+
+export async function POST(req: Request) {
+  const secured = await secureRequest(req, { scope: 'runtime:route', rateLimit: RATE_LIMITS.write, maxBodyBytes: 256_000, routeName: ROUTE });
+  if (!secured.ok) return secured.response;
   try {
-    const body = await req.json();
-    const context = RuntimeContextSchema.parse(body);
+    const context = await parseJsonBody(req, RuntimeContextSchema, 256_000);
     const decision = choosePipeline(context);
-    const routeEvent = buildRouteEvent(decision, context);
-
-    return NextResponse.json({
-      ok: true,
-      productionReady: true,
-      decision,
-      routeEvent,
-    });
+    return routeSuccessResponse({ ok: true, decision, routeEvent: buildRouteEvent(decision, context) }, secured.context, ROUTE);
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Invalid runtime route request';
-    return NextResponse.json({ ok: false, error: message }, { status: 400 });
+    return routeErrorResponse(error, secured.context, ROUTE);
   }
 }
 
 export async function GET() {
-  return NextResponse.json({
+  return Response.json({
     endpoint: '/api/runtime/route',
     method: 'POST',
-    description: 'Classify a request and return Zenos Runtime routing policy.',
-    productionReady: true,
-  });
+    description: 'Classify a request using the deterministic Zenos routing and risk policy.',
+    auth: 'runtime:route',
+  }, { headers: { 'Cache-Control': 'no-store' } });
 }

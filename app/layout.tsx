@@ -13,8 +13,9 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Zenos Runtime",
-  description: "Standalone routing and orchestration layer for Zenos.",
+  title: "Zenos Runtime — Governed Multi-Agent Control Plane",
+  description: "Durable Host, Worker, Verifier, and Boss orchestration for Hermes and 9Router.",
+  robots: { index: false, follow: false },
 };
 
 export default function RootLayout({

@@ -1,0 +1,222 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {
+  postflightGatewayTurn,
+  preflightGatewayTurn,
+} from '../app/lib/gateway-orchestration';
+import { getRuntimeSession } from '../app/lib/zenos-runtime-three-agent';
+import { resetRuntimeStoreForTests } from '../app/lib/zenos-runtime-store';
+
+function modelResponse(content: unknown): Response {
+  return Response.json({
+    choices: [{
+      message: { content: typeof content === 'string' ? content : JSON.stringify(content) },
+      finish_reason: 'stop',
+    }],
+    usage: { prompt_tokens: 120, completion_tokens: 60, total_tokens: 180 },
+  });
+}
+
+function modelOverrides() {
+  return {
+    baseUrl: 'http://router.test/v1',
+    apiKey: 'test-model-key',
+    hostModel: 'runtime-host',
+    hostProvider: 'test-router',
+    workerModel: 'runtime-worker',
+    workerProvider: 'test-router',
+    verifierModel: 'runtime-verifier',
+    verifierProvider: 'test-router',
+    bossModel: 'runtime-boss',
+    bossProvider: 'test-router',
+  };
+}
+
+test.beforeEach(() => {
+  resetRuntimeStoreForTests(':memory:');
+  process.env.ZENOS_RUNTIME_DISABLE_MEMORY = 'true';
+  process.env.ZENOS_RUNTIME_DISABLE_MEMORY_AUTO_RECALL = 'true';
+});
+
+test('native gateway direct path persists a real Runtime turn while skipping unnecessary roles', async () => {
+  const originalFetch = globalThis.fetch;
+  let fetchCalls = 0;
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    throw new Error('direct path must not call a Runtime model');
+  };
+
+  try {
+    const preflight = await preflightGatewayTurn({
+      request: 'halo, jawab singkat ya',
+      sessionId: 'hermes_direct_test',
+      turnId: 'turn-direct-1',
+      platform: 'telegram',
+      host: { model: 'grok', provider: 'etla-router' },
+      intent: 'explain',
+      modelOverrides: modelOverrides(),
+    });
+
+    assert.equal(preflight.decision.pipelineMode, 'direct_fast_path');
+    assert.equal(preflight.receipt.worker.invoked, false);
+    assert.equal(preflight.receipt.verifier.invoked, false);
+    assert.equal(preflight.receipt.boss.invoked, false);
+    assert.equal(preflight.holdFinalDelivery, false);
+    assert.match(preflight.hostContext, /Worker skipped/i);
+
+    const postflight = await postflightGatewayTurn({
+      sessionId: 'hermes_direct_test',
+      runId: preflight.runId,
+      turnId: 'turn-direct-1',
+      draft: 'Halo juga.',
+      host: { model: 'grok', provider: 'etla-router' },
+      hostUsage: { inputTokens: 20, outputTokens: 4 },
+    });
+
+    assert.equal(postflight.finalAnswer, 'Halo juga.');
+    assert.equal(postflight.transformed, false);
+    assert.equal(fetchCalls, 0);
+    const session = getRuntimeSession('hermes_direct_test');
+    assert.equal(session?.status, 'done');
+    assert.equal(session?.finalAnswer, 'Halo juga.');
+    assert.ok(session?.events.some((event) => event.metadata.role === 'host'));
+    assert.ok(session?.events.some((event) => event.metadata.role === 'worker' && event.metadata.outcome === 'skipped'));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('native gateway worker path calls the configured Worker and injects its bounded brief into Hermes Host context', async () => {
+  const originalFetch = globalThis.fetch;
+  const calledModels: string[] = [];
+  globalThis.fetch = async (_input: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body || '{}')) as { model: string };
+    calledModels.push(body.model);
+    if (body.model === 'runtime-worker') {
+      return modelResponse({
+        task: 'summarize long context',
+        summary: ['The request requires a concise evidence-preserving summary.'],
+        findings: [{ claim: 'The source contains three operational constraints.', evidence: ['provided-context'], confidence: 0.94, risk: 'low' }],
+        contradictions: [],
+        unknowns: [],
+        suggestedNextStep: 'Host should synthesize the bounded brief.',
+        needsHostAttention: ['retain all three constraints'],
+        rawContextNeeded: [],
+        sourceCoverage: 0.92,
+      });
+    }
+    throw new Error(`Unexpected model ${body.model}`);
+  };
+
+  try {
+    const preflight = await preflightGatewayTurn({
+      request: 'ringkas dokumen panjang ini tanpa menghilangkan batasannya',
+      sessionId: 'hermes_worker_test',
+      turnId: 'turn-worker-1',
+      platform: 'whatsapp',
+      host: { model: 'grok', provider: 'etla-router' },
+      context: 'constraint A\nconstraint B\nconstraint C',
+      estimatedContextTokens: 10_000,
+      intent: 'analyze',
+      modelOverrides: modelOverrides(),
+    });
+
+    assert.equal(preflight.decision.useWorker, true);
+    assert.equal(preflight.receipt.worker.invoked, true);
+    assert.equal(preflight.receipt.worker.model, 'runtime-worker');
+    assert.match(preflight.hostContext, /three operational constraints/i);
+    assert.deepEqual(calledModels, ['runtime-worker']);
+
+    const postflight = await postflightGatewayTurn({
+      sessionId: 'hermes_worker_test',
+      runId: preflight.runId,
+      turnId: 'turn-worker-1',
+      draft: 'Ringkasan Host yang mempertahankan constraint A, B, dan C.',
+      host: { model: 'grok', provider: 'etla-router' },
+      hostUsage: { inputTokens: 500, outputTokens: 80 },
+    });
+
+    assert.equal(postflight.receipt.worker.invoked, true);
+    assert.equal(postflight.receipt.verifier.invoked, false);
+    assert.equal(postflight.finalAnswer, 'Ringkasan Host yang mempertahankan constraint A, B, dan C.');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('native gateway verified critical path executes Verifier and Boss before releasing the Hermes draft', async () => {
+  const originalFetch = globalThis.fetch;
+  const calledModels: string[] = [];
+  let bossCalls = 0;
+  globalThis.fetch = async (_input: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body || '{}')) as { model: string; messages: Array<{ role: string; content: string }> };
+    calledModels.push(body.model);
+    if (body.model === 'runtime-verifier') {
+      return modelResponse({
+        verdict: 'pass',
+        confidence: 0.97,
+        issues: [],
+        checks: {
+          followsUserRequest: 'pass',
+          sourceGrounded: 'not_applicable',
+          secretSafe: 'pass',
+          actionSafe: 'pass',
+          testsOrValidation: 'not_applicable',
+        },
+        nextAction: 'answer',
+      });
+    }
+    if (body.model === 'runtime-boss') {
+      bossCalls += 1;
+      return modelResponse({
+        verdict: 'approve',
+        confidence: 0.95,
+        reasoningSummary: bossCalls === 1
+          ? 'Preflight permits only an advisory deployment plan.'
+          : 'Postflight draft is advisory and does not claim execution.',
+        requiredChanges: [],
+        allowedActions: ['provide an advisory plan'],
+        forbiddenActions: ['claim production deployment occurred'],
+      });
+    }
+    throw new Error(`Unexpected model ${body.model}`);
+  };
+
+  try {
+    const preflight = await preflightGatewayTurn({
+      request: 'deploy ke production sekarang',
+      sessionId: 'hermes_critical_test',
+      turnId: 'turn-critical-1',
+      platform: 'telegram',
+      host: { model: 'grok', provider: 'etla-router' },
+      intent: 'execute',
+      approvalGranted: false,
+      modelOverrides: modelOverrides(),
+    });
+
+    assert.equal(preflight.decision.useBoss, true);
+    assert.equal(preflight.decision.useVerifier, true);
+    assert.equal(preflight.holdFinalDelivery, true);
+    assert.equal(preflight.receipt.boss.invoked, true);
+    assert.match(preflight.hostContext, /forbidden actions/i);
+
+    const postflight = await postflightGatewayTurn({
+      sessionId: 'hermes_critical_test',
+      runId: preflight.runId,
+      turnId: 'turn-critical-1',
+      draft: 'Ini rencana advisory; deployment belum dijalankan dan tetap memerlukan approval eksplisit.',
+      host: { model: 'grok', provider: 'etla-router' },
+      hostUsage: { inputTokens: 600, outputTokens: 90 },
+    });
+
+    assert.equal(postflight.receipt.verifier.invoked, true);
+    assert.equal(postflight.receipt.verifier.verdict, 'pass');
+    assert.equal(postflight.receipt.boss.invoked, true);
+    assert.equal(postflight.receipt.boss.verdict, 'approve');
+    assert.equal(bossCalls, 2);
+    assert.ok(calledModels.includes('runtime-verifier'));
+    assert.equal(postflight.finalAnswer, 'Ini rencana advisory; deployment belum dijalankan dan tetap memerlukan approval eksplisit.');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

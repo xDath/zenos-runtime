@@ -1,227 +1,225 @@
+import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import { choosePipeline, ModelTierSchema, RiskLevelSchema, RuntimeContextSchema, WorkerFindingSchema } from './zenos-runtime';
-import { loadRuntimeSessionsFromDisk, runtimeFileStoreInfo, saveRuntimeSessionsToDisk } from './zenos-runtime-file-store';
+import { choosePipeline, RuntimeContextSchema, WorkerFinding, WorkerFindingSchema } from './zenos-runtime';
 import { RuntimeModelSlotsSchema } from './zenos-runtime-model-config';
+import { getRuntimeStore } from './zenos-runtime-store';
+import {
+  BossDecision,
+  BossDecisionSchema,
+  EscalationPacket,
+  EscalationPacketSchema,
+  QualityGateInputSchema,
+  QualityGateResult,
+  QualityGateResultSchema,
+  RuntimeSessionState,
+  RuntimeSessionStateSchema,
+  WorkerEvent,
+  WorkerEventSchema,
+  WorkerLease,
+  WorkerLeaseSchema,
+  WorkerTemplateName,
+  workerTemplates,
+} from './zenos-runtime-state';
 
-export const AgentRoleSchema = z.enum(['host', 'boss', 'worker']);
-export const WorkerEventTypeSchema = z.enum(['progress', 'finding', 'risk', 'conflict', 'tool_result', 'done', 'error']);
-export const RuntimeSessionStatusSchema = z.enum(['routing', 'working', 'paused', 'boss_review', 'finalizing', 'done', 'failed']);
-export const WorkerLeaseStatusSchema = z.enum(['queued', 'running', 'paused', 'done', 'failed', 'cancelled']);
-export const BossVerdictSchema = z.enum(['approve', 'revise', 'block', 'ask_user', 'delegate']);
+export {
+  AgentRoleSchema,
+  BossDecisionSchema,
+  BossVerdictSchema,
+  EscalationPacketSchema,
+  QualityGateInputSchema,
+  QualityGateResultSchema,
+  RuntimeBudgetStateSchema,
+  RuntimeSessionStateSchema,
+  RuntimeSessionStatusSchema,
+  WorkerEventSchema,
+  WorkerEventTypeSchema,
+  WorkerLeaseSchema,
+  WorkerLeaseStatusSchema,
+  workerTemplates,
+} from './zenos-runtime-state';
 
-export const RuntimeBudgetStateSchema = z.object({
-  maxPremiumTokens: z.number().int().nonnegative().default(4000),
-  maxHostTokens: z.number().int().nonnegative().default(8000),
-  maxWorkerTokens: z.number().int().nonnegative().default(40000),
-  premiumTokensUsed: z.number().int().nonnegative().default(0),
-  hostTokensUsed: z.number().int().nonnegative().default(0),
-  workerTokensUsed: z.number().int().nonnegative().default(0),
-  estimatedPremiumTokensAvoided: z.number().int().nonnegative().default(0),
-});
-
-export const WorkerLeaseSchema = z.object({
-  workerId: z.string().min(1),
-  template: z.string().min(1),
-  modelTier: ModelTierSchema.extract(['cheap', 'standard']),
-  task: z.string().min(1),
-  status: WorkerLeaseStatusSchema.default('queued'),
-  maxTokens: z.number().int().positive().default(6000),
-});
-
-export const WorkerEventSchema = z.object({
-  sessionId: z.string().min(1),
-  workerId: z.string().min(1),
-  type: WorkerEventTypeSchema,
-  summary: z.string().min(1),
-  evidence: z.array(z.string()).default([]),
-  severity: RiskLevelSchema.default('low'),
-  confidence: z.number().min(0).max(1).default(0.75),
-  needsBoss: z.boolean().default(false),
-  createdAt: z.string().datetime().optional(),
-});
-
-export const RuntimeSessionStateSchema = z.object({
-  sessionId: z.string().min(1),
-  userGoal: z.string().min(1),
-  status: RuntimeSessionStatusSchema.default('routing'),
-  hostModel: z.string().default('standard'),
-  bossModel: z.string().optional(),
-  modelOverrides: RuntimeModelSlotsSchema.default({}),
-  routeDecision: z.unknown().optional(),
-  workers: z.array(WorkerLeaseSchema).default([]),
-  events: z.array(WorkerEventSchema).default([]),
-  budget: RuntimeBudgetStateSchema.default({}),
-  createdAt: z.string().datetime(),
-  updatedAt: z.string().datetime(),
-});
-
-export const EscalationPacketSchema = z.object({
-  sessionId: z.string().min(1),
-  userGoal: z.string().min(1),
-  hostAssessment: z.string().min(1),
-  decisionNeeded: BossVerdictSchema,
-  workerFindings: z.array(WorkerFindingSchema).default([]),
-  conflicts: z.array(z.string()).default([]),
-  unknowns: z.array(z.string()).default([]),
-  triggeringEvents: z.array(WorkerEventSchema).default([]),
-  budget: RuntimeBudgetStateSchema,
-});
-
-export const BossDecisionSchema = z.object({
-  verdict: BossVerdictSchema,
-  confidence: z.number().min(0).max(1),
-  reasoningSummary: z.string().min(1),
-  requiredChanges: z.array(z.string()).default([]),
-  allowedActions: z.array(z.string()).default([]),
-  forbiddenActions: z.array(z.string()).default([]),
-});
-
-export const QualityGateInputSchema = z.object({
-  findings: z.array(WorkerFindingSchema).default([]),
-  events: z.array(WorkerEventSchema).default([]),
-  minConfidence: z.number().min(0).max(1).default(0.75),
-  requireEvidence: z.boolean().default(true),
-});
-
-export const QualityGateResultSchema = z.object({
-  verdict: z.enum(['pass', 'revise', 'escalate', 'block']),
-  usableFindings: z.array(WorkerFindingSchema),
-  discardedFindings: z.array(WorkerFindingSchema),
-  reasons: z.array(z.string()),
-  needsBoss: z.boolean(),
-});
-
-export type RuntimeSessionState = z.infer<typeof RuntimeSessionStateSchema>;
-export type WorkerLease = z.infer<typeof WorkerLeaseSchema>;
-export type WorkerEvent = z.infer<typeof WorkerEventSchema>;
-export type EscalationPacket = z.infer<typeof EscalationPacketSchema>;
-export type BossDecision = z.infer<typeof BossDecisionSchema>;
-export type QualityGateResult = z.infer<typeof QualityGateResultSchema>;
-
-const sessions = new Map<string, RuntimeSessionState>();
-let loadedStore = false;
-
-function loadStore(): void {
-  if (loadedStore) return;
-  loadedStore = true;
-  for (const session of loadRuntimeSessionsFromDisk()) sessions.set(session.sessionId, session);
-}
-
-function saveStore(): void {
-  saveRuntimeSessionsToDisk([...sessions.values()]);
-}
+export type {
+  BossDecision,
+  EscalationPacket,
+  QualityGateResult,
+  RuntimeSessionState,
+  WorkerEvent,
+  WorkerLease,
+  WorkerTemplateName,
+} from './zenos-runtime-state';
 
 function now(): string {
   return new Date().toISOString();
 }
 
 function id(prefix: string): string {
-  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  return `${prefix}_${randomUUID()}`;
 }
 
 export function estimateTokens(text: string): number {
   return Math.max(1, Math.ceil(text.length / 4));
 }
 
-export const workerTemplates = {
-  extractor: { modelTier: 'cheap', maxTokens: 5000, description: 'Extract explicit facts with evidence only.' },
-  summarizer: { modelTier: 'cheap', maxTokens: 7000, description: 'Compress long context into evidence-backed bullets.' },
-  classifier: { modelTier: 'cheap', maxTokens: 2500, description: 'Classify task, risk, and source dependency.' },
-  comparator: { modelTier: 'cheap', maxTokens: 6000, description: 'Compare two sources and identify differences.' },
-  coding_brief: { modelTier: 'standard', maxTokens: 8000, description: 'Map files, symbols, risks, and tests for code work.' },
-  research_brief: { modelTier: 'cheap', maxTokens: 8000, description: 'Summarize browser/search results with citations.' },
-  checklist: { modelTier: 'cheap', maxTokens: 3000, description: 'Create operational checklist from known facts.' },
-} as const;
+function withVersion(session: RuntimeSessionState, patch: Partial<RuntimeSessionState>): RuntimeSessionState {
+  return RuntimeSessionStateSchema.parse({
+    ...session,
+    ...patch,
+    version: session.version + 1,
+    updatedAt: now(),
+  });
+}
 
-export function createRuntimeSession(input: z.input<typeof RuntimeContextSchema>): RuntimeSessionState {
-  loadStore();
+export function createRuntimeSession(
+  input: z.input<typeof RuntimeContextSchema>,
+  options: {
+    sessionId?: string;
+    modelOverrides?: z.input<typeof RuntimeModelSlotsSchema>;
+    metadata?: Record<string, unknown>;
+  } = {},
+): RuntimeSessionState {
   const context = RuntimeContextSchema.parse(input);
   const decision = choosePipeline(context);
   const started = now();
-  const session: RuntimeSessionState = RuntimeSessionStateSchema.parse({
-    sessionId: id('session'),
+  const session = RuntimeSessionStateSchema.parse({
+    sessionId: options.sessionId || id('session'),
     userGoal: context.request,
-    status: decision.useWorker ? 'working' : 'routing',
+    status: 'routing',
     hostModel: decision.hostTier,
-    bossModel: decision.allowEscalation ? 'premium' : undefined,
-    modelOverrides: {},
+    bossModel: decision.useBoss ? 'premium' : undefined,
+    modelOverrides: RuntimeModelSlotsSchema.parse(options.modelOverrides || {}),
     routeDecision: decision,
     workers: [],
     events: [],
     budget: {
-      maxPremiumTokens: decision.risk === 'critical' ? 6000 : 3000,
+      maxPremiumTokens: decision.risk === 'critical' ? 10_000 : decision.hostTier === 'premium' ? 6_000 : 2_000,
       maxHostTokens: decision.maxContextTokens,
-      maxWorkerTokens: decision.useWorker ? 50000 : 0,
+      maxWorkerTokens: decision.useWorker ? Math.max(20_000, decision.maxWorkerCalls * 10_000) : 0,
+      maxModelCalls: Math.max(4, 2 + decision.maxWorkerCalls + decision.maxRevisionAttempts * 2 + (decision.useBoss ? 1 : 0)),
       premiumTokensUsed: 0,
-      hostTokensUsed: estimateTokens(context.request),
+      hostTokensUsed: 0,
       workerTokensUsed: 0,
+      verifierTokensUsed: 0,
+      modelCallsUsed: 0,
       estimatedPremiumTokensAvoided: Math.max(0, context.estimatedContextTokens - decision.maxContextTokens),
     },
+    metadata: options.metadata || {},
+    version: 1,
     createdAt: started,
     updatedAt: started,
   });
-  sessions.set(session.sessionId, session);
-  saveStore();
-  return session;
+  return getRuntimeStore().saveSession(session);
 }
 
 export function getRuntimeSession(sessionId: string): RuntimeSessionState | undefined {
-  loadStore();
-  return sessions.get(sessionId);
+  return getRuntimeStore().getSession(sessionId);
 }
 
-export function listRuntimeSessions(): RuntimeSessionState[] {
-  loadStore();
-  return [...sessions.values()].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+export function listRuntimeSessions(limit = 100): RuntimeSessionState[] {
+  return getRuntimeStore().listSessions(limit);
 }
 
-export function dispatchWorker(sessionId: string, templateName: keyof typeof workerTemplates, task: string): RuntimeSessionState {
-  loadStore();
-  const session = sessions.get(sessionId);
+export function updateRuntimeSession(
+  sessionId: string,
+  patch: Partial<Pick<RuntimeSessionState, 'status' | 'finalAnswer' | 'lastError' | 'activeRunId' | 'budget' | 'metadata' | 'modelOverrides'>>,
+): RuntimeSessionState {
+  const session = getRuntimeSession(sessionId);
   if (!session) throw new Error('Runtime session not found');
+  return getRuntimeStore().saveSession(withVersion(session, patch));
+}
+
+export function dispatchWorker(sessionId: string, templateName: WorkerTemplateName, task: string): RuntimeSessionState {
+  const store = getRuntimeStore();
+  const session = store.getSession(sessionId);
+  if (!session) throw new Error('Runtime session not found');
+  if (['done', 'failed', 'cancelled'].includes(session.status)) throw new Error(`Cannot dispatch worker for ${session.status} session`);
   const template = workerTemplates[templateName];
-  const worker: WorkerLease = WorkerLeaseSchema.parse({
+  const createdAt = now();
+  const worker = WorkerLeaseSchema.parse({
     workerId: id('worker'),
     template: templateName,
     modelTier: template.modelTier,
     task,
-    status: 'running',
+    status: 'queued',
     maxTokens: template.maxTokens,
+    attempts: 0,
+    createdAt,
+    updatedAt: createdAt,
   });
-  const updated = RuntimeSessionStateSchema.parse({
-    ...session,
-    status: 'working',
-    workers: [...session.workers, worker],
-    updatedAt: now(),
+  store.transaction(() => {
+    store.saveWorker(sessionId, worker);
+    store.saveSession(withVersion(session, { status: 'working' }));
+    store.insertEvent({
+      sessionId,
+      workerId: worker.workerId,
+      type: 'progress',
+      summary: `Worker queued with template ${templateName}.`,
+      evidence: [],
+      severity: 'low',
+      confidence: 1,
+      needsBoss: false,
+      metadata: { template: templateName },
+      createdAt,
+    });
   });
-  sessions.set(sessionId, updated);
-  saveStore();
-  return updated;
+  return store.getSession(sessionId) as RuntimeSessionState;
+}
+
+export function updateWorkerLease(
+  sessionId: string,
+  workerId: string,
+  patch: Partial<Pick<WorkerLease, 'status' | 'attempts' | 'result' | 'error'>>,
+): WorkerLease {
+  const store = getRuntimeStore();
+  const session = store.getSession(sessionId);
+  if (!session) throw new Error('Runtime session not found');
+  const worker = session.workers.find((item) => item.workerId === workerId);
+  if (!worker) throw new Error('Runtime worker not found');
+  const updated = WorkerLeaseSchema.parse({ ...worker, ...patch, updatedAt: now() });
+  return store.saveWorker(sessionId, updated);
 }
 
 export function recordWorkerEvent(input: z.input<typeof WorkerEventSchema>): RuntimeSessionState {
-  loadStore();
+  const store = getRuntimeStore();
   const event = WorkerEventSchema.parse({ ...input, createdAt: input.createdAt || now() });
-  const session = sessions.get(event.sessionId);
+  const session = store.getSession(event.sessionId);
   if (!session) throw new Error('Runtime session not found');
+  const worker = session.workers.find((item) => item.workerId === event.workerId);
   const needsPause = event.needsBoss || event.severity === 'critical' || event.type === 'risk' || event.type === 'conflict';
-  const updatedWorkers = session.workers.map((worker) => worker.workerId === event.workerId && needsPause
-    ? { ...worker, status: 'paused' as const }
-    : worker);
-  const updated = RuntimeSessionStateSchema.parse({
-    ...session,
-    status: needsPause ? 'paused' : session.status,
-    workers: updatedWorkers,
-    events: [...session.events, event],
-    budget: {
-      ...session.budget,
-      workerTokensUsed: session.budget.workerTokensUsed + estimateTokens(event.summary + event.evidence.join('\n')),
-    },
-    updatedAt: now(),
+  const terminalWorkerStatus = event.type === 'done' ? 'done' : event.type === 'error' ? 'failed' : undefined;
+  const reportedUsage = event.metadata.usage && typeof event.metadata.usage === 'object' && !Array.isArray(event.metadata.usage)
+    ? event.metadata.usage as Record<string, unknown>
+    : undefined;
+  const reportedWorkerTokens = typeof reportedUsage?.totalTokens === 'number' && Number.isFinite(reportedUsage.totalTokens)
+    ? Math.max(0, Math.round(reportedUsage.totalTokens))
+    : 0;
+
+  store.transaction(() => {
+    store.insertEvent(event);
+    if (worker) {
+      store.saveWorker(event.sessionId, WorkerLeaseSchema.parse({
+        ...worker,
+        status: terminalWorkerStatus || (needsPause ? 'paused' : worker.status === 'queued' ? 'running' : worker.status),
+        error: event.type === 'error' ? event.summary : worker.error,
+        updatedAt: now(),
+      }));
+    }
+    const nextStatus = event.type === 'error' && session.workers.length <= 1
+      ? 'failed'
+      : needsPause
+        ? 'paused'
+        : session.status === 'routing'
+          ? 'working'
+          : session.status;
+    store.saveSession(withVersion(session, {
+      status: nextStatus,
+      lastError: event.type === 'error' ? event.summary : session.lastError,
+      budget: {
+        ...session.budget,
+        workerTokensUsed: session.budget.workerTokensUsed + reportedWorkerTokens,
+      },
+    }));
   });
-  sessions.set(event.sessionId, updated);
-  saveStore();
-  return updated;
+  return store.getSession(event.sessionId) as RuntimeSessionState;
 }
 
 export function runQualityGate(input: z.input<typeof QualityGateInputSchema>): QualityGateResult {
@@ -231,29 +229,57 @@ export function runQualityGate(input: z.input<typeof QualityGateInputSchema>): Q
     return hasEvidence && finding.confidence >= parsed.minConfidence;
   });
   const discardedFindings = parsed.findings.filter((finding) => !usableFindings.includes(finding));
+  const criticalEvents = parsed.events.filter((event) => event.severity === 'critical');
   const severeEvents = parsed.events.filter((event) => event.needsBoss || event.severity === 'high' || event.severity === 'critical');
   const reasons = [
     ...discardedFindings.map((finding) => `discarded:${finding.claim}`),
     ...severeEvents.map((event) => `event:${event.type}:${event.summary}`),
   ];
   const needsBoss = severeEvents.length > 0 || discardedFindings.some((finding) => finding.risk === 'high' || finding.risk === 'critical');
-  const verdict = needsBoss ? 'escalate' : discardedFindings.length ? 'revise' : 'pass';
+  const verdict = criticalEvents.some((event) => event.type === 'risk')
+    ? 'block'
+    : needsBoss
+      ? 'escalate'
+      : discardedFindings.length
+        ? 'revise'
+        : 'pass';
   return QualityGateResultSchema.parse({ verdict, usableFindings, discardedFindings, reasons, needsBoss });
 }
 
-export function buildEscalationPacket(sessionId: string, hostAssessment = 'Host requests Boss review.'): EscalationPacket {
-  loadStore();
-  const session = sessions.get(sessionId);
+function findingsFromEvents(events: WorkerEvent[]): WorkerFinding[] {
+  const findings: WorkerFinding[] = [];
+  for (const event of events) {
+    if (event.type !== 'finding' && event.type !== 'risk' && event.type !== 'conflict') continue;
+    const candidate = WorkerFindingSchema.safeParse({
+      claim: event.summary,
+      evidence: event.evidence,
+      confidence: event.confidence,
+      risk: event.severity,
+    });
+    if (candidate.success) findings.push(candidate.data);
+  }
+  return findings.slice(0, 20);
+}
+
+export function buildEscalationPacket(
+  sessionId: string,
+  hostAssessment = 'Host requests Boss review.',
+  extras: { currentDraft?: string; runId?: string; verifierIssues?: EscalationPacket['verifierIssues'] } = {},
+): EscalationPacket {
+  const session = getRuntimeSession(sessionId);
   if (!session) throw new Error('Runtime session not found');
   const triggeringEvents = session.events.filter((event) => event.needsBoss || event.severity === 'high' || event.severity === 'critical' || event.type === 'conflict' || event.type === 'risk');
   const conflicts = session.events.filter((event) => event.type === 'conflict').map((event) => event.summary);
   const unknowns = session.events.filter((event) => event.confidence < 0.6).map((event) => event.summary);
   return EscalationPacketSchema.parse({
     sessionId,
+    runId: extras.runId,
     userGoal: session.userGoal,
     hostAssessment,
+    currentDraft: extras.currentDraft || session.finalAnswer || '',
     decisionNeeded: triggeringEvents.length ? 'approve' : 'revise',
-    workerFindings: [],
+    workerFindings: findingsFromEvents(session.events),
+    verifierIssues: extras.verifierIssues || [],
     conflicts,
     unknowns,
     triggeringEvents,
@@ -261,71 +287,99 @@ export function buildEscalationPacket(sessionId: string, hostAssessment = 'Host 
   });
 }
 
-export function applyBossDecision(sessionId: string, decisionInput: z.input<typeof BossDecisionSchema>): RuntimeSessionState {
-  loadStore();
+export function applyBossDecision(
+  sessionId: string,
+  decisionInput: z.input<typeof BossDecisionSchema>,
+  accounting: { usageTokens?: number; modelCall?: boolean } = {},
+): RuntimeSessionState {
+  const store = getRuntimeStore();
   const decision = BossDecisionSchema.parse(decisionInput);
-  const session = sessions.get(sessionId);
+  const session = store.getSession(sessionId);
   if (!session) throw new Error('Runtime session not found');
-  const status = decision.verdict === 'block' ? 'failed' : decision.verdict === 'ask_user' ? 'paused' : 'working';
-  const event: WorkerEvent = WorkerEventSchema.parse({
-    sessionId,
-    workerId: 'boss',
-    type: decision.verdict === 'block' ? 'risk' : 'progress',
-    summary: `Boss decision: ${decision.verdict}. ${decision.reasoningSummary}`,
-    evidence: decision.requiredChanges,
-    severity: decision.verdict === 'block' ? 'critical' : 'medium',
-    confidence: decision.confidence,
-    needsBoss: false,
-    createdAt: now(),
+  const status = decision.verdict === 'block'
+    ? 'failed'
+    : decision.verdict === 'ask_user'
+      ? 'paused'
+      : decision.verdict === 'revise'
+        ? 'revising'
+        : 'working';
+  store.transaction(() => {
+    store.insertEvent({
+      sessionId,
+      workerId: 'boss',
+      type: decision.verdict === 'block' ? 'risk' : 'progress',
+      summary: `Boss decision: ${decision.verdict}. ${decision.reasoningSummary}`,
+      evidence: decision.requiredChanges,
+      severity: decision.verdict === 'block' ? 'critical' : decision.verdict === 'revise' ? 'medium' : 'low',
+      confidence: decision.confidence,
+      needsBoss: false,
+      metadata: {
+        allowedActions: decision.allowedActions,
+        forbiddenActions: decision.forbiddenActions,
+        ...(accounting.modelCall ? { usage: { totalTokens: Math.max(0, Math.round(accounting.usageTokens || 0)) } } : {}),
+      },
+      createdAt: now(),
+    });
+    store.saveSession(withVersion(session, {
+      status,
+      lastError: decision.verdict === 'block' ? decision.reasoningSummary : session.lastError,
+      budget: accounting.modelCall
+        ? {
+            ...session.budget,
+            premiumTokensUsed: session.budget.premiumTokensUsed + Math.max(0, Math.round(accounting.usageTokens || 0)),
+            modelCallsUsed: session.budget.modelCallsUsed + 1,
+          }
+        : session.budget,
+    }));
   });
-  const updated = RuntimeSessionStateSchema.parse({
-    ...session,
-    status,
-    events: [...session.events, event],
-    budget: {
-      ...session.budget,
-      premiumTokensUsed: session.budget.premiumTokensUsed + estimateTokens(JSON.stringify(decision)),
-    },
-    updatedAt: now(),
-  });
-  sessions.set(sessionId, updated);
-  saveStore();
-  return updated;
+  return store.getSession(sessionId) as RuntimeSessionState;
 }
 
-export function completeRuntimeSession(sessionId: string): RuntimeSessionState {
-  loadStore();
-  const session = sessions.get(sessionId);
+export function completeRuntimeSession(sessionId: string, finalAnswer?: string): RuntimeSessionState {
+  const session = getRuntimeSession(sessionId);
   if (!session) throw new Error('Runtime session not found');
-  const updated = RuntimeSessionStateSchema.parse({ ...session, status: 'done', updatedAt: now() });
-  sessions.set(sessionId, updated);
-  saveStore();
-  return updated;
+  return getRuntimeStore().saveSession(withVersion(session, { status: 'done', finalAnswer, lastError: undefined, activeRunId: undefined }));
 }
 
-export function runtimeStoreInfo() {
-  loadStore();
-  return { ...runtimeFileStoreInfo(), sessions: sessions.size };
+export function failRuntimeSession(sessionId: string, error: string): RuntimeSessionState {
+  const session = getRuntimeSession(sessionId);
+  if (!session) throw new Error('Runtime session not found');
+  return getRuntimeStore().saveSession(withVersion(session, { status: 'failed', lastError: error, activeRunId: undefined }));
 }
 
+export function cancelRuntimeSession(sessionId: string): RuntimeSessionState {
+  const store = getRuntimeStore();
+  const session = store.getSession(sessionId);
+  if (!session) throw new Error('Runtime session not found');
+  store.transaction(() => {
+    for (const worker of session.workers.filter((item) => ['queued', 'running', 'paused'].includes(item.status))) {
+      store.saveWorker(sessionId, WorkerLeaseSchema.parse({ ...worker, status: 'cancelled', updatedAt: now() }));
+    }
+    store.saveSession(withVersion(session, { status: 'cancelled', activeRunId: undefined }));
+  });
+  return store.getSession(sessionId) as RuntimeSessionState;
+}
+
+export function runtimeStoreInfo(): ReturnType<ReturnType<typeof getRuntimeStore>['health']> & { sessions: number; engine: string } {
+  const store = getRuntimeStore();
+  return { ...store.health(), sessions: store.listSessions(500).length, engine: 'sqlite-wal' };
+}
 
 export function updateSessionModelOverrides(sessionId: string, update: z.input<typeof RuntimeModelSlotsSchema>): RuntimeSessionState {
-  loadStore();
-  const session = sessions.get(sessionId);
+  const session = getRuntimeSession(sessionId);
   if (!session) throw new Error('Runtime session not found');
   const modelOverrides = RuntimeModelSlotsSchema.parse({ ...session.modelOverrides, ...update });
-  const updated = RuntimeSessionStateSchema.parse({ ...session, modelOverrides, updatedAt: now() });
-  sessions.set(sessionId, updated);
-  saveStore();
-  return updated;
+  return getRuntimeStore().saveSession(withVersion(session, { modelOverrides }));
 }
 
 export function getRuntimeModels() {
   return {
+    architecture: 'host-worker-boss-verifier',
     roles: [
-      { role: 'host', tier: 'standard', purpose: 'middleman, user-facing routing, supervision, synthesis' },
-      { role: 'boss', tier: 'premium', purpose: 'rare high-risk judgment on escalation packets' },
-      { role: 'worker', tier: 'cheap|standard', purpose: 'high-volume bounded context/tool work' },
+      { role: 'host', tier: 'standard|premium', purpose: 'user-facing judgment, supervision, revision, and synthesis' },
+      { role: 'worker', tier: 'cheap|standard', purpose: 'bounded evidence extraction, compression, and tool-context preparation' },
+      { role: 'verifier', tier: 'cheap|premium', purpose: 'independent quality, grounding, safety, and validation gate' },
+      { role: 'boss', tier: 'premium', purpose: 'rare escalation judgment for critical risk or unresolved ambiguity' },
     ],
     workerTemplates,
   };

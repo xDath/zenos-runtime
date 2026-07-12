@@ -1,8 +1,10 @@
-import type { NextConfig } from "next";
+import type { NextConfig } from 'next';
 
 const nextConfig: NextConfig = {
-  typescript: {
-    ignoreBuildErrors: true,
+  poweredByHeader: false,
+  compress: true,
+  outputFileTracingExcludes: {
+    '/*': ['./next.config.ts'],
   },
 };
 

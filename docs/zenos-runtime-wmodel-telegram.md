@@ -16,13 +16,12 @@ Render inline buttons:
 Host: <hostModel>
 Worker: <workerModel>
 Boss: <bossModel>
-Verifier: <verifierModel>
-SAVE
+CANCEL | SAVE
 ```
 
 ## Slot Selection
 
-When user taps `Host`, `Worker`, `Boss`, or `Verifier`:
+When user taps `Host`, `Worker`, or `Boss`:
 
 1. Store selected slot in callback state.
 2. Show the existing `/model` provider/model picker UI.
@@ -46,9 +45,7 @@ Body:
   "workerModel": "...",
   "workerProvider": "...",
   "bossModel": "...",
-  "bossProvider": "...",
-  "verifierModel": "...",
-  "verifierProvider": "..."
+  "bossProvider": "..."
 }
 ```
 
@@ -71,11 +68,13 @@ ZENOS_RUNTIME_SESSION_ID=<sessionId> npm run wmodel
 Update current session models:
 
 ```bash
-npm run wmodel -- --session <sessionId> "host:grok --provider etla; worker:gemini --provider etla; boss:gpt --provider openai; verifier:gpt --provider openai"
+npm run wmodel -- --session <sessionId> "host:grok --provider etla; worker:gemini --provider etla; boss:gpt --provider openai"
 ```
 
 Update global defaults:
 
 ```bash
-npm run wmodel -- --global "host:grok --provider etla; worker:gemini --provider etla; boss:gpt --provider openai; verifier:gpt --provider openai"
+npm run wmodel -- --global "host:grok --provider etla; worker:gemini --provider etla; boss:gpt --provider openai"
 ```
+
+Verifier remains an internal Runtime slot and is intentionally omitted from the user-facing `/wmodel` picker.

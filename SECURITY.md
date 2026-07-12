@@ -1,73 +1,123 @@
-# Security Policy
+# Zenos Runtime Security
 
-Zenos Runtime is designed to be safe as a public orchestration repository while keeping credentials and runtime data private.
+## Supported deployment
 
-## Public Repository Policy
+Zenos Runtime v0.2 is designed for one active process on a trusted Linux VPS, bound to loopback and exposed only through a configured reverse proxy or trusted local clients.
 
-This repository must not contain production secrets, API keys, OAuth refresh tokens, service account JSON, private keys, or deployment tokens.
+Production must configure at least one of:
 
-Safe files may include:
+- `ZENOS_RUNTIME_API_KEY`
+- `ETLA_MASTER_SECRET`
 
-- source code
-- sanitized templates
-- documentation
-- endpoint descriptions
-- architecture diagrams
-- placeholder environment variables
+The service refuses unauthenticated production operation.
 
-Unsafe files must remain untracked:
+## Authentication methods
 
-- `.env*`
-- `.vercel/`
-- `.next/`
-- `node_modules/`
-- private key files
-- local token files
+### Dedicated Runtime API key
 
-## Runtime Secrets
-
-Production secrets must live in the deployment environment.
-
-Common variables:
+Use for trusted local operators and simple service integrations:
 
 ```text
-ETLA_MASTER_SECRET
-ZENOS_LLM_BASE_URL
-ZENOS_LLM_API_KEY
-ZENOS_HOST_MODEL
-ZENOS_WORKER_MODEL
-ZENOS_VERIFIER_MODEL
-ZENOS_MEMORY_BASE_URL
-ZENOS_MEMORY_API_KEY
+Authorization: Bearer <ZENOS_RUNTIME_API_KEY>
 ```
 
-## Protected APIs
+The Zenos Memory API key is not accepted as a Runtime credential.
 
-Operational runtime endpoints require Etla HMAC signatures or the configured API key. Public endpoints expose only safe service metadata.
+### Scoped bearer token
 
-Public endpoints:
+Administrators can mint a short-lived `zrt2` token through `/api/runtime/token`. Tokens include:
+
+- subject/client identity;
+- operation scopes;
+- issue and expiry times;
+- a unique token nonce;
+- HMAC-SHA256 integrity.
+
+A token scoped to `runtime:read` cannot call `runtime:run` or mutate model settings.
+
+### HMAC v2
+
+Trusted service clients should sign the exact request envelope:
 
 ```text
-GET /
-GET /api/health
+v2
+<timestamp milliseconds>
+<unique nonce>
+<HTTP method>
+<path plus query>
+<SHA-256 request body>
+<operation scope>
+<client identity>
 ```
 
-Protected endpoints:
+Required headers:
 
 ```text
-POST /api/runtime/route
-POST /api/runtime/run
-POST /api/runtime/route-event
-GET  /api/runtime/eval
-GET  /api/runtime/readiness
+x-etla-timestamp
+x-etla-nonce
+x-etla-body-sha256
+x-etla-signature
+x-etla-scope
+x-etla-client
 ```
 
-## Before Making The Repository Public
+The nonce is transactionally persisted and rejected if replayed. The timestamp must be inside the configured skew window. Production systemd disables legacy path-only HMAC.
 
-Run:
+## Route scopes
 
-```bash
-git grep -nE 'sk-|vcp_|ghp_|GOCSPX-|private_key|BEGIN PRIVATE KEY|shirinka' || true
-```
+- `runtime:read`
+- `runtime:route`
+- `runtime:run`
+- `runtime:session`
+- `runtime:worker`
+- `runtime:models`
+- `runtime:metrics`
+- `runtime:admin`
+- `*` for trusted administration only
 
-Expected result: no real secrets. Placeholder values are acceptable if clearly redacted.
+## Secret handling
+
+- Runtime API responses never return configured model keys.
+- Structured logs redact credential-shaped strings and sensitive field names.
+- Zenos Memory recall requests explicitly exclude secret memories.
+- Runtime does not store raw credentials in session or route-event metadata.
+- `.env.local`, Hermes model configuration, and SQLite state must remain outside public artifacts.
+- Per-session model configuration files are written atomically with mode `0600`.
+
+## Request protections
+
+Operational routes enforce:
+
+- authentication and operation scope;
+- token-bucket rate limiting;
+- maximum body sizes;
+- strict Zod schemas;
+- non-cacheable responses;
+- request IDs;
+- idempotency for pipeline runs;
+- model timeout, retry, response-size, and circuit-breaker limits.
+
+## Action safety
+
+Runtime does not itself run shell commands, deploy services, or edit repositories. It governs model output and external worker events. Critical action requests:
+
+- route through premium Host, Verifier, and Boss policy;
+- are marked as requiring approval;
+- cannot be represented as completed merely because a model produced text;
+- remain advisory unless the calling integration separately performs an authorized action.
+
+## Persistence boundary
+
+SQLite WAL protects single-node state transitions. It is not a distributed consensus system. Do not run multiple writable Runtime replicas against copied local databases. A multi-node deployment requires a shared transactional database and distributed nonce, rate-limit, idempotency, and queue infrastructure.
+
+## Reporting
+
+When reporting a vulnerability, include:
+
+- affected endpoint and version;
+- reproducible request shape with secrets removed;
+- expected and observed behavior;
+- impact;
+- relevant request ID or redacted log line.
+
+Never include live credentials, private model prompts, or user memory content in a public issue.

@@ -1,14 +1,20 @@
 {
   "name": "zenos-runtime",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
+  "description": "Production-grade Zenos orchestration control plane with Host, Worker, Verifier, Boss, durable sessions, and policy-driven model routing.",
   "scripts": {
     "dev": "next dev -p 3090",
     "build": "next build",
     "start": "next start -p 3090",
     "lint": "eslint",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test --test-concurrency=1 tests/*.test.ts",
     "smoke:runtime": "tsx scripts/smoke-runtime.mjs",
+    "validate:production": "npm run typecheck && npm run lint -- --quiet && npm run test && npm run smoke:runtime && npm run build",
     "runtime:config": "node scripts/zenos-runtime-cli.mjs",
+    "runtime:setup": "node scripts/zenos-runtime-cli.mjs wizard",
+    "runtime:watch": "node --experimental-sqlite scripts/zenos-runtime-watch.mjs",
     "start:local": "node scripts/load-env-and-start.mjs",
     "runtime:local": "node scripts/zenos-runtime-local-client.mjs",
     "wmodel": "node scripts/wmodel.mjs"
@@ -30,5 +36,7 @@
     "tsx": "^4.22.5",
     "typescript": "^5"
   },
-  "description": "Standalone Zenos Runtime orchestration layer for routing, host/worker/verifier pipelines, and runtime telemetry."
+  "overrides": {
+    "postcss": "8.5.16"
+  }
 }

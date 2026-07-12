@@ -1,47 +1,65 @@
-import { NextRequest, NextResponse } from 'next/server';
 import { getRuntimeModels, getRuntimeSession, updateSessionModelOverrides } from '@/app/lib/zenos-runtime-three-agent';
 import { getRuntimeModelConfigSummary } from '@/app/lib/zenos-runtime-executor';
-import { mergeModelSlots, readSessionModelSlots, RuntimeModelSlotsSchema, writeRuntimeModelSlots, writeSessionModelSlots } from '@/app/lib/zenos-runtime-model-config';
-import { validateApiKey, unauthorizedResponse } from '@/app/lib/auth';
-import { rateLimit } from '@/app/lib/rate-limit';
+import {
+  publicModelSlots,
+  readSessionModelSlots,
+  RuntimeModelSlotsSchema,
+  writeRuntimeModelSlots,
+  writeSessionModelSlots,
+} from '@/app/lib/zenos-runtime-model-config';
+import { parseJsonBody, routeErrorResponse, routeSuccessResponse, secureRequest } from '@/app/lib/http';
+import { RATE_LIMITS } from '@/app/lib/rate-limit';
 
-function sessionIdFrom(req: NextRequest): string {
-  return req.nextUrl.searchParams.get('sessionId') || req.headers.get('x-runtime-session') || '';
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
+
+const ROUTE = 'runtime.models';
+
+function sessionIdFrom(req: Request): string {
+  const url = new URL(req.url);
+  return url.searchParams.get('sessionId') || req.headers.get('x-runtime-session') || '';
 }
 
-export async function GET(req: NextRequest) {
-  const ip = req.headers.get('x-forwarded-for') || 'unknown';
-  if (!rateLimit(ip)) return NextResponse.json({ error: 'Rate limit exceeded' }, { status: 429 });
-  if (!validateApiKey(req)) return unauthorizedResponse();
-
-  const sessionId = sessionIdFrom(req);
-  const session = sessionId ? getRuntimeSession(sessionId) : undefined;
-  const sessionConfig = session?.modelOverrides || readSessionModelSlots(sessionId);
-  const globalConfig = getRuntimeModelConfigSummary();
-  const config = sessionId ? mergeModelSlots(globalConfig, sessionConfig) : globalConfig;
-
-  return NextResponse.json({ ok: true, sessionId: sessionId || null, config, sessionConfig, runtime: getRuntimeModels() });
-}
-
-export async function POST(req: NextRequest) {
-  const ip = req.headers.get('x-forwarded-for') || 'unknown';
-  if (!rateLimit(ip)) return NextResponse.json({ error: 'Rate limit exceeded' }, { status: 429 });
-  if (!validateApiKey(req)) return unauthorizedResponse();
-
+export async function GET(req: Request) {
+  const secured = await secureRequest(req, { scope: 'runtime:read', rateLimit: RATE_LIMITS.read, routeName: `${ROUTE}.get` });
+  if (!secured.ok) return secured.response;
   try {
     const sessionId = sessionIdFrom(req);
-    const body = RuntimeModelSlotsSchema.parse(await req.json());
+    const session = sessionId ? getRuntimeSession(sessionId) : undefined;
+    const sessionConfig = sessionId ? readSessionModelSlots(sessionId) : {};
+    return routeSuccessResponse({
+      ok: true,
+      sessionId: sessionId || null,
+      config: getRuntimeModelConfigSummary(sessionId || undefined),
+      sessionConfig: publicModelSlots(session?.modelOverrides || sessionConfig),
+      runtime: getRuntimeModels(),
+    }, secured.context, `${ROUTE}.get`);
+  } catch (error) {
+    return routeErrorResponse(error, secured.context, `${ROUTE}.get`);
+  }
+}
 
+export async function POST(req: Request) {
+  const secured = await secureRequest(req, { scope: 'runtime:models', rateLimit: RATE_LIMITS.write, maxBodyBytes: 256_000, routeName: `${ROUTE}.set` });
+  if (!secured.ok) return secured.response;
+  try {
+    const sessionId = sessionIdFrom(req);
+    const body = await parseJsonBody(req, RuntimeModelSlotsSchema, 256_000);
     if (sessionId) {
       const saved = writeSessionModelSlots(sessionId, body);
       const session = getRuntimeSession(sessionId) ? updateSessionModelOverrides(sessionId, saved) : null;
-      return NextResponse.json({ ok: true, scope: 'session', sessionId, saved, session, config: mergeModelSlots(getRuntimeModelConfigSummary(), saved) });
+      return routeSuccessResponse({
+        ok: true,
+        scope: 'session',
+        sessionId,
+        saved: publicModelSlots(saved),
+        session,
+        config: getRuntimeModelConfigSummary(sessionId),
+      }, secured.context, `${ROUTE}.set`);
     }
-
     const saved = writeRuntimeModelSlots(body);
-    return NextResponse.json({ ok: true, scope: 'global', saved, config: getRuntimeModelConfigSummary() });
+    return routeSuccessResponse({ ok: true, scope: 'global', saved: publicModelSlots(saved), config: getRuntimeModelConfigSummary() }, secured.context, `${ROUTE}.set`);
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Invalid runtime model config';
-    return NextResponse.json({ ok: false, error: message }, { status: 400 });
+    return routeErrorResponse(error, secured.context, `${ROUTE}.set`);
   }
 }

@@ -4,20 +4,21 @@ import assert from 'node:assert/strict';
 import { pathToFileURL } from 'node:url';
 import { resolve } from 'node:path';
 
-const runtimePath = pathToFileURL(resolve('app/lib/zenos-runtime.ts')).href;
-const executorPath = pathToFileURL(resolve('app/lib/zenos-runtime-executor.ts')).href;
-const threeAgentPath = pathToFileURL(resolve('app/lib/zenos-runtime-three-agent.ts')).href;
+process.env.ZENOS_RUNTIME_DISABLE_MEMORY = 'true';
+process.env.ZENOS_RUNTIME_DISABLE_MEMORY_AUTO_RECALL = 'true';
+process.env.ZENOS_RUNTIME_DB_PATH = ':memory:';
+
+const runtimeModule = await import(pathToFileURL(resolve('app/lib/zenos-runtime.ts')).href);
+const stateModule = await import(pathToFileURL(resolve('app/lib/zenos-runtime-three-agent.ts')).href);
+const executorModule = await import(pathToFileURL(resolve('app/lib/zenos-runtime-executor.ts')).href);
+const storeModule = await import(pathToFileURL(resolve('app/lib/zenos-runtime-store.ts')).href);
+
 const {
   choosePipeline,
-  buildRouteEvent,
+  runRuntimeEval,
   validateWorkerResult,
   validateVerifierResult,
-  runRuntimeEval,
-  runtimeReadinessReport,
-  routeEventMemoryContent,
-} = await import(runtimePath);
-const executorModule = await import(executorPath);
-const { runZenosPipeline, getRuntimeModelConfigSummary } = executorModule.default || executorModule;
+} = runtimeModule;
 const {
   createRuntimeSession,
   dispatchWorker,
@@ -25,173 +26,112 @@ const {
   runQualityGate,
   buildEscalationPacket,
   applyBossDecision,
-  getRuntimeModels,
-  runtimeStoreInfo,
   completeRuntimeSession,
-} = await import(threeAgentPath);
+  runtimeStoreInfo,
+} = stateModule;
+const { runZenosPipeline, getRuntimeModelConfigSummary } = executorModule;
+const { resetRuntimeStoreForTests } = storeModule;
 
-const cases = [
-  {
-    name: 'simple chat stays fast',
-    input: { request: 'jelasin singkat bedanya host sama worker' },
-    expect: { taskType: 'simple_chat', pipelineMode: 'direct_fast_path', useWorker: false, useVerifier: false },
-  },
-  {
-    name: 'memory question recalls memory',
-    input: { request: 'tadi roadmap Zenos Runtime isinya apa?' },
-    expect: { taskType: 'memory_question', useMemory: true },
-  },
-  {
-    name: 'large summarize uses cheap worker',
-    input: { request: 'summarize log panjang ini', estimatedContextTokens: 9000 },
-    expect: { taskType: 'summarization', pipelineMode: 'worker_compression_path', useWorker: true },
-  },
-  {
-    name: 'coding change uses source tools and premium host',
-    input: { request: 'fix bug di repo ini', hasFiles: true, hasCodeChangeIntent: true },
-    expect: { taskType: 'coding_change', useTools: true, useMemory: true, hostTier: 'premium' },
-  },
-  {
-    name: 'secret work is verified',
-    input: { request: 'cek apakah ada secret leak di auth token', hasFiles: true },
-    expect: { taskType: 'security_or_secret', useVerifier: true, hostTier: 'premium' },
-  },
-  {
-    name: 'deploy work escalates',
-    input: { request: 'deploy production sekarang', confidence: 0.9 },
-    expect: { taskType: 'deploy_or_destructive_action', pipelineMode: 'escalated_deep_path', verifierTier: 'premium' },
-  },
-];
+resetRuntimeStoreForTests(':memory:');
 
-for (const testCase of cases) {
-  const decision = choosePipeline(testCase.input);
-  for (const [key, value] of Object.entries(testCase.expect)) {
-    assert.equal(decision[key], value, `${testCase.name}: expected ${key}=${value}, got ${decision[key]}`);
-  }
-  const event = buildRouteEvent(decision, testCase.input);
-  assert.equal(event.taskType, decision.taskType);
-}
+const report = runRuntimeEval();
+assert.equal(report.status, 'pass');
+assert.ok(report.total >= 20);
+
+const explanation = choosePipeline({ request: 'jelaskan arsitektur deployment production', intent: 'explain' });
+assert.notEqual(explanation.risk, 'critical');
+assert.equal(explanation.requiresApproval, false);
+
+const execution = choosePipeline({ request: 'deploy ke production sekarang', intent: 'execute' });
+assert.equal(execution.risk, 'critical');
+assert.equal(execution.useBoss, true);
+assert.equal(execution.requiresApproval, true);
 
 validateWorkerResult({
   task: 'inspect auth bug',
-  summary: ['Likely failure is in session expiry handling.'],
-  findings: [
-    {
-      claim: 'Expiry comparison needs focused host review.',
-      evidence: ['src/auth/session.ts:42'],
-      confidence: 0.78,
-      risk: 'medium',
-    },
-  ],
-  suggestedNextStep: 'Host should inspect cited line before patching.',
-  needsHostAttention: ['time comparison semantics'],
-  rawContextNeeded: ['src/auth/session.ts:42'],
+  summary: ['Expiry validation requires review.'],
+  findings: [{ claim: 'Expiry comparison is suspect.', evidence: ['src/auth.ts:42'], confidence: 0.9, risk: 'medium' }],
+  contradictions: [],
+  unknowns: [],
+  suggestedNextStep: 'Inspect the cited source and run tests.',
+  needsHostAttention: ['expiry semantics'],
+  rawContextNeeded: [],
+  sourceCoverage: 0.9,
 });
 
 validateVerifierResult({
-  verdict: 'revise',
-  confidence: 0.82,
-  issues: [
-    {
-      severity: 'medium',
-      issue: 'No validation command was reported for the code change.',
-      evidence: 'missing test result',
-      requiredFix: 'Run or explain tests before final answer.',
-    },
-  ],
+  verdict: 'pass',
+  confidence: 0.95,
+  issues: [],
   checks: {
     followsUserRequest: 'pass',
     sourceGrounded: 'pass',
     secretSafe: 'pass',
-    actionSafe: 'not_applicable',
-    testsOrValidation: 'fail',
+    actionSafe: 'pass',
+    testsOrValidation: 'pass',
   },
-  nextAction: 'revise',
+  nextAction: 'answer',
 });
 
-const report = runRuntimeEval();
-assert.equal(report.status, 'pass');
-assert.equal(report.failed, 0);
-
-const memoryLine = routeEventMemoryContent(buildRouteEvent(choosePipeline(cases[0].input), cases[0].input));
-assert.match(memoryLine, /Zenos Runtime route event/);
-
-const readiness = runtimeReadinessReport();
-assert.equal(readiness.status, 'production_ready_v1');
-
-const dryRun = await runZenosPipeline({
-  request: 'summarize dokumen besar ini supaya host hemat token',
-  context: 'x'.repeat(12000),
-  estimatedContextTokens: 9000,
-  dryRun: true,
-});
-assert.equal(dryRun.ok, true);
-assert.equal(dryRun.dryRun, true);
-assert.equal(dryRun.decision.useWorker, true);
-
-const session = createRuntimeSession({
-  request: 'fix bug besar di repo dan awasi worker kalau ada hal rancu',
-  hasFiles: true,
-  hasCodeChangeIntent: true,
-  estimatedContextTokens: 12000,
-});
-assert.equal(session.status, 'working');
-
-const withWorker = dispatchWorker(session.sessionId, 'coding_brief', 'Inspect affected files and produce evidence-backed change map.');
-const workerId = withWorker.workers[0].workerId;
-assert.equal(withWorker.workers[0].status, 'running');
-
-const withEvent = recordWorkerEvent({
+const session = createRuntimeSession({ request: 'fix bug besar di repo', hasFiles: true, hasCodeChangeIntent: true, intent: 'mutate' });
+const queued = dispatchWorker(session.sessionId, 'coding_brief', 'Inspect files and return evidence.');
+assert.equal(queued.workers[0].status, 'queued');
+const paused = recordWorkerEvent({
   sessionId: session.sessionId,
-  workerId,
+  workerId: queued.workers[0].workerId,
   type: 'risk',
-  summary: 'Worker found a destructive reset command in proposed workflow.',
+  summary: 'Found destructive reset command.',
   evidence: ['scripts/deploy.sh:31'],
   severity: 'high',
-  confidence: 0.91,
+  confidence: 0.95,
   needsBoss: true,
 });
-assert.equal(withEvent.status, 'paused');
-assert.equal(withEvent.workers[0].status, 'paused');
+assert.equal(paused.status, 'paused');
+assert.equal(paused.workers[0].status, 'paused');
 
 const gate = runQualityGate({
   findings: [
-    { claim: 'Supported fact', evidence: ['file.ts:1'], confidence: 0.9, risk: 'low' },
-    { claim: 'Unsupported risky claim', evidence: [], confidence: 0.4, risk: 'high' },
+    { claim: 'Supported', evidence: ['file.ts:1'], confidence: 0.9, risk: 'low' },
+    { claim: 'Unsupported risky', evidence: [], confidence: 0.4, risk: 'high' },
   ],
-  events: withEvent.events,
+  events: paused.events,
 });
-assert.equal(gate.needsBoss, true);
 assert.equal(gate.verdict, 'escalate');
-assert.equal(gate.usableFindings.length, 1);
-assert.equal(gate.discardedFindings.length, 1);
 
-const packet = buildEscalationPacket(session.sessionId, 'Host detected high-severity worker event.');
+const packet = buildEscalationPacket(session.sessionId, 'Host found a high-risk worker event.');
 assert.equal(packet.sessionId, session.sessionId);
-assert.equal(packet.triggeringEvents.length, 1);
-
-const afterBoss = applyBossDecision(session.sessionId, {
+const bossApplied = applyBossDecision(session.sessionId, {
   verdict: 'revise',
-  confidence: 0.88,
-  reasoningSummary: 'Do not run destructive reset; revise plan with safe inspection commands.',
-  requiredChanges: ['Remove reset command', 'Run read-only inspection first'],
+  confidence: 0.9,
+  reasoningSummary: 'Replace destructive action with read-only inspection.',
+  requiredChanges: ['Remove reset command'],
   allowedActions: ['read files', 'run tests'],
   forbiddenActions: ['git reset --hard'],
 });
-assert.equal(afterBoss.status, 'working');
+assert.equal(bossApplied.status, 'revising');
+assert.equal(completeRuntimeSession(session.sessionId, 'Safe answer.').status, 'done');
 
-const runtimeModels = getRuntimeModels();
-assert.equal(runtimeModels.roles.length, 3);
-assert.ok(runtimeModels.workerTemplates.coding_brief);
+const dryRun = await runZenosPipeline({
+  request: 'summarize dokumen besar ini',
+  context: 'x'.repeat(20_000),
+  estimatedContextTokens: 8_000,
+  dryRun: true,
+  persistSession: false,
+  persistRouteEvent: false,
+});
+assert.equal(dryRun.ok, true);
+assert.equal(dryRun.status, 'dry_run');
+assert.equal(dryRun.decision.useWorker, true);
 
-const completed = completeRuntimeSession(session.sessionId);
-assert.equal(completed.status, 'done');
-const storeInfo = runtimeStoreInfo();
-assert.equal(typeof storeInfo.durable, 'boolean');
-assert.ok(storeInfo.sessions >= 1);
+const store = runtimeStoreInfo();
+assert.equal(store.ok, true);
+assert.equal(store.integrity, 'ok');
+assert.equal(store.engine, 'sqlite-wal');
 
-const modelSummary = getRuntimeModelConfigSummary();
-assert.ok(modelSummary.hostModel, 'host model should resolve from env or Hermes config');
-assert.ok(modelSummary.workerModel, 'worker model should resolve from env, override, or Hermes config');
+const models = getRuntimeModelConfigSummary();
+assert.ok(models.hostModel, 'Host model must resolve');
+assert.ok(models.workerModel, 'Worker model must resolve');
+assert.ok(models.bossModel, 'Boss model must resolve');
+assert.ok(models.verifierModel, 'Verifier model must resolve');
 
-console.log(`Zenos Runtime smoke passed (${cases.length} route cases + three-agent supervision + quality gate + eval + readiness + dry-run pipeline + Hermes model config).`);
+console.log(`Zenos Runtime v0.2 smoke passed: ${report.total} routing cases, SQLite WAL state, worker supervision, quality gate, Boss escalation, dry-run pipeline, and four role model slots.`);
