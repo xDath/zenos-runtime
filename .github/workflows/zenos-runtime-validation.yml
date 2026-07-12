@@ -32,11 +32,6 @@ jobs:
 
       - name: Production validation
         run: npm run validate:production
-        env:
-          ZENOS_RUNTIME_DISABLE_MEMORY: "true"
-          ZENOS_RUNTIME_DISABLE_MEMORY_AUTO_RECALL: "true"
-          ZENOS_RUNTIME_EXECUTION_MODE: "control-plane"
-          ETLA_MASTER_SECRET: ci-only-runtime-secret-long-enough
 
       - name: Production dependency audit
         run: npm audit --omit=dev --audit-level=high
