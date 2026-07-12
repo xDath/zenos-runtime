@@ -36,6 +36,11 @@ install -d -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" -m 0700 \
   /var/lib/zenos-runtime/validation-workspaces \
   /var/lib/zenos-runtime/executor-workspaces \
   /var/lib/zenos-runtime/artifacts
+# Preserve the existing SQLite/audit state while transferring ownership from
+# the legacy root service to the dedicated control-plane identity.
+chown -R "${SERVICE_USER}:${SERVICE_GROUP}" /var/lib/zenos-runtime
+find /var/lib/zenos-runtime -xdev -type d -exec chmod 0700 {} +
+find /var/lib/zenos-runtime -xdev -type f -exec chmod 0600 {} +
 
 rm -rf "${STAGING}"
 install -d -o root -g root -m 0755 "${STAGING}"
