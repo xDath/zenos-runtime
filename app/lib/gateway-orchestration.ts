@@ -71,6 +71,7 @@ export const GatewayTurnPostflightRequestSchema = z.object({
     inputTokens: z.number().int().nonnegative().default(0),
     outputTokens: z.number().int().nonnegative().default(0),
   }).optional().default({ inputTokens: 0, outputTokens: 0 }),
+  hostDurationMs: z.number().int().nonnegative().max(86_400_000).optional().default(0),
 });
 
 const StoredGatewayPreflightSchema = z.object({
@@ -144,7 +145,7 @@ function recordActivity(
   role: 'host' | 'worker' | 'verifier' | 'boss' | 'tool',
   summary: string,
   metadata: Record<string, unknown>,
-  outcome: 'started' | 'success' | 'failed' | 'skipped' = 'success',
+  outcome: 'queued' | 'started' | 'success' | 'failed' | 'skipped' = 'success',
 ): void {
   getRuntimeStore().insertEvent({
     sessionId,
@@ -276,9 +277,17 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
   recordActivity(
     request.sessionId,
     'host',
-    `Hermes Host ${request.host.model} accepted turn ${request.turnId}.`,
-    { runId, turnId: request.turnId, model: request.host.model, provider: request.host.provider },
-    'started',
+    `Hermes Host ${request.host.model} queued behind Runtime preflight.`,
+    {
+      lifecycle: 'role_state',
+      runId,
+      turnId: request.turnId,
+      role: 'host',
+      status: 'queued',
+      model: request.host.model,
+      provider: request.host.provider,
+    },
+    'queued',
   );
 
   let workerResult: WorkerResult | undefined;
@@ -363,6 +372,25 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
       'skipped',
     );
   }
+
+  const hostCallId = `${runId}:hermes-host`;
+  recordActivity(
+    request.sessionId,
+    'host',
+    `Hermes Host ${request.host.model} started the user-facing turn.`,
+    {
+      lifecycle: 'model_call',
+      runId,
+      turnId: request.turnId,
+      callId: hostCallId,
+      role: 'host',
+      status: 'calling',
+      model: request.host.model,
+      provider: request.host.provider,
+      trigger: request.userRequestedBoss ? 'user_requested_boss' : 'route_policy',
+    },
+    'started',
+  );
 
   const holdFinalDelivery = decision.useVerifier || decision.useBoss || decision.requiresApproval;
   const stored: StoredGatewayPreflight = {
@@ -456,11 +484,16 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
       turnId: request.turnId,
       model: request.host.model,
       provider: request.host.provider,
+      lifecycle: 'model_call',
+      callId: `${request.runId}:hermes-host`,
+      status: request.failed ? 'failed' : 'completed',
       modelUsage: {
         inputTokens: request.hostUsage.inputTokens,
         outputTokens: request.hostUsage.outputTokens,
         totalTokens: request.hostUsage.inputTokens + request.hostUsage.outputTokens,
+        estimated: false,
       },
+      latencyMs: request.hostDurationMs,
     },
     request.failed ? 'failed' : 'success',
   );
@@ -562,9 +595,9 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
     );
   }
 
-  const shouldRunBoss = decision.useBoss
-    || decision.requiresApproval
-    || verifierResult?.verdict === 'escalate';
+  const shouldRunBoss = decision.requiresApproval
+    || verifierResult?.verdict === 'escalate'
+    || (decision.useBoss && !input.userRequestedBoss);
   if (shouldRunBoss) {
     const finalBossCall = await runBossReviewModel({
       stage: 'postflight',

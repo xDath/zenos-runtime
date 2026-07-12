@@ -144,6 +144,67 @@ test('native gateway worker path calls the configured Worker and injects its bou
   }
 });
 
+test('explicit Boss request invokes Boss exactly once and records user-requested escalation', async () => {
+  const originalFetch = globalThis.fetch;
+  let bossCalls = 0;
+  globalThis.fetch = async (_input: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body || '{}')) as { model: string };
+    if (body.model !== 'runtime-boss') throw new Error(`Unexpected model ${body.model}`);
+    bossCalls += 1;
+    return modelResponse({
+      verdict: 'approve',
+      confidence: 0.96,
+      reasoningSummary: 'Use a private authenticated RPC endpoint close to the target chain.',
+      requiredChanges: [],
+      allowedActions: ['explain provider options'],
+      forbiddenActions: ['claim free unlimited infrastructure exists'],
+    });
+  };
+
+  try {
+    const preflight = await preflightGatewayTurn({
+      request: 'coba tanya agent boss ada ga caranya supaya private RPC lebih dekat dengan chain',
+      sessionId: 'hermes_explicit_boss_test',
+      turnId: 'turn-boss-1',
+      platform: 'matrix',
+      host: { model: 'grok', provider: 'etla-router' },
+      intent: 'analyze',
+      userRequestedBoss: true,
+      modelOverrides: modelOverrides(),
+    });
+
+    assert.equal(preflight.decision.useBoss, true);
+    assert.equal(preflight.decision.pipelineMode, 'escalated_deep_path');
+    assert.equal(preflight.decision.useVerifier, false);
+    assert.match(preflight.decision.reasons.join(' '), /explicitly requested Boss/i);
+    assert.equal(preflight.receipt.boss.invoked, true);
+    assert.equal(bossCalls, 1);
+
+    const postflight = await postflightGatewayTurn({
+      sessionId: 'hermes_explicit_boss_test',
+      runId: preflight.runId,
+      turnId: 'turn-boss-1',
+      draft: 'Gunakan private authenticated RPC dan pilih region terdekat dengan validator atau sequencer chain.',
+      host: { model: 'grok', provider: 'etla-router' },
+      hostUsage: { inputTokens: 420, outputTokens: 75 },
+      hostDurationMs: 1850,
+    });
+
+    assert.equal(bossCalls, 1, 'explicit Boss request should not double-call Boss in postflight');
+    assert.equal(postflight.receipt.boss.invoked, true);
+    assert.equal(postflight.receipt.boss.model, 'runtime-boss');
+    const session = getRuntimeSession('hermes_explicit_boss_test');
+    assert.ok(session?.events.some((event) => event.metadata.lifecycle === 'model_call'
+      && event.metadata.role === 'boss'
+      && event.metadata.status === 'completed'));
+    assert.ok(session?.events.some((event) => event.metadata.lifecycle === 'model_call'
+      && event.metadata.role === 'host'
+      && event.metadata.latencyMs === 1850));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('native gateway verified critical path executes Verifier and Boss before releasing the Hermes draft', async () => {
   const originalFetch = globalThis.fetch;
   const calledModels: string[] = [];

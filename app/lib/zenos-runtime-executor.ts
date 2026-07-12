@@ -349,6 +349,60 @@ export function getRuntimeModelConfigSummary(sessionId?: string) {
   };
 }
 
+function recordModelCallLifecycle(input: {
+  sessionId?: string;
+  requestId: string;
+  role: RuntimeModelRole;
+  model: string;
+  provider: string;
+  transport: 'http' | 'hermes-cli';
+  outcome: 'started' | 'success' | 'failed';
+  inputTokensEstimate: number;
+  result?: RuntimeModelResult;
+}): void {
+  if (!input.sessionId) return;
+  try {
+    const runId = input.requestId.includes(':') ? input.requestId.split(':')[0] : input.requestId;
+    const usage = input.result?.usage;
+    getRuntimeStore().insertEvent({
+      sessionId: input.sessionId,
+      workerId: `model-${input.role}-${input.requestId}`,
+      type: input.outcome === 'failed' ? 'error' : input.outcome === 'success' ? 'done' : 'progress',
+      summary: input.outcome === 'started'
+        ? `${input.role} model ${input.model || 'unconfigured'} started.`
+        : input.outcome === 'success'
+          ? `${input.role} model ${input.model} completed.`
+          : `${input.role} model ${input.model || 'unconfigured'} failed.`,
+      evidence: [],
+      severity: input.outcome === 'failed' ? 'medium' : 'low',
+      confidence: input.outcome === 'failed' ? 0 : 1,
+      needsBoss: false,
+      metadata: {
+        lifecycle: 'model_call',
+        role: input.role,
+        callId: input.requestId,
+        runId,
+        status: input.outcome === 'started' ? 'calling' : input.outcome === 'success' ? 'completed' : 'failed',
+        outcome: input.outcome,
+        model: input.model,
+        provider: input.provider,
+        transport: input.transport,
+        inputTokensEstimate: input.inputTokensEstimate,
+        ...(usage ? { modelUsage: usage } : {}),
+        ...(input.result ? {
+          latencyMs: input.result.latencyMs,
+          attempts: input.result.attempts,
+          finishReason: input.result.finishReason,
+          error: input.result.error,
+        } : {}),
+      },
+      createdAt: new Date().toISOString(),
+    });
+  } catch {
+    // Telemetry must never change model-call behavior.
+  }
+}
+
 function modelUsage(data: z.infer<typeof OpenAIResponseSchema>, prompt: string, content: string): RuntimeModelUsage {
   const usage = data.usage;
   const inputTokens = usage?.prompt_tokens ?? usage?.input_tokens;
@@ -544,9 +598,33 @@ export async function callRuntimeModel(
   const requestId = options.requestId || crypto.randomUUID();
   const started = Date.now();
   const emptyUsage: RuntimeModelUsage = { inputTokens: inputEstimate, outputTokens: 0, totalTokens: inputEstimate, estimated: true };
+  recordModelCallLifecycle({
+    sessionId: options.sessionId,
+    requestId,
+    role,
+    model: config.model,
+    provider: config.provider,
+    transport: config.transport,
+    outcome: 'started',
+    inputTokensEstimate: inputEstimate,
+  });
+  const finalize = (result: RuntimeModelResult): RuntimeModelResult => {
+    recordModelCallLifecycle({
+      sessionId: options.sessionId,
+      requestId,
+      role,
+      model: config.model,
+      provider: config.provider,
+      transport: config.transport,
+      outcome: result.ok ? 'success' : 'failed',
+      inputTokensEstimate: inputEstimate,
+      result,
+    });
+    return result;
+  };
 
   if (!config.model || (config.transport === 'http' && !config.endpointUrl)) {
-    return {
+    return finalize({
       ok: false,
       role,
       model: config.model,
@@ -558,12 +636,12 @@ export async function callRuntimeModel(
       attempts: 0,
       requestId,
       error: `Model role ${role} is not fully configured`,
-    };
+    });
   }
 
   const circuitError = checkCircuit(config);
   if (circuitError) {
-    return {
+    return finalize({
       ok: false,
       role,
       model: config.model,
@@ -575,7 +653,7 @@ export async function callRuntimeModel(
       attempts: 0,
       requestId,
       error: circuitError,
-    };
+    });
   }
 
   if (config.transport === 'hermes-cli') {
@@ -583,11 +661,11 @@ export async function callRuntimeModel(
       options.json ? 'Return only valid JSON. Do not wrap it in markdown fences.' : '',
       prompt,
     ].filter(Boolean).join('\n\n');
-    return callHermesCliTransport(config, cliPrompt, {
+    return finalize(await callHermesCliTransport(config, cliPrompt, {
       timeoutMs: options.timeoutMs,
       retries: options.retries,
       requestId,
-    });
+    }));
   }
 
   const maxAttempts = Math.min(Math.max((options.retries ?? 2) + 1, 1), 4);
@@ -650,7 +728,7 @@ export async function callRuntimeModel(
       incrementMetric('model_tokens_total', { role, direction: 'input' }, usage.inputTokens);
       incrementMetric('model_tokens_total', { role, direction: 'output' }, usage.outputTokens);
       recordCircuitSuccess(config);
-      return {
+      return finalize({
         ok: true,
         role,
         model: config.model,
@@ -664,7 +742,7 @@ export async function callRuntimeModel(
         attempts: attempt,
         finishReason: parsedTransport.data.choices[0]?.finish_reason || undefined,
         requestId,
-      };
+      });
     } catch (error) {
       lastError = error instanceof Error
         ? error.name === 'AbortError' ? `Model request timed out after ${options.timeoutMs || process.env.ZENOS_MODEL_TIMEOUT_MS || '90000'} ms` : error.message
@@ -682,7 +760,7 @@ export async function callRuntimeModel(
   const latencyMs = observeDuration('model_call_duration', started, { role, model: config.model, ok: false });
   incrementMetric('model_calls_total', { role, model: config.model, status: 'failed' });
   log('warn', 'Runtime model call failed', { requestId, role, model: config.model, provider: config.provider, error: lastError });
-  return {
+  return finalize({
     ok: false,
     role,
     model: config.model,
@@ -694,7 +772,7 @@ export async function callRuntimeModel(
     attempts: maxAttempts,
     requestId,
     error: redactText(lastError),
-  };
+  });
 }
 
 export async function runBossReviewModel(

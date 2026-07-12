@@ -34,6 +34,7 @@ export const RuntimeContextSchema = z.object({
   hasLogs: z.boolean().optional().default(false),
   hasCodeChangeIntent: z.boolean().optional().default(false),
   userRequestedVerification: z.boolean().optional().default(false),
+  userRequestedBoss: z.boolean().optional().default(false),
   estimatedContextTokens: z.number().int().nonnegative().max(2_000_000).optional().default(0),
   confidence: z.number().min(0).max(1).optional().default(0.75),
   intent: RuntimeIntentSchema.optional().default('analyze'),
@@ -347,7 +348,15 @@ export function choosePipeline(input: RuntimeContext): RouteDecision {
     reasons.push('user explicitly requested verification');
   }
 
-  if (taskType === 'simple_chat') reasons.push('low-risk request stays on direct host path');
+  if (context.userRequestedBoss) {
+    useBoss = true;
+    allowEscalation = true;
+    hostTier = 'premium';
+    pipelineMode = 'escalated_deep_path';
+    reasons.push('user explicitly requested Boss review');
+  }
+
+  if (taskType === 'simple_chat' && !context.userRequestedBoss) reasons.push('low-risk request stays on direct host path');
   if (context.requiresFreshData) {
     useTools = true;
     requiresSourceContext = true;
@@ -523,6 +532,8 @@ export function runtimeReadinessReport(): RuntimeReadinessReport {
       '/api/runtime/gateway/postflight',
       '/api/runtime/remote-validation',
       '/api/runtime/stream/[sessionId]',
+      '/api/runtime/tracker',
+      '/api/runtime/tracker/stream',
       '/api/runtime/readiness',
       '/api/runtime/metrics',
     ],

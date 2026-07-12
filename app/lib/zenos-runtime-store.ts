@@ -466,6 +466,48 @@ export class RuntimeStore {
     }));
   }
 
+  listEvents(options: {
+    limit?: number;
+    sessionId?: string;
+    since?: string;
+    afterEventId?: number;
+  } = {}): WorkerEvent[] {
+    const limit = Math.min(Math.max(options.limit || 500, 1), 10_000);
+    const clauses: string[] = [];
+    const params: Array<string | number> = [];
+    if (options.sessionId) {
+      clauses.push('session_id = ?');
+      params.push(options.sessionId);
+    }
+    if (options.since) {
+      clauses.push('created_at >= ?');
+      params.push(options.since);
+    }
+    if (options.afterEventId && options.afterEventId > 0) {
+      clauses.push('event_id > ?');
+      params.push(options.afterEventId);
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    const ascending = Boolean(options.afterEventId);
+    const rows = this.db.prepare(`
+      SELECT * FROM worker_events ${where}
+      ORDER BY event_id ${ascending ? 'ASC' : 'DESC'} LIMIT ?
+    `).all(...params, limit);
+    return rows.map((row) => WorkerEventSchema.parse({
+      eventId: asNumber(row.event_id),
+      sessionId: asString(row.session_id),
+      workerId: asString(row.worker_id),
+      type: asString(row.type),
+      summary: asString(row.summary),
+      evidence: parseJson<string[]>(row.evidence_json, []),
+      severity: asString(row.severity),
+      confidence: typeof row.confidence === 'number' ? row.confidence : 0.75,
+      needsBoss: asNumber(row.needs_boss) === 1,
+      metadata: parseJson<Record<string, unknown>>(row.metadata_json, {}),
+      createdAt: asString(row.created_at),
+    }));
+  }
+
   private hydrateSession(row: Record<string, unknown>): RuntimeSessionState {
     const sessionId = asString(row.session_id);
     return RuntimeSessionStateSchema.parse({

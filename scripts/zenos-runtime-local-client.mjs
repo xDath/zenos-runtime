@@ -47,7 +47,7 @@ function parseJsonArg(value, fallback = {}) {
 
 const [command, ...args] = process.argv.slice(2);
 if (!command || command === 'help') {
-  console.log(`Zenos Runtime local client\n\nCommands:\n  health\n  readiness\n  eval\n  metrics\n  route <request-or-json>\n  run <request-or-json>\n  run-key <idempotencyKey> <request-or-json>\n  run-status <runId>\n  gateway-preflight <json>\n  gateway-postflight <json>\n  remote-validate <json>\n  session <request-or-json>\n  session-get <sessionId>\n  dispatch <sessionId> <template> <task>\n  event <json>\n  escalate <sessionId> [hostAssessment]\n  boss-review <sessionId> <decision-json>\n  quality-gate <json>\n  models [sessionId]\n  budget <sessionId>\n`);
+  console.log(`Zenos Runtime local client\n\nCommands:\n  health\n  readiness\n  eval\n  metrics\n  tracker [today|24h|7d|30d|60d]\n  route <request-or-json>\n  run <request-or-json>\n  run-key <idempotencyKey> <request-or-json>\n  run-status <runId>\n  gateway-preflight <json>\n  gateway-postflight <json>\n  remote-validate <json>\n  session <request-or-json>\n  session-get <sessionId>\n  dispatch <sessionId> <template> <task>\n  event <json>\n  escalate <sessionId> [hostAssessment]\n  boss-review <sessionId> <decision-json>\n  quality-gate <json>\n  models [sessionId]\n  budget <sessionId>\n`);
   process.exit(0);
 }
 
@@ -57,6 +57,12 @@ switch (command) {
   case 'readiness': output = await request('/api/runtime/readiness', null, 'GET'); break;
   case 'eval': output = await request('/api/runtime/eval', null, 'GET'); break;
   case 'metrics': output = await request('/api/runtime/metrics', null, 'GET'); break;
+  case 'tracker': {
+    const range = args[0] || 'today';
+    if (!['today', '24h', '7d', '30d', '60d'].includes(range)) throw new Error('tracker range must be today, 24h, 7d, 30d, or 60d');
+    output = await request(`/api/runtime/tracker?range=${encodeURIComponent(range)}&sessions=100&calls=2000`, null, 'GET');
+    break;
+  }
   case 'route': output = await request('/api/runtime/route', parseJsonArg(args.join(' '))); break;
   case 'run': output = await request('/api/runtime/run', parseJsonArg(args.join(' ')), 'POST', { 'Idempotency-Key': `cli-${Date.now()}-${Math.random().toString(36).slice(2)}` }); break;
   case 'run-key': {
