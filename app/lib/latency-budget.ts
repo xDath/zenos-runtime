@@ -38,29 +38,39 @@ const TOTALS: Record<z.infer<typeof TaskTypeSchema>, number> = {
   eval_or_benchmark: 90_000,
 };
 
+const PIPELINE_MINIMUMS: Record<RouteDecision['pipelineMode'], number> = {
+  direct_fast_path: 15_000,
+  grounded_path: 30_000,
+  worker_compression_path: 55_000,
+  verified_path: 75_000,
+  escalated_deep_path: 100_000,
+};
+
 function bounded(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, Math.round(value)));
 }
 
 export function createLatencyBudgetPlan(decision: RouteDecision): LatencyBudgetPlan {
-  const totalMs = TOTALS[decision.taskType] * (decision.risk === 'critical' ? 1.3 : decision.risk === 'high' ? 1.18 : 1);
+  const riskMultiplier = decision.risk === 'critical' ? 1.3 : decision.risk === 'high' ? 1.18 : 1;
+  const totalMs = Math.max(TOTALS[decision.taskType], PIPELINE_MINIMUMS[decision.pipelineMode]) * riskMultiplier;
   const memoryShare = decision.useMemory ? 0.12 : 0.03;
   const repositoryShare = decision.useTools ? 0.16 : 0.03;
   const workerShare = decision.useWorker ? 0.28 : 0.03;
   const verifierShare = decision.useVerifier ? 0.18 : 0.02;
-  const bossShare = decision.useBoss || decision.allowEscalation ? 0.12 : 0.02;
+  const bossActive = decision.useBoss || decision.allowEscalation;
+  const bossShare = bossActive ? 0.12 : 0.02;
   const reserveShare = 0.12;
   const hostShare = Math.max(0.22, 1 - memoryShare - repositoryShare - workerShare - verifierShare - bossShare - reserveShare);
   const plan = LatencyBudgetPlanSchema.parse({
     version: 'etla-latency-budget-v1',
     taskType: decision.taskType,
     totalMs: bounded(totalMs, 10_000, 180_000),
-    memoryMs: bounded(totalMs * memoryShare, 2_000, 25_000),
-    repositoryMs: bounded(totalMs * repositoryShare, 2_000, 30_000),
-    hostMs: bounded(totalMs * hostShare, 5_000, 90_000),
-    workerMs: bounded(totalMs * workerShare, 5_000, 90_000),
-    verifierMs: bounded(totalMs * verifierShare, 5_000, 60_000),
-    bossMs: bounded(totalMs * bossShare, 5_000, 60_000),
+    memoryMs: bounded(totalMs * memoryShare, decision.useMemory ? 8_000 : 2_000, 25_000),
+    repositoryMs: bounded(totalMs * repositoryShare, decision.useTools ? 10_000 : 2_000, 30_000),
+    hostMs: bounded(totalMs * hostShare, decision.pipelineMode === 'escalated_deep_path' ? 25_000 : 8_000, 90_000),
+    workerMs: bounded(totalMs * workerShare, decision.useWorker ? 25_000 : 5_000, 90_000),
+    verifierMs: bounded(totalMs * verifierShare, decision.useVerifier ? 20_000 : 5_000, 60_000),
+    bossMs: bounded(totalMs * bossShare, bossActive ? 20_000 : 5_000, 60_000),
     reserveMs: bounded(totalMs * reserveShare, 0, 30_000),
   });
   setGauge('runtime_latency_budget_ms', plan.totalMs, { task: plan.taskType });
