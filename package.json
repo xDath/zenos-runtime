@@ -12,6 +12,7 @@
     "test": "tsx --test --test-concurrency=1 tests/*.test.ts",
     "smoke:runtime": "tsx scripts/smoke-runtime.mjs",
     "validate:production": "npm run typecheck && npm run lint -- --quiet && npm run test && npm run smoke:runtime && npm run build",
+    "validate:remote": "tsx scripts/run-remote-validation-gate.mts",
     "runtime:config": "node scripts/zenos-runtime-cli.mjs",
     "runtime:setup": "node scripts/zenos-runtime-cli.mjs wizard",
     "runtime:watch": "node --experimental-sqlite scripts/zenos-runtime-watch.mjs",
