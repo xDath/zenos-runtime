@@ -19,8 +19,31 @@ test('token economy keeps Boss bounded and allocates cheap work first', () => {
   const budget = createTokenBudgetPlan(decision, context);
   assert.ok(budget.worker.maxCalls >= 1);
   assert.ok(budget.boss.inputTokens <= 1_500);
-  assert.ok(budget.boss.outputTokens <= 500);
+  assert.equal(budget.boss.outputTokens, 500);
+  assert.ok(budget.worker.outputTokens >= 1_600);
+  assert.ok(budget.verifier.outputTokens >= 1_200);
+  assert.ok(budget.host.outputTokens >= 1_600);
   assert.ok(budget.worker.inputTokens > budget.boss.inputTokens);
+});
+
+test('four-role orchestration reserves enough structured output budget to avoid truncated contracts', () => {
+  const context = RuntimeContextSchema.parse({
+    request: 'analyze this bounded readiness evidence',
+    intent: 'analyze',
+    estimatedContextTokens: 8_000,
+    userRequestedVerification: true,
+    userRequestedBoss: true,
+  });
+  const decision = choosePipeline(context);
+  const budget = createTokenBudgetPlan(decision, context);
+
+  assert.equal(decision.useWorker, true);
+  assert.equal(decision.useVerifier, true);
+  assert.equal(decision.useBoss, true);
+  assert.ok(budget.totalTokens >= 12_000);
+  assert.ok(budget.worker.outputTokens >= 1_600);
+  assert.ok(budget.verifier.outputTokens >= 1_200);
+  assert.equal(budget.boss.outputTokens, 500);
 });
 
 test('context compiler reduces raw context and emits role-specific packets', () => {

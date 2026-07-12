@@ -79,8 +79,16 @@ export function createTokenBudgetPlan(
       ? 1.15
       : 1;
   const retryPressure = 1 + Math.min(Math.max(options.priorFailures || 0, 0), 3) * 0.08;
+  const orchestrationFloor = decision.useWorker && decision.useVerifier && decision.useBoss
+    ? 12_000
+    : decision.useWorker && decision.useVerifier
+      ? 10_000
+      : 2_500;
   const totalTokens = bounded(
-    taskBase(decision.taskType) * riskMultiplier(decision.risk) * priorityMultiplier * sourcePressure * retryPressure,
+    Math.max(
+      taskBase(decision.taskType) * riskMultiplier(decision.risk) * priorityMultiplier * sourcePressure * retryPressure,
+      orchestrationFloor,
+    ),
     2_500,
     48_000,
   );
@@ -100,11 +108,12 @@ export function createTokenBudgetPlan(
     timeoutMs: number,
     inputCap: number,
     outputCap: number,
+    outputFloor = 64,
   ): RoleTokenBudget => {
     const allocation = totalTokens * share;
     return RoleTokenBudgetSchema.parse({
       inputTokens: bounded(allocation * (1 - outputRatio), 128, inputCap),
-      outputTokens: bounded(allocation * outputRatio, 64, outputCap),
+      outputTokens: bounded(allocation * outputRatio, outputFloor, outputCap),
       maxCalls,
       maxRetries,
       timeoutMs,
@@ -128,10 +137,11 @@ export function createTokenBudgetPlan(
       90_000,
       12_000,
       2_400,
+      decision.useWorker ? 1_600 : 64,
     ),
-    host: roleBudget(hostShare, 0.35, 1 + decision.maxRevisionAttempts, decision.maxRevisionAttempts, 120_000, 10_000, 3_200),
-    verifier: roleBudget(verifierShare, 0.35, decision.useVerifier ? 1 + decision.maxRevisionAttempts : 0, 0, 90_000, 5_000, 1_400),
-    boss: roleBudget(bossShare, 0.3, bossEnabled ? 1 : 0, 0, 120_000, 1_500, 500),
+    host: roleBudget(hostShare, 0.35, 1 + decision.maxRevisionAttempts, decision.maxRevisionAttempts, 120_000, 10_000, 3_200, 1_600),
+    verifier: roleBudget(verifierShare, 0.35, decision.useVerifier ? 1 + decision.maxRevisionAttempts : 0, 0, 90_000, 5_000, 1_400, decision.useVerifier ? 1_200 : 64),
+    boss: roleBudget(bossShare, 0.3, bossEnabled ? 1 : 0, 0, 120_000, 1_500, 500, bossEnabled ? 500 : 64),
     reserveTokens: bounded(totalTokens * reserveShare, 0, 12_000),
     reasons: [
       `task:${decision.taskType}`,
