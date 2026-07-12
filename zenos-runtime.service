@@ -1,5 +1,5 @@
 [Unit]
-Description=Zenos Runtime v0.2 - Host Worker Verifier Boss Orchestration
+Description=Zenos Runtime v0.3 - Host Worker Verifier Boss Memory Continuity
 Documentation=file:/root/openclaw-projects/zenos-runtime/README.md
 After=network-online.target 9router.service
 Wants=network-online.target
