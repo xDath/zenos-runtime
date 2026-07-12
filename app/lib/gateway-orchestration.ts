@@ -12,6 +12,7 @@ import {
 import {
   RuntimeModelResult,
   RuntimeRunRequestSchema,
+  callRuntimeModel,
   runBossReviewModel,
   runHostRevision,
   runVerifier,
@@ -83,12 +84,28 @@ export const GatewayTurnPostflightRequestSchema = z.object({
   hostDurationMs: z.number().int().nonnegative().max(86_400_000).optional().default(0),
 });
 
+const GatewayHostPlanSchema = z.object({
+  intentSummary: z.string().trim().min(1).max(4_000),
+  useWorker: z.boolean(),
+  workerTask: z.string().trim().max(8_000).default(''),
+  useVerifier: z.boolean(),
+  useBoss: z.boolean(),
+  confidence: z.number().min(0).max(1),
+  rationale: z.string().trim().min(1).max(4_000),
+  acceptanceCriteria: z.array(z.string().trim().min(1).max(2_000)).max(10).default([]),
+  constraints: z.array(z.string().trim().min(1).max(2_000)).max(10).default([]),
+});
+
+type GatewayHostPlan = z.infer<typeof GatewayHostPlanSchema>;
+
 const StoredGatewayPreflightSchema = z.object({
   kind: z.literal('gateway_preflight_v1'),
   input: RuntimeRunRequestSchema,
   turnId: z.string(),
   platform: z.string(),
   host: GatewayModelIdentitySchema,
+  hostPlan: GatewayHostPlanSchema.optional(),
+  hostPlanCall: z.unknown().optional(),
   workerResult: WorkerResultSchema.optional(),
   workerCall: z.unknown().optional(),
   bossPreflight: BossDecisionSchema.optional(),
@@ -104,7 +121,7 @@ type StoredGatewayPreflight = z.infer<typeof StoredGatewayPreflightSchema>;
 
 export type GatewayTurnReceipt = {
   pipeline: RouteDecision['pipelineMode'];
-  host: { model: string; provider: string; invoked: boolean };
+  host: { model: string; provider: string; invoked: boolean; plannerInvoked?: boolean; calls?: number };
   worker: { model?: string; provider?: string; invoked: boolean; ok?: boolean };
   verifier: { model?: string; provider?: string; invoked: boolean; verdict?: string; ok?: boolean };
   boss: { model?: string; provider?: string; invoked: boolean; verdict?: string; ok?: boolean };
@@ -206,6 +223,7 @@ function compactBossGuardrails(boss?: BossDecision): string {
 
 function renderHostContext(
   decision: RouteDecision,
+  hostPlan: GatewayHostPlan | undefined,
   worker: WorkerResult | undefined,
   boss: BossDecision | undefined,
   runId: string,
@@ -215,9 +233,10 @@ function renderHostContext(
     `Run: ${runId}`,
     `Route: ${decision.pipelineMode}; task=${decision.taskType}; risk=${decision.risk}`,
     `Roles required: worker=${decision.useWorker}; verifier=${decision.useVerifier}; boss=${decision.useBoss}`,
-    decision.useWorker ? '' : 'Worker skipped by deterministic route policy.',
-    decision.useVerifier ? '' : 'Verifier skipped by deterministic route policy.',
-    decision.useBoss ? '' : 'Boss skipped by deterministic route policy.',
+    compactHostPlan(hostPlan),
+    decision.useWorker ? '' : 'Worker skipped by Host orchestration and safety policy.',
+    decision.useVerifier ? '' : 'Verifier skipped by Host orchestration and safety policy.',
+    decision.useBoss ? '' : 'Boss skipped by Host orchestration and safety policy.',
     `Route reasons: ${decision.reasons.join('; ')}`,
     compactWorkerBrief(worker),
     compactBossGuardrails(boss),
@@ -243,11 +262,162 @@ function safeBossDecision(call: RuntimeModelResult): BossDecision | undefined {
   return parsed.success ? parsed.data : undefined;
 }
 
+function safeHostPlan(call: RuntimeModelResult): GatewayHostPlan | undefined {
+  if (!call.ok || !call.parsed) return undefined;
+  const parsed = GatewayHostPlanSchema.safeParse(call.parsed);
+  return parsed.success ? parsed.data : undefined;
+}
+
+function needsHostPlanning(request: GatewayTurnPreflightRequest, decision: RouteDecision): boolean {
+  return request.userRequestedBoss
+    || decision.taskType !== 'simple_chat'
+    || decision.useWorker
+    || decision.useVerifier
+    || decision.useBoss
+    || decision.useTools
+    || decision.useMemory;
+}
+
+function pipelineForHostPlan(
+  decision: RouteDecision,
+  plan: GatewayHostPlan,
+  request: GatewayTurnPreflightRequest,
+): RouteDecision {
+  const safetyVerifier = request.userRequestedVerification
+    || decision.requiresApproval
+    || decision.risk === 'high'
+    || decision.risk === 'critical';
+  const safetyBoss = request.userRequestedBoss
+    || decision.requiresApproval
+    || decision.risk === 'critical';
+  const useWorker = plan.useWorker;
+  const useVerifier = safetyVerifier || plan.useVerifier;
+  const useBoss = safetyBoss || plan.useBoss;
+  const pipelineMode: RouteDecision['pipelineMode'] = useBoss
+    ? 'escalated_deep_path'
+    : useVerifier
+      ? 'verified_path'
+      : useWorker
+        ? 'worker_compression_path'
+        : decision.useTools || decision.useMemory
+          ? 'grounded_path'
+          : 'direct_fast_path';
+
+  return RouteDecisionSchema.parse({
+    ...decision,
+    pipelineMode,
+    useWorker,
+    useVerifier,
+    useBoss,
+    allowEscalation: decision.allowEscalation || useBoss || plan.confidence < 0.55,
+    workerTier: useWorker ? (decision.workerTier === 'none' ? 'standard' : decision.workerTier) : 'none',
+    verifierTier: useVerifier ? (decision.verifierTier === 'none' ? 'cheap' : decision.verifierTier) : 'none',
+    maxWorkerCalls: useWorker ? Math.max(1, decision.maxWorkerCalls) : 0,
+    maxRevisionAttempts: useVerifier ? Math.max(1, decision.maxRevisionAttempts) : 0,
+    reasons: [
+      ...decision.reasons,
+      `host-plan:${plan.rationale}`,
+      useWorker ? 'Host delegated bounded work to Worker' : 'Host retained the task without Worker delegation',
+      useBoss ? 'Boss authority requested by Host or mandatory safety policy' : 'Boss not required by Host or safety policy',
+    ],
+  });
+}
+
+function hostPlanningFallback(
+  decision: RouteDecision,
+  request: GatewayTurnPreflightRequest,
+): RouteDecision {
+  const useVerifier = request.userRequestedVerification
+    || decision.requiresApproval
+    || decision.risk === 'high'
+    || decision.risk === 'critical';
+  const useBoss = request.userRequestedBoss
+    || decision.requiresApproval
+    || decision.risk === 'critical';
+  return RouteDecisionSchema.parse({
+    ...decision,
+    useWorker: false,
+    workerTier: 'none',
+    maxWorkerCalls: 0,
+    useVerifier,
+    verifierTier: useVerifier ? (decision.verifierTier === 'none' ? 'cheap' : decision.verifierTier) : 'none',
+    useBoss,
+    allowEscalation: decision.allowEscalation || useBoss,
+    pipelineMode: useBoss
+      ? 'escalated_deep_path'
+      : useVerifier
+        ? 'verified_path'
+        : decision.useTools || decision.useMemory
+          ? 'grounded_path'
+          : 'direct_fast_path',
+    reasons: [
+      ...decision.reasons,
+      'Host planner unavailable; Worker delegation disabled rather than letting Worker lead the turn',
+    ],
+  });
+}
+
+async function runGatewayHostPlanning(
+  request: GatewayTurnPreflightRequest,
+  input: z.infer<typeof RuntimeRunRequestSchema>,
+  baseline: RouteDecision,
+  repositoryContext: string,
+  runId: string,
+): Promise<{ plan?: GatewayHostPlan; call?: RuntimeModelResult; decision: RouteDecision }> {
+  if (!needsHostPlanning(request, baseline)) return { decision: baseline };
+
+  const call = await callRuntimeModel('host', [
+    {
+      role: 'system',
+      content: `You are the Zenos Host Planner, the primary brain and orchestrator for this user turn.
+Understand the user's goal before any Worker or Boss is invoked. Do not answer the user yet.
+Delegate to Worker only for bounded inspection, evidence extraction, compression, or implementation support.
+Use Verifier when independent checking materially improves reliability.
+Boss is the highest decision authority, but invoke Boss only for explicit user requests, critical/high-stakes uncertainty, unresolved conflict, or when your confidence is genuinely insufficient.
+Return ONLY JSON matching:
+{"intentSummary":"...","useWorker":true,"workerTask":"...","useVerifier":false,"useBoss":false,"confidence":0.0,"rationale":"...","acceptanceCriteria":["..."],"constraints":["..."]}`,
+    },
+    {
+      role: 'user',
+      content: `User request:\n${request.request}\n\nDeterministic safety baseline:\n${JSON.stringify(baseline)}\n\nConversation context (bounded):\n${request.context.slice(-12_000) || '(none)'}\n\nRepository context (bounded):\n${repositoryContext.slice(0, 16_000) || '(none)'}\n\nChoose the minimum sufficient delegation while keeping Host responsible for the final decision.`,
+    },
+  ], {
+    json: true,
+    maxTokens: 700,
+    maxInputTokens: 6_000,
+    sessionId: request.sessionId,
+    modelOverrides: input.modelOverrides,
+    requestId: `${runId}:gateway-host-plan`,
+    trigger: 'host_planning',
+  });
+  const plan = safeHostPlan(call);
+  return {
+    plan,
+    call,
+    decision: plan
+      ? pipelineForHostPlan(baseline, plan, request)
+      : hostPlanningFallback(baseline, request),
+  };
+}
+
+function compactHostPlan(plan?: GatewayHostPlan): string {
+  if (!plan) return '';
+  return [
+    `Host intent: ${plan.intentSummary}`,
+    `Host orchestration: worker=${plan.useWorker}; verifier=${plan.useVerifier}; boss=${plan.useBoss}; confidence=${plan.confidence.toFixed(2)}`,
+    plan.workerTask ? `Worker delegation: ${plan.workerTask}` : '',
+    plan.acceptanceCriteria.length ? `Acceptance criteria: ${plan.acceptanceCriteria.join('; ')}` : '',
+    plan.constraints.length ? `Constraints: ${plan.constraints.join('; ')}` : '',
+    `Host rationale: ${plan.rationale}`,
+  ].filter(Boolean).join('\n');
+}
+
 export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
   const request = GatewayTurnPreflightRequestSchema.parse(raw);
   const runId = `gateway_${crypto.randomUUID()}`;
-  const decision = choosePipeline(request);
-  const repositoryContext = await repositoryContextFor(request, decision);
+  const baselineDecision = choosePipeline(request);
+  let decision = baselineDecision;
+  const repositoryContext = await repositoryContextFor(request, baselineDecision);
   const input = RuntimeRunRequestSchema.parse({
     ...request,
     sessionId: request.sessionId,
@@ -265,9 +435,8 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
     autonomousCoding: false,
     includeExecutionReceipt: false,
   });
-  const budget = createTokenBudgetPlan(decision, input, { userPriority: input.tokenPriority });
 
-  ensureGatewaySession(input, decision, runId, {
+  ensureGatewaySession(input, baselineDecision, runId, {
     turnId: request.turnId,
     platform: request.platform,
     hostModel: request.host.model,
@@ -286,7 +455,7 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
   recordActivity(
     request.sessionId,
     'host',
-    `Hermes Host ${request.host.model} queued behind Runtime preflight.`,
+    `Hermes Host ${request.host.model} owns the turn and is preparing orchestration.`,
     {
       lifecycle: 'role_state',
       runId,
@@ -299,6 +468,35 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
     'queued',
   );
 
+  const hostPlanning = await runGatewayHostPlanning(
+    request,
+    input,
+    baselineDecision,
+    repositoryContext,
+    runId,
+  );
+  const hostPlan = hostPlanning.plan;
+  const hostPlanCall = hostPlanning.call;
+  decision = hostPlanning.decision;
+  ensureGatewaySession(input, decision, runId, {
+    turnId: request.turnId,
+    platform: request.platform,
+    hostModel: request.host.model,
+    hostProvider: request.host.provider,
+    orchestration: hostPlan ? 'host-led' : 'deterministic-fallback',
+    hostPlanConfidence: hostPlan?.confidence,
+  });
+  store.saveRun({
+    runId,
+    sessionId: request.sessionId,
+    requestHash: hashRequest({ request: input.request, context: input.context, turnId: request.turnId }),
+    status: 'running',
+    decision,
+    errors: hostPlanCall && !hostPlan ? ['Host planning failed; deterministic safety route retained'] : [],
+    startedAt: now(),
+  });
+  const budget = createTokenBudgetPlan(decision, input, { userPriority: input.tokenPriority });
+
   let workerResult: WorkerResult | undefined;
   let workerCall: RuntimeModelResult | undefined;
   if (decision.useWorker) {
@@ -307,6 +505,9 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
       totalPasses: 1,
       requestId: `${runId}:gateway-worker:1`,
       budget,
+      delegationTask: hostPlan?.workerTask,
+      acceptanceCriteria: hostPlan?.acceptanceCriteria,
+      constraints: hostPlan?.constraints,
     });
     workerResult = worker.result;
     workerCall = worker.call;
@@ -329,7 +530,7 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
     recordActivity(
       request.sessionId,
       'worker',
-      'Worker skipped by deterministic direct-path policy.',
+      'Worker skipped by Host orchestration and safety policy.',
       { runId, turnId: request.turnId },
       'skipped',
     );
@@ -346,6 +547,7 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
       userGoal: input.request,
       decision,
       approvalGranted: request.approvalGranted,
+      hostPlan,
       workerResult,
       host: request.host,
     }, {
@@ -354,6 +556,7 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
       requestId: `${runId}:gateway-boss-preflight`,
       maxInputTokens: 1_800,
       maxOutputTokens: 600,
+      trigger: request.userRequestedBoss ? 'user_requested_boss' : 'host_or_safety_escalation',
     });
     bossPreflight = safeBossDecision(bossCall);
     recordActivity(
@@ -376,7 +579,7 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
     recordActivity(
       request.sessionId,
       'boss',
-      'Boss skipped because the route does not require premium judgment.',
+      'Boss skipped because Host and safety policy did not require highest-authority review.',
       { runId, turnId: request.turnId },
       'skipped',
     );
@@ -396,7 +599,7 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
       status: 'calling',
       model: request.host.model,
       provider: request.host.provider,
-      trigger: request.userRequestedBoss ? 'user_requested_boss' : 'route_policy',
+      trigger: 'host_final_synthesis',
     },
     'started',
   );
@@ -408,6 +611,8 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
     turnId: request.turnId,
     platform: request.platform,
     host: request.host,
+    hostPlan,
+    hostPlanCall,
     workerResult,
     workerCall,
     bossPreflight,
@@ -433,10 +638,15 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
     turnId: request.turnId,
     decision,
     holdFinalDelivery,
-    hostContext: renderHostContext(decision, workerResult, bossPreflight, runId),
+    hostContext: renderHostContext(decision, hostPlan, workerResult, bossPreflight, runId),
     receipt: {
       pipeline: decision.pipelineMode,
-      host: { ...request.host, invoked: true },
+      host: {
+        ...request.host,
+        invoked: true,
+        plannerInvoked: Boolean(hostPlanCall),
+        calls: hostPlanCall ? 2 : 1,
+      },
       worker: callIdentity(workerCall),
       verifier: { invoked: false },
       boss: { ...callIdentity(bossCall), verdict: bossPreflight?.verdict },
@@ -469,10 +679,18 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
   const input = RuntimeRunRequestSchema.parse({
     ...stored.input,
     sessionId: request.sessionId,
-    toolContext: [stored.input.toolContext, request.toolSummary].filter(Boolean).join('\n\n'),
+    toolContext: [
+      stored.input.toolContext,
+      stored.hostPlan ? `Host orchestration plan:\n${compactHostPlan(stored.hostPlan)}` : '',
+      request.toolSummary,
+    ].filter(Boolean).join('\n\n'),
   });
   const budget = createTokenBudgetPlan(decision, input, { userPriority: input.tokenPriority });
   const calls: RuntimeModelResult[] = [];
+  if (stored.hostPlanCall) {
+    const parsed = stored.hostPlanCall as RuntimeModelResult;
+    if (parsed.role === 'host') calls.push(parsed);
+  }
   if (stored.workerCall) {
     const parsed = stored.workerCall as RuntimeModelResult;
     if (parsed.role === 'worker') calls.push(parsed);
@@ -528,7 +746,12 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
       transformed: false,
       receipt: {
         pipeline: decision.pipelineMode,
-        host: { ...request.host, invoked: true },
+        host: {
+          ...request.host,
+          invoked: true,
+          plannerInvoked: Boolean(stored.hostPlanCall),
+          calls: stored.hostPlanCall ? 2 : 1,
+        },
         worker: callIdentity(calls.find((call) => call.role === 'worker')),
         verifier: { invoked: false },
         boss: { ...callIdentity(calls.find((call) => call.role === 'boss')), verdict: stored.bossPreflight?.verdict },
@@ -604,7 +827,7 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
     recordActivity(
       request.sessionId,
       'verifier',
-      'Verifier skipped by deterministic route policy.',
+      'Verifier skipped by Host orchestration and safety policy.',
       { runId: request.runId, turnId: request.turnId },
       'skipped',
     );
@@ -612,7 +835,7 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
 
   const shouldRunBoss = decision.requiresApproval
     || verifierResult?.verdict === 'escalate'
-    || (decision.useBoss && !input.userRequestedBoss);
+    || (decision.useBoss && decision.risk === 'critical' && !input.userRequestedBoss);
   if (shouldRunBoss) {
     const finalBossCall = await runBossReviewModel({
       stage: 'postflight',
@@ -622,6 +845,7 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
       userGoal: input.request,
       decision,
       currentDraft: finalAnswer,
+      hostPlan: stored.hostPlan,
       workerResult: stored.workerResult,
       verifierResult,
       toolSummary: request.toolSummary,
@@ -632,6 +856,7 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
       requestId: `${request.runId}:gateway-boss-postflight`,
       maxInputTokens: 2_400,
       maxOutputTokens: 700,
+      trigger: verifierResult?.verdict === 'escalate' ? 'verifier_escalation' : 'critical_postflight_authority',
     });
     calls.push(finalBossCall);
     const parsedBoss = safeBossDecision(finalBossCall);
@@ -728,7 +953,12 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
 
   const receipt: GatewayTurnReceipt = {
     pipeline: decision.pipelineMode,
-    host: { ...request.host, invoked: true },
+    host: {
+      ...request.host,
+      invoked: true,
+      plannerInvoked: Boolean(stored.hostPlanCall),
+      calls: stored.hostPlanCall ? 2 : 1,
+    },
     worker: callIdentity(calls.find((call) => call.role === 'worker')),
     verifier: {
       ...callIdentity(verifierCall || [...calls].reverse().find((call) => call.role === 'verifier')),

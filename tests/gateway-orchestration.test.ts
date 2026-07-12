@@ -17,6 +17,28 @@ function modelResponse(content: unknown): Response {
   });
 }
 
+function hostPlan(overrides: Partial<{
+  useWorker: boolean;
+  workerTask: string;
+  useVerifier: boolean;
+  useBoss: boolean;
+  confidence: number;
+  rationale: string;
+}> = {}) {
+  return {
+    intentSummary: 'Understand the request and keep Host responsible for the final decision.',
+    useWorker: false,
+    workerTask: '',
+    useVerifier: false,
+    useBoss: false,
+    confidence: 0.92,
+    rationale: 'Host can coordinate the minimum sufficient roles.',
+    acceptanceCriteria: ['Answer the actual user goal.'],
+    constraints: ['Worker may not make the final user-facing decision.'],
+    ...overrides,
+  };
+}
+
 function modelOverrides() {
   return {
     baseUrl: 'http://router.test/v1',
@@ -92,6 +114,13 @@ test('native gateway worker path calls the configured Worker and injects its bou
   globalThis.fetch = async (_input: string | URL | Request, init?: RequestInit) => {
     const body = JSON.parse(String(init?.body || '{}')) as { model: string };
     calledModels.push(body.model);
+    if (body.model === 'runtime-host') {
+      return modelResponse(hostPlan({
+        useWorker: true,
+        workerTask: 'Extract the three operational constraints without losing evidence.',
+        rationale: 'The long source context should be compressed by Worker before Host synthesis.',
+      }));
+    }
     if (body.model === 'runtime-worker') {
       return modelResponse({
         task: 'summarize long context',
@@ -125,7 +154,8 @@ test('native gateway worker path calls the configured Worker and injects its bou
     assert.equal(preflight.receipt.worker.invoked, true);
     assert.equal(preflight.receipt.worker.model, 'runtime-worker');
     assert.match(preflight.hostContext, /three operational constraints/i);
-    assert.deepEqual(calledModels, ['runtime-worker']);
+    assert.deepEqual(calledModels, ['runtime-host', 'runtime-worker']);
+    assert.match(preflight.hostContext, /Host orchestration: worker=true/i);
 
     const postflight = await postflightGatewayTurn({
       sessionId: 'hermes_worker_test',
@@ -144,11 +174,54 @@ test('native gateway worker path calls the configured Worker and injects its bou
   }
 });
 
+test('Host planner can retain a serious task and prevent Worker from becoming the lead agent', async () => {
+  const originalFetch = globalThis.fetch;
+  const calledModels: string[] = [];
+  globalThis.fetch = async (_input: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body || '{}')) as { model: string };
+    calledModels.push(body.model);
+    if (body.model !== 'runtime-host') throw new Error(`Unexpected model ${body.model}`);
+    return modelResponse(hostPlan({
+      useWorker: false,
+      rationale: 'The Host can reason over the bounded request without delegating it.',
+    }));
+  };
+
+  try {
+    const preflight = await preflightGatewayTurn({
+      request: 'ringkas konteks panjang ini, tapi fokus hanya pada keputusan utamanya',
+      sessionId: 'hermes_host_retains_test',
+      turnId: 'turn-host-retains-1',
+      platform: 'discord',
+      host: { model: 'grok', provider: 'etla-router' },
+      context: 'bounded context',
+      estimatedContextTokens: 10_000,
+      intent: 'analyze',
+      modelOverrides: modelOverrides(),
+    });
+
+    assert.equal(preflight.decision.useWorker, false);
+    assert.equal(preflight.receipt.worker.invoked, false);
+    assert.deepEqual(calledModels, ['runtime-host']);
+    assert.match(preflight.decision.reasons.join(' '), /Host retained the task/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('explicit Boss request invokes Boss exactly once and records user-requested escalation', async () => {
   const originalFetch = globalThis.fetch;
   let bossCalls = 0;
+  const calledModels: string[] = [];
   globalThis.fetch = async (_input: string | URL | Request, init?: RequestInit) => {
     const body = JSON.parse(String(init?.body || '{}')) as { model: string };
+    calledModels.push(body.model);
+    if (body.model === 'runtime-host') {
+      return modelResponse(hostPlan({
+        useBoss: true,
+        rationale: 'The user explicitly requested the highest-authority review.',
+      }));
+    }
     if (body.model !== 'runtime-boss') throw new Error(`Unexpected model ${body.model}`);
     bossCalls += 1;
     return modelResponse({
@@ -179,6 +252,7 @@ test('explicit Boss request invokes Boss exactly once and records user-requested
     assert.match(preflight.decision.reasons.join(' '), /explicitly requested Boss/i);
     assert.equal(preflight.receipt.boss.invoked, true);
     assert.equal(bossCalls, 1);
+    assert.deepEqual(calledModels, ['runtime-host', 'runtime-boss']);
 
     const postflight = await postflightGatewayTurn({
       sessionId: 'hermes_explicit_boss_test',
@@ -212,6 +286,14 @@ test('native gateway verified critical path executes Verifier and Boss before re
   globalThis.fetch = async (_input: string | URL | Request, init?: RequestInit) => {
     const body = JSON.parse(String(init?.body || '{}')) as { model: string; messages: Array<{ role: string; content: string }> };
     calledModels.push(body.model);
+    if (body.model === 'runtime-host') {
+      return modelResponse(hostPlan({
+        useVerifier: true,
+        useBoss: true,
+        confidence: 0.82,
+        rationale: 'Critical production execution requires Verifier and Boss authority.',
+      }));
+    }
     if (body.model === 'runtime-verifier') {
       return modelResponse({
         verdict: 'pass',
@@ -275,7 +357,7 @@ test('native gateway verified critical path executes Verifier and Boss before re
     assert.equal(postflight.receipt.boss.invoked, true);
     assert.equal(postflight.receipt.boss.verdict, 'approve');
     assert.equal(bossCalls, 2);
-    assert.ok(calledModels.includes('runtime-verifier'));
+    assert.deepEqual(calledModels, ['runtime-host', 'runtime-boss', 'runtime-verifier', 'runtime-boss']);
     assert.equal(postflight.finalAnswer, 'Ini rencana advisory; deployment belum dijalankan dan tetap memerlukan approval eksplisit.');
   } finally {
     globalThis.fetch = originalFetch;

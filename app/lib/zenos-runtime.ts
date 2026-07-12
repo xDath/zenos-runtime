@@ -1,6 +1,6 @@
 import { z } from 'zod';
 
-export const RUNTIME_POLICY_VERSION = '2026.07.10-v2';
+export const RUNTIME_POLICY_VERSION = '2026.07.12-v3-host-led';
 
 export const TaskTypeSchema = z.enum([
   'simple_chat',

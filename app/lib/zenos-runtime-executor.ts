@@ -372,6 +372,7 @@ function recordModelCallLifecycle(input: {
   transport: 'http' | 'hermes-cli';
   outcome: 'started' | 'success' | 'failed';
   inputTokensEstimate: number;
+  trigger?: string;
   result?: RuntimeModelResult;
 }): void {
   if (!input.sessionId) return;
@@ -402,6 +403,7 @@ function recordModelCallLifecycle(input: {
         provider: input.provider,
         transport: input.transport,
         inputTokensEstimate: input.inputTokensEstimate,
+        ...(input.trigger ? { trigger: input.trigger } : {}),
         ...(usage ? { modelUsage: usage } : {}),
         ...(input.result ? {
           latencyMs: input.result.latencyMs,
@@ -635,6 +637,7 @@ export async function callRuntimeModel(
     sessionId?: string;
     modelOverrides?: RuntimeModelSlots;
     requestId?: string;
+    trigger?: string;
   } = {},
 ): Promise<RuntimeModelResult> {
   const config = resolveRoleConfig(role, options.sessionId, options.modelOverrides || {});
@@ -666,6 +669,7 @@ export async function callRuntimeModel(
     transport: config.transport,
     outcome: 'started',
     inputTokensEstimate: inputEstimate,
+    trigger: options.trigger,
   });
   const finalize = (result: RuntimeModelResult): RuntimeModelResult => {
     recordModelCallLifecycle({
@@ -677,6 +681,7 @@ export async function callRuntimeModel(
       transport: config.transport,
       outcome: result.ok ? 'success' : 'failed',
       inputTokensEstimate: inputEstimate,
+      trigger: options.trigger,
       result,
     });
     return result;
@@ -836,7 +841,7 @@ export async function callRuntimeModel(
 
 export async function runBossReviewModel(
   packet: unknown,
-  options: { sessionId?: string; modelOverrides?: RuntimeModelSlots; requestId?: string; maxInputTokens?: number; maxOutputTokens?: number } = {},
+  options: { sessionId?: string; modelOverrides?: RuntimeModelSlots; requestId?: string; maxInputTokens?: number; maxOutputTokens?: number; trigger?: string } = {},
 ): Promise<RuntimeModelResult> {
   return callRuntimeModel('boss', [
     {
@@ -907,7 +912,16 @@ function mergeWorkerResults(results: WorkerResult[], request: string): WorkerRes
 export async function runWorkerCompression(
   input: z.infer<typeof RuntimeRunRequestSchema>,
   chunk?: string,
-  options: { pass?: number; totalPasses?: number; requestId?: string; packet?: RuntimeWorkPacket; budget?: TokenBudgetPlan } = {},
+  options: {
+    pass?: number;
+    totalPasses?: number;
+    requestId?: string;
+    packet?: RuntimeWorkPacket;
+    budget?: TokenBudgetPlan;
+    delegationTask?: string;
+    acceptanceCriteria?: string[];
+    constraints?: string[];
+  } = {},
 ): Promise<{ result?: WorkerResult; call: RuntimeModelResult }> {
   const sourceContext = options.packet ? renderRolePacket(options.packet) : (chunk ?? compactSourceContext(input));
   const budget = options.budget ? roleBudget(options.budget, 'worker') : undefined;
@@ -921,7 +935,7 @@ Return ONLY JSON matching:
     },
     {
       role: 'user',
-      content: `Worker pass ${options.pass || 1}/${options.totalPasses || 1}\nUser request:\n${input.request}\n\nBounded source context:\n${sourceContext || '(no source context supplied)'}`,
+      content: `Worker pass ${options.pass || 1}/${options.totalPasses || 1}\nUser request:\n${input.request}\n\nHost delegation:\n${options.delegationTask || 'Extract the evidence the Host needs to answer safely and accurately.'}\n\nAcceptance criteria:\n${(options.acceptanceCriteria || []).map((item) => `- ${item}`).join('\n') || '- Preserve material evidence and uncertainty.'}\n\nConstraints:\n${(options.constraints || []).map((item) => `- ${item}`).join('\n') || '- Do not make the final user-facing decision.'}\n\nBounded source context:\n${sourceContext || '(no source context supplied)'}`,
     },
   ], {
     json: true,
@@ -930,6 +944,7 @@ Return ONLY JSON matching:
     sessionId: input.sessionId,
     modelOverrides: input.modelOverrides,
     requestId: options.requestId,
+    trigger: 'host_delegation',
   });
   if (!call.ok || !call.parsed) return { call };
   try {
