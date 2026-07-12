@@ -118,6 +118,58 @@ export function listRuntimeSessions(limit = 100): RuntimeSessionState[] {
   return getRuntimeStore().listSessions(limit);
 }
 
+export function reconcileStaleRuntimeSessions(options: {
+  staleAfterMs?: number;
+  limit?: number;
+  excludeSessionId?: string;
+  nowMs?: number;
+} = {}): { reconciled: number; sessionIds: string[] } {
+  const store = getRuntimeStore();
+  const staleAfterMs = Math.max(
+    15 * 60_000,
+    options.staleAfterMs || Number(process.env.ZENOS_RUNTIME_STALE_SESSION_MS || 6 * 60 * 60_000),
+  );
+  const nowMs = options.nowMs || Date.now();
+  const activeStatuses = new Set<RuntimeSessionState['status']>([
+    'routing',
+    'working',
+    'paused',
+    'boss_review',
+    'revising',
+    'finalizing',
+  ]);
+  const stale = store.listSessions(Math.min(Math.max(options.limit || 500, 1), 2_000))
+    .filter((session) => session.sessionId !== options.excludeSessionId)
+    .filter((session) => activeStatuses.has(session.status))
+    .filter((session) => nowMs - new Date(session.updatedAt).getTime() >= staleAfterMs);
+
+  for (const session of stale) {
+    store.transaction(() => {
+      for (const worker of session.workers.filter((item) => ['queued', 'running', 'paused'].includes(item.status))) {
+        store.saveWorker(session.sessionId, WorkerLeaseSchema.parse({
+          ...worker,
+          status: 'cancelled',
+          error: worker.error || 'Cancelled by stale-session reconciliation.',
+          updatedAt: now(),
+        }));
+      }
+      store.saveSession(withVersion(session, {
+        status: 'cancelled',
+        activeRunId: undefined,
+        lastError: 'Stale active session reconciled after exceeding the inactivity window.',
+        metadata: {
+          ...session.metadata,
+          staleReconciledAt: now(),
+          staleAfterMs,
+          previousStatus: session.status,
+        },
+      }));
+    });
+  }
+
+  return { reconciled: stale.length, sessionIds: stale.map((session) => session.sessionId) };
+}
+
 export function updateRuntimeSession(
   sessionId: string,
   patch: Partial<Pick<RuntimeSessionState, 'status' | 'finalAnswer' | 'lastError' | 'activeRunId' | 'budget' | 'metadata' | 'modelOverrides'>>,

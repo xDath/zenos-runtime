@@ -19,6 +19,28 @@ const RecallResponseSchema = z.object({
   results: z.array(MemoryResultSchema).default([]),
 }).passthrough();
 
+const MemoryCoverageSchema = z.object({
+  goal: z.boolean(),
+  decisions: z.boolean(),
+  pendingWork: z.boolean(),
+  questions: z.boolean(),
+  artifacts: z.boolean(),
+  complete: z.boolean(),
+});
+
+const CompactResponseSchema = z.object({
+  success: z.boolean().optional(),
+  compact: MemoryResultSchema,
+  coverage: MemoryCoverageSchema.optional(),
+  strategy: z.string().optional(),
+}).passthrough();
+
+const BootstrapResponseSchema = z.object({
+  success: z.boolean().optional(),
+  bootstrap: z.string().default(''),
+  count: z.number().int().nonnegative().optional().default(0),
+}).passthrough();
+
 const AuthResponseSchema = z.object({
   success: z.boolean().optional(),
   token: z.string().min(16),
@@ -28,6 +50,7 @@ const AuthResponseSchema = z.object({
 }).passthrough();
 
 export type MemoryItem = z.infer<typeof MemoryResultSchema>;
+export type MemoryCoverage = z.infer<typeof MemoryCoverageSchema>;
 export type MemoryScope = 'memory:read' | 'memory:write' | 'memory:admin';
 
 export type MemoryClientResult<T> = {
@@ -324,6 +347,129 @@ export async function recallMemoryContext(input: {
     ok: true,
     value: lines.length ? `Zenos Memory recall:\n${lines.join('\n')}` : '',
   };
+}
+
+export async function compactMemoryHandoff(input: {
+  messages: Array<{ role: string; content: unknown; name?: string; tool_call_id?: string }>;
+  namespace?: string;
+  sessionId: string;
+  conversationId?: string;
+  approxTokens?: number;
+  maxChars?: number;
+  inputMaxChars?: number;
+  reason?: string;
+}): Promise<MemoryClientResult<{
+  context: string;
+  coverage?: MemoryCoverage;
+  strategy?: string;
+  memoryId?: string;
+}>> {
+  if (process.env.ZENOS_RUNTIME_DISABLE_MEMORY_HANDOFF === 'true') {
+    return { ok: false, skipped: true, error: 'Automatic Memory handoff is disabled', degraded: true };
+  }
+  const namespace = input.namespace || process.env.ZENOS_MEMORY_NAMESPACE || 'zenos';
+  const maxChars = Math.min(Math.max(input.maxChars || 10_000, 1_000), 24_000);
+  const inputMaxChars = Math.min(Math.max(input.inputMaxChars || 180_000, 20_000), 500_000);
+  const fingerprint = crypto.createHash('sha256')
+    .update(JSON.stringify(input.messages.slice(-300)))
+    .digest('hex')
+    .slice(0, 24);
+  const cache = getRuntimeCache();
+  const cacheKey = runtimeCacheKey('memory', { kind: 'handoff',
+    namespace,
+    sessionId: input.sessionId,
+    conversationId: input.conversationId || '',
+    fingerprint,
+    maxChars,
+    inputMaxChars,
+  }, { memory: process.env.ZENOS_MEMORY_REVISION || 'cloud' });
+  const cached = cache.get<{
+    context: string;
+    coverage?: MemoryCoverage;
+    strategy?: string;
+    memoryId?: string;
+  }>(cacheKey, { memory: process.env.ZENOS_MEMORY_REVISION || 'cloud' });
+  if (cached) return { ok: true, skipped: false, value: cached, cacheHit: true, latencyMs: 0 };
+
+  const result = await memoryFetch<z.infer<typeof CompactResponseSchema>>('/api/memory/compact', {
+    messages: input.messages,
+    namespace,
+    reason: input.reason || 'runtime-context-pressure',
+    approx_tokens: input.approxTokens,
+    session_id: input.sessionId,
+    conversation_id: input.conversationId,
+    max_chars: maxChars,
+    input_max_chars: inputMaxChars,
+    mode: 'dag',
+  }, {
+    scopes: ['memory:read', 'memory:write'],
+    parser: CompactResponseSchema,
+    timeoutMs: 60_000,
+  });
+  if (!result.ok || !result.value) {
+    return {
+      ok: false,
+      skipped: result.skipped,
+      status: result.status,
+      error: result.error,
+      latencyMs: result.latencyMs,
+      degraded: result.degraded,
+    };
+  }
+  const value = {
+    context: `Zenos Memory structured handoff:\n${redactText(result.value.compact.content).slice(0, maxChars)}`,
+    coverage: result.value.coverage,
+    strategy: result.value.strategy,
+    memoryId: result.value.compact.id,
+  };
+  cache.set(cacheKey, value, {
+    ttlMs: Math.max(60_000, Number(process.env.ZENOS_MEMORY_HANDOFF_CACHE_MS || 600_000)),
+    revisions: { memory: process.env.ZENOS_MEMORY_REVISION || 'cloud' },
+  });
+  return { ...result, value };
+}
+
+export async function bootstrapMemoryContext(input: {
+  namespace?: string;
+  queries?: string[];
+  limit?: number;
+  maxChars?: number;
+}): Promise<MemoryClientResult<string>> {
+  const namespace = input.namespace || process.env.ZENOS_MEMORY_NAMESPACE || 'zenos';
+  const limit = Math.min(Math.max(input.limit || 10, 1), 30);
+  const maxChars = Math.min(Math.max(input.maxChars || 6_000, 500), 12_000);
+  const cache = getRuntimeCache();
+  const cacheKey = runtimeCacheKey('memory', { kind: 'bootstrap',
+    namespace,
+    queries: input.queries || [],
+    limit,
+    maxChars,
+  }, { memory: process.env.ZENOS_MEMORY_REVISION || 'cloud' });
+  const cached = cache.get<string>(cacheKey, { memory: process.env.ZENOS_MEMORY_REVISION || 'cloud' });
+  if (cached !== undefined) return { ok: true, skipped: false, value: cached, cacheHit: true, latencyMs: 0 };
+
+  const result = await memoryFetch<z.infer<typeof BootstrapResponseSchema>>('/api/memory/bootstrap', {
+    namespace,
+    queries: input.queries,
+    limit,
+    max_chars: maxChars,
+  }, { scopes: ['memory:read'], parser: BootstrapResponseSchema, timeoutMs: 30_000 });
+  if (!result.ok || !result.value) {
+    return {
+      ok: false,
+      skipped: result.skipped,
+      status: result.status,
+      error: result.error,
+      latencyMs: result.latencyMs,
+      degraded: result.degraded,
+    };
+  }
+  const value = redactText(result.value.bootstrap).slice(0, maxChars);
+  cache.set(cacheKey, value, {
+    ttlMs: Math.max(30_000, Number(process.env.ZENOS_MEMORY_BOOTSTRAP_CACHE_MS || 300_000)),
+    revisions: { memory: process.env.ZENOS_MEMORY_REVISION || 'cloud' },
+  });
+  return { ...result, value };
 }
 
 export async function persistRouteEventToMemory(input: {

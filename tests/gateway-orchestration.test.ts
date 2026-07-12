@@ -92,7 +92,7 @@ test('native gateway direct path persists a real Runtime turn while skipping unn
       turnId: 'turn-direct-1',
       draft: 'Halo juga.',
       host: { model: 'grok', provider: 'etla-router' },
-      hostUsage: { inputTokens: 20, outputTokens: 4 },
+      hostUsage: { inputTokens: 20, cacheReadTokens: 100, outputTokens: 4, calls: 3 },
     });
 
     assert.equal(postflight.finalAnswer, 'Halo juga.');
@@ -101,6 +101,8 @@ test('native gateway direct path persists a real Runtime turn while skipping unn
     const session = getRuntimeSession('hermes_direct_test');
     assert.equal(session?.status, 'done');
     assert.equal(session?.finalAnswer, 'Halo juga.');
+    assert.equal(session?.budget.hostTokensUsed, 124);
+    assert.equal(session?.budget.modelCallsUsed, 3);
     assert.ok(session?.events.some((event) => event.metadata.role === 'host'));
     assert.ok(session?.events.some((event) => event.metadata.role === 'worker' && event.metadata.outcome === 'skipped'));
   } finally {
@@ -169,6 +171,49 @@ test('native gateway worker path calls the configured Worker and injects its bou
     assert.equal(postflight.receipt.worker.invoked, true);
     assert.equal(postflight.receipt.verifier.invoked, false);
     assert.equal(postflight.finalAnswer, 'Ringkasan Host yang mempertahankan constraint A, B, dan C.');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('clear coding work uses deterministic Host orchestration without spending a separate planner call', async () => {
+  const originalFetch = globalThis.fetch;
+  const calledModels: string[] = [];
+  globalThis.fetch = async (_input: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body || '{}')) as { model: string };
+    calledModels.push(body.model);
+    if (body.model !== 'runtime-worker') throw new Error(`Unexpected model ${body.model}`);
+    return modelResponse({
+      task: 'inspect and bound the requested code change',
+      summary: ['The deterministic route delegated source inspection while Host remains final.'],
+      findings: [{ claim: 'The change is scoped to one implementation path.', evidence: ['repository-context'], confidence: 0.9, risk: 'medium' }],
+      contradictions: [],
+      unknowns: [],
+      suggestedNextStep: 'Hermes Host should implement and validate the bounded change.',
+      needsHostAttention: [],
+      rawContextNeeded: [],
+      sourceCoverage: 0.9,
+    });
+  };
+
+  try {
+    const preflight = await preflightGatewayTurn({
+      request: 'perbaiki fungsi parser ini lalu jalankan test terkait',
+      sessionId: 'hermes_clear_coding_test',
+      turnId: 'turn-clear-coding-1',
+      platform: 'telegram',
+      host: { model: 'grok', provider: 'etla-router' },
+      hasFiles: true,
+      hasCodeChangeIntent: true,
+      estimatedContextTokens: 2_500,
+      intent: 'mutate',
+      modelOverrides: modelOverrides(),
+    });
+
+    assert.equal(preflight.decision.taskType, 'coding_change');
+    assert.equal(preflight.decision.useWorker, true);
+    assert.equal(preflight.receipt.host.plannerInvoked, false);
+    assert.deepEqual(calledModels, ['runtime-worker']);
   } finally {
     globalThis.fetch = originalFetch;
   }

@@ -22,6 +22,18 @@ incoming Telegram / WhatsApp turn
 
 Direct low-risk chat still records a Runtime session and receipt, but Worker, Verifier, and Boss are deliberately skipped by policy.
 
+## Layered context continuity
+
+The native middleware keeps three distinct context layers instead of replaying the entire transcript into every Host call:
+
+1. **Hot context:** Hermes keeps the recent raw conversation and active tool loop in its canonical transcript.
+2. **Warm context:** Runtime injects the current route, acceptance criteria, Worker evidence, verification state, and guardrails.
+3. **Cold context:** Zenos Memory supplies selective recall, a bounded bootstrap packet, or a durable structured handoff when the Host working set crosses `context_soft_limit_tokens`.
+
+Stored history is not deleted. The working-set limit only lowers Hermes' existing cache-aware compression threshold. Before context compression, Hermes sends a bounded head-plus-recent-tail packet to Runtime; Runtime persists a coverage-checked Memory handoff that must retain the active goal, decisions, pending work, open questions, and artifacts.
+
+Clear repository, coding, and debugging tasks use deterministic Host orchestration and skip a separate planner model call. Architectural, ambiguous, high-risk, verification, and explicit Boss paths retain Host planning.
+
 ## Profile configuration
 
 ```yaml
@@ -32,6 +44,9 @@ zenos_runtime:
   receipt: concise
   timeout_seconds: 180
   max_history_chars: 16000
+  context_soft_limit_tokens: 160000
+  handoff_history_chars: 240000
+  handoff_max_messages: 300
   disable_streaming_when_verified: true
   report_failures: true
 ```

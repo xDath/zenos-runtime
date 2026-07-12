@@ -1,6 +1,6 @@
 {
   "name": "zenos-runtime",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "Production-grade Zenos orchestration control plane with Host, Worker, Verifier, Boss, durable sessions, and policy-driven model routing.",
   "scripts": {
