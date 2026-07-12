@@ -30,8 +30,31 @@ jobs:
       - name: Install locked dependencies
         run: npm ci
 
-      - name: Production validation
-        run: npm run validate:production
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint -- --quiet
+
+      - name: Unit and integration tests
+        run: npm test
+
+      - name: Runtime smoke with isolated model slots
+        run: npm run smoke:runtime
+        env:
+          ZENOS_LLM_BASE_URL: http://127.0.0.1:9/v1
+          ZENOS_LLM_API_KEY: ci-model-key
+          ZENOS_HOST_MODEL: runtime-host
+          ZENOS_HOST_PROVIDER: ci-router
+          ZENOS_WORKER_MODEL: runtime-worker
+          ZENOS_WORKER_PROVIDER: ci-router
+          ZENOS_BOSS_MODEL: runtime-boss
+          ZENOS_BOSS_PROVIDER: ci-router
+          ZENOS_VERIFIER_MODEL: runtime-verifier
+          ZENOS_VERIFIER_PROVIDER: ci-router
+
+      - name: Production build
+        run: npm run build
 
       - name: Production dependency audit
         run: npm audit --omit=dev --audit-level=high
