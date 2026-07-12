@@ -1,0 +1,57 @@
+name: Zenos Runtime Remote Validation
+
+on:
+  push:
+    branches:
+      - "etla/runtime/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zenos-runtime-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout temporary validation branch
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Production validation
+        run: npm run validate:production
+        env:
+          ZENOS_RUNTIME_DISABLE_MEMORY: "true"
+          ZENOS_RUNTIME_DISABLE_MEMORY_AUTO_RECALL: "true"
+          ZENOS_RUNTIME_EXECUTION_MODE: "control-plane"
+          ETLA_MASTER_SECRET: ci-only-runtime-secret-long-enough
+
+      - name: Production dependency audit
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Write structured validation evidence
+        if: always()
+        run: |
+          mkdir -p validation-artifacts
+          node -e 'const fs=require("fs"); fs.writeFileSync("validation-artifacts/runtime-validation.json", JSON.stringify({version:require("./package.json").version,sha:process.env.GITHUB_SHA,ref:process.env.GITHUB_REF,runId:process.env.GITHUB_RUN_ID,runAttempt:process.env.GITHUB_RUN_ATTEMPT,status:"${{ job.status }}",validatedAt:new Date().toISOString(),gates:["typecheck","lint","tests","runtime-smoke","production-build","dependency-audit"]},null,2)+"\n")'
+
+      - name: Upload validation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: zenos-runtime-validation-${{ github.run_id }}
+          path: validation-artifacts/runtime-validation.json
+          if-no-files-found: error
+          retention-days: 30
