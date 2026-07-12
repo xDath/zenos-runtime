@@ -62,6 +62,8 @@ import {
   TokenBudgetPlan,
   truncateToTokenBudget,
 } from './token-economy';
+import { createLatencyBudgetPlan, LatencyObservation, observeLatency } from './latency-budget';
+import { recordOutcomePassport } from './outcome-ledger';
 
 export const RuntimeRunRequestSchema = RuntimeContextSchema.extend({
   sessionId: z.string().min(1).max(220).optional(),
@@ -1192,6 +1194,72 @@ function updateSessionBudget(sessionId: string | undefined, calls: RuntimeModelR
   });
 }
 
+function recordNativePipelineOutcome(input: {
+  runId: string;
+  sessionId?: string;
+  request: string;
+  decision: RouteDecision;
+  status: 'done' | 'blocked' | 'failed';
+  revisions: number;
+  calls: RuntimeModelResult[];
+  totalDurationMs: number;
+  memoryRecall?: RuntimePipelineResult['memoryRecall'];
+  repositoryIntelligence?: RuntimeRepositoryIntelligenceResult;
+  workerResult?: WorkerResult;
+  verifierResult?: VerifierResult;
+  bossDecision?: BossDecision;
+  memoryContext: string;
+}): void {
+  const plan = createLatencyBudgetPlan(input.decision);
+  const observations: LatencyObservation[] = [];
+  const roleBudget = {
+    host: plan.hostMs,
+    worker: plan.workerMs,
+    verifier: plan.verifierMs,
+    boss: plan.bossMs,
+  } as const;
+  for (const role of ['host', 'worker', 'verifier', 'boss'] as const) {
+    const durationMs = input.calls
+      .filter((call) => call.role === role)
+      .reduce((sum, call) => sum + Math.max(0, call.latencyMs || 0), 0);
+    if (durationMs > 0) observations.push(observeLatency(role, durationMs, roleBudget[role]));
+  }
+  if (input.memoryRecall?.latencyMs !== undefined) {
+    observations.push(observeLatency('memory', input.memoryRecall.latencyMs, plan.memoryMs));
+  }
+  if (input.repositoryIntelligence?.stats.durationMs !== undefined) {
+    observations.push(observeLatency('repository', input.repositoryIntelligence.stats.durationMs, plan.repositoryMs));
+  }
+  observations.push(observeLatency('total', input.totalDurationMs, plan.totalMs));
+
+  recordOutcomePassport({
+    runId: input.runId,
+    sessionId: input.sessionId,
+    request: input.request,
+    decision: input.decision,
+    verdict: input.status === 'blocked'
+      ? 'blocked'
+      : input.status === 'failed'
+        ? 'failed'
+        : input.revisions > 0
+          ? 'revised'
+          : 'success',
+    transformed: input.revisions > 0,
+    calls: input.calls,
+    latencyObservations: observations,
+    verifierVerdict: input.verifierResult?.verdict,
+    verifierConfidence: input.verifierResult?.confidence,
+    bossVerdict: input.bossDecision?.verdict,
+    bossConfidence: input.bossDecision?.confidence,
+    evidenceCoverage: input.workerResult?.sourceCoverage,
+    memorySource: input.memoryRecall?.ok
+      ? 'recall'
+      : input.memoryContext.trim()
+        ? 'supplied'
+        : 'none',
+  });
+}
+
 export async function executeManagedWorker(input: {
   sessionId: string;
   workerId: string;
@@ -1657,6 +1725,22 @@ export async function runZenosPipeline(request: RuntimeRunRequest): Promise<Runt
           store.saveRun({ runId, sessionId, requestHash: requestHash(input), status: 'blocked', decision, result, errors, startedAt: new Date(started).toISOString(), completedAt: new Date().toISOString() });
           updateSessionBudget(sessionId, modelCalls, 0);
           if (sessionId) failRuntimeSession(sessionId, blockedAnswer);
+          recordNativePipelineOutcome({
+            runId,
+            sessionId,
+            request: input.request,
+            decision,
+            status: 'blocked',
+            revisions,
+            calls: modelCalls,
+            totalDurationMs: Date.now() - started,
+            memoryRecall,
+            repositoryIntelligence,
+            workerResult,
+            verifierResult,
+            bossDecision,
+            memoryContext: input.memoryContext,
+          });
           return result;
         }
         if (bossDecision.verdict === 'ask_user') {
@@ -1829,6 +1913,25 @@ export async function runZenosPipeline(request: RuntimeRunRequest): Promise<Runt
     }
     incrementMetric('pipeline_runs_total', { status, task: decision.taskType, risk: decision.risk });
     observeDuration('pipeline_run_duration', started, { status, task: decision.taskType });
+    if (status === 'done' || status === 'blocked' || status === 'failed') {
+      const outcomeStatus: 'done' | 'blocked' | 'failed' = status;
+      recordNativePipelineOutcome({
+        runId,
+        sessionId,
+        request: input.request,
+        decision,
+        status: outcomeStatus,
+        revisions,
+        calls: modelCalls,
+        totalDurationMs: Date.now() - started,
+        memoryRecall,
+        repositoryIntelligence,
+        workerResult,
+        verifierResult,
+        bossDecision,
+        memoryContext: input.memoryContext,
+      });
+    }
     return result;
   } catch (error) {
     const message = redactText(error instanceof Error ? error.message : String(error));
@@ -1894,6 +1997,22 @@ export async function runZenosPipeline(request: RuntimeRunRequest): Promise<Runt
     if (sessionId) failRuntimeSession(sessionId, failureAnswer);
     incrementMetric('pipeline_runs_total', { status: result.status, task: decision.taskType, risk: decision.risk });
     observeDuration('pipeline_run_duration', started, { status: result.status, task: decision.taskType });
+    recordNativePipelineOutcome({
+      runId,
+      sessionId,
+      request: input.request,
+      decision,
+      status: result.status === 'blocked' ? 'blocked' : 'failed',
+      revisions,
+      calls: modelCalls,
+      totalDurationMs: Date.now() - started,
+      memoryRecall,
+      repositoryIntelligence,
+      workerResult: mergeWorkerResults(workerResults, input.request),
+      verifierResult: verifierResults.at(-1),
+      bossDecision,
+      memoryContext: input.memoryContext,
+    });
     log('error', 'Zenos pipeline failed', { runId, sessionId, task: decision.taskType, risk: decision.risk, error: message });
     return result;
   }

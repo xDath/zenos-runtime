@@ -14,8 +14,9 @@ import {
   runQualityGate,
 } from '../app/lib/zenos-runtime-three-agent';
 import { authorizeRequest, issueScopedToken } from '../app/lib/auth';
-import { resetRuntimeStoreForTests } from '../app/lib/zenos-runtime-store';
+import { getRuntimeStore, resetRuntimeStoreForTests } from '../app/lib/zenos-runtime-store';
 import { runZenosPipeline } from '../app/lib/zenos-runtime-executor';
+import { OutcomePassportSchema } from '../app/lib/outcome-ledger';
 
 function signedRequest(options: {
   body: string;
@@ -266,6 +267,14 @@ test('pipeline uses the Host slot, executes Worker, revises on verifier feedback
       persisted?.budget.verifierTokensUsed,
       result.modelCalls.filter((call) => call.role === 'verifier').reduce((sum, call) => sum + call.usage.totalTokens, 0),
     );
+    const outcome = getRuntimeStore().listOutcomes(1, { runId: result.runId })[0];
+    assert.ok(outcome, 'native pipeline must write an Outcome Passport');
+    assert.equal(outcome.verdict, 'revised');
+    const passport = OutcomePassportSchema.parse(outcome.record);
+    assert.equal(passport.roleUsage.worker.calls, 1);
+    assert.equal(passport.roleUsage.runtime_host.calls, 2);
+    assert.equal(passport.roleUsage.verifier.calls, 2);
+    assert.ok(passport.latency.observations.some((item) => item.component === 'total'));
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -379,6 +388,9 @@ test('unresolved verifier revisions fail closed after the policy retry budget', 
     assert.equal(verifierCalls, 2);
     assert.match(result.errors.join(' '), /unresolved/i);
     assert.equal(result.modelCalls.some((call) => call.role === 'boss'), false);
+    const outcome = getRuntimeStore().listOutcomes(1, { runId: result.runId })[0];
+    assert.ok(outcome, 'failed native pipeline must write an Outcome Passport');
+    assert.equal(outcome.verdict, 'failed');
   } finally {
     globalThis.fetch = originalFetch;
   }

@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { LatencyObservationSchema, latencySummary } from './latency-budget';
 import { incrementMetric } from './metrics';
 import { RouteDecisionSchema } from './zenos-runtime';
-import { RuntimeModelResult } from './zenos-runtime-executor';
+import type { RuntimeModelResult } from './zenos-runtime-executor';
 import { getRuntimeStore } from './zenos-runtime-store';
 
 export const OUTCOME_LEDGER_VERSION = 'etla-outcome-passport-v1';
