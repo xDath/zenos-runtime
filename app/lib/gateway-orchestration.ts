@@ -69,8 +69,17 @@ export const GatewayTurnPostflightRequestSchema = z.object({
   failed: z.boolean().optional().default(false),
   hostUsage: z.object({
     inputTokens: z.number().int().nonnegative().default(0),
+    cacheReadTokens: z.number().int().nonnegative().default(0),
+    cacheWriteTokens: z.number().int().nonnegative().default(0),
     outputTokens: z.number().int().nonnegative().default(0),
-  }).optional().default({ inputTokens: 0, outputTokens: 0 }),
+    reasoningTokens: z.number().int().nonnegative().default(0),
+  }).optional().default({
+    inputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    outputTokens: 0,
+    reasoningTokens: 0,
+  }),
   hostDurationMs: z.number().int().nonnegative().max(86_400_000).optional().default(0),
 });
 
@@ -489,8 +498,14 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
       status: request.failed ? 'failed' : 'completed',
       modelUsage: {
         inputTokens: request.hostUsage.inputTokens,
+        cacheReadTokens: request.hostUsage.cacheReadTokens,
+        cacheWriteTokens: request.hostUsage.cacheWriteTokens,
         outputTokens: request.hostUsage.outputTokens,
-        totalTokens: request.hostUsage.inputTokens + request.hostUsage.outputTokens,
+        reasoningTokens: request.hostUsage.reasoningTokens,
+        totalTokens: request.hostUsage.inputTokens
+          + request.hostUsage.cacheReadTokens
+          + request.hostUsage.cacheWriteTokens
+          + request.hostUsage.outputTokens,
         estimated: false,
       },
       latencyMs: request.hostDurationMs,

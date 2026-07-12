@@ -23,7 +23,10 @@ export type RuntimeCallRecord = {
   startedAt: string;
   completedAt?: string;
   inputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
   outputTokens: number;
+  reasoningTokens: number;
   totalTokens: number;
   estimatedTokens: boolean;
   latencyMs?: number;
@@ -89,7 +92,10 @@ function lifecycleCallRecords(events: WorkerEvent[]): RuntimeCallRecord[] {
       trigger: asString(metadata.trigger) || undefined,
       startedAt: event.createdAt || new Date(0).toISOString(),
       inputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
       outputTokens: 0,
+      reasoningTokens: 0,
       totalTokens: 0,
       estimatedTokens: false,
     };
@@ -107,8 +113,14 @@ function lifecycleCallRecords(events: WorkerEvent[]): RuntimeCallRecord[] {
       base.status = status === 'failed' || metadata.outcome === 'failed' ? 'failed' : 'completed';
       base.completedAt = event.createdAt || base.completedAt;
       base.inputTokens = asNumber(usage.inputTokens, base.inputTokens);
+      base.cacheReadTokens = asNumber(usage.cacheReadTokens, base.cacheReadTokens);
+      base.cacheWriteTokens = asNumber(usage.cacheWriteTokens, base.cacheWriteTokens);
       base.outputTokens = asNumber(usage.outputTokens, base.outputTokens);
-      base.totalTokens = asNumber(usage.totalTokens, base.inputTokens + base.outputTokens);
+      base.reasoningTokens = asNumber(usage.reasoningTokens, base.reasoningTokens);
+      base.totalTokens = asNumber(
+        usage.totalTokens,
+        base.inputTokens + base.cacheReadTokens + base.cacheWriteTokens + base.outputTokens,
+      );
       base.estimatedTokens = Boolean(usage.estimated);
       base.latencyMs = asNumber(metadata.latencyMs, base.latencyMs || 0) || undefined;
       base.attempts = asNumber(metadata.attempts, base.attempts || 0) || undefined;
@@ -143,7 +155,10 @@ function roleStateForSession(
     startedAt: latest?.startedAt || null,
     completedAt: latest?.completedAt || null,
     inputTokens: latest?.inputTokens || 0,
+    cacheReadTokens: latest?.cacheReadTokens || 0,
+    cacheWriteTokens: latest?.cacheWriteTokens || 0,
     outputTokens: latest?.outputTokens || 0,
+    reasoningTokens: latest?.reasoningTokens || 0,
     totalTokens: latest?.totalTokens || 0,
     latencyMs: latest?.latencyMs || null,
     trigger: latest?.trigger || null,
@@ -205,7 +220,10 @@ export function buildRuntimeTracker(options: {
 
   const completedCalls = calls.filter((call) => call.status !== 'calling');
   const totalInputTokens = completedCalls.reduce((sum, call) => sum + call.inputTokens, 0);
+  const totalCacheReadTokens = completedCalls.reduce((sum, call) => sum + call.cacheReadTokens, 0);
+  const totalCacheWriteTokens = completedCalls.reduce((sum, call) => sum + call.cacheWriteTokens, 0);
   const totalOutputTokens = completedCalls.reduce((sum, call) => sum + call.outputTokens, 0);
+  const totalReasoningTokens = completedCalls.reduce((sum, call) => sum + call.reasoningTokens, 0);
   const bossCalls = completedCalls.filter((call) => call.role === 'boss').length;
   const failedCalls = completedCalls.filter((call) => call.status === 'failed').length;
   const latencyValues = completedCalls.map((call) => call.latencyMs || 0).filter((value) => value > 0);
@@ -215,7 +233,10 @@ export function buildRuntimeTracker(options: {
       calls: roleCalls.length,
       failures: roleCalls.filter((call) => call.status === 'failed').length,
       inputTokens: roleCalls.reduce((sum, call) => sum + call.inputTokens, 0),
+      cacheReadTokens: roleCalls.reduce((sum, call) => sum + call.cacheReadTokens, 0),
+      cacheWriteTokens: roleCalls.reduce((sum, call) => sum + call.cacheWriteTokens, 0),
       outputTokens: roleCalls.reduce((sum, call) => sum + call.outputTokens, 0),
+      reasoningTokens: roleCalls.reduce((sum, call) => sum + call.reasoningTokens, 0),
       totalTokens: roleCalls.reduce((sum, call) => sum + call.totalTokens, 0),
       averageLatencyMs: roleCalls.length
         ? Math.round(roleCalls.reduce((sum, call) => sum + (call.latencyMs || 0), 0) / roleCalls.length)
@@ -237,8 +258,11 @@ export function buildRuntimeTracker(options: {
       modelCalls: completedCalls.length,
       failedCalls,
       totalInputTokens,
+      totalCacheReadTokens,
+      totalCacheWriteTokens,
       totalOutputTokens,
-      totalTokens: totalInputTokens + totalOutputTokens,
+      totalReasoningTokens,
+      totalTokens: totalInputTokens + totalCacheReadTokens + totalCacheWriteTokens + totalOutputTokens,
       bossCallRate: completedCalls.length ? bossCalls / completedCalls.length : 0,
       averageLatencyMs: latencyValues.length
         ? Math.round(latencyValues.reduce((sum, value) => sum + value, 0) / latencyValues.length)

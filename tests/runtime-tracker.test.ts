@@ -60,8 +60,11 @@ test('Runtime tracker collapses lifecycle events into real calls with tokens, la
       latencyMs: 1200,
       attempts: 1,
       modelUsage: {
-        inputTokens: 880,
+        inputTokens: 380,
+        cacheReadTokens: 500,
+        cacheWriteTokens: 0,
         outputTokens: 120,
+        reasoningTokens: 20,
         totalTokens: 1000,
         estimated: false,
       },
@@ -78,8 +81,10 @@ test('Runtime tracker collapses lifecycle events into real calls with tokens, la
   assert.equal(tracker.calls.length, 1);
   assert.equal(tracker.calls[0].status, 'completed');
   assert.equal(tracker.calls[0].latencyMs, 1200);
-  assert.equal(tracker.calls[0].inputTokens, 880);
+  assert.equal(tracker.calls[0].inputTokens, 380);
+  assert.equal(tracker.calls[0].cacheReadTokens, 500);
   assert.equal(tracker.calls[0].outputTokens, 120);
+  assert.equal(tracker.stats.totalCacheReadTokens, 500);
   assert.equal(tracker.sessions[0].platform, 'discord');
   assert.match(tracker.sessions[0].label, /^#[A-F0-9]{6} · Analisis bug validasi input$/);
   assert.equal(tracker.sessions[0].roles.worker.observed, true);

@@ -104,7 +104,10 @@ type ResolvedRoleConfig = {
 
 export type RuntimeModelUsage = {
   inputTokens: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
   outputTokens: number;
+  reasoningTokens?: number;
   totalTokens: number;
   estimated: boolean;
 };
@@ -209,6 +212,17 @@ const OpenAIResponseSchema = z.object({
     total_tokens: z.number().int().nonnegative().optional(),
     input_tokens: z.number().int().nonnegative().optional(),
     output_tokens: z.number().int().nonnegative().optional(),
+    cached_tokens: z.number().int().nonnegative().optional(),
+    cache_read_input_tokens: z.number().int().nonnegative().optional(),
+    cache_creation_input_tokens: z.number().int().nonnegative().optional(),
+    reasoning_tokens: z.number().int().nonnegative().optional(),
+    prompt_tokens_details: z.object({
+      cached_tokens: z.number().int().nonnegative().optional(),
+      cache_write_tokens: z.number().int().nonnegative().optional(),
+    }).passthrough().optional(),
+    completion_tokens_details: z.object({
+      reasoning_tokens: z.number().int().nonnegative().optional(),
+    }).passthrough().optional(),
   }).passthrough().optional(),
 }).passthrough();
 
@@ -405,16 +419,42 @@ function recordModelCallLifecycle(input: {
 
 function modelUsage(data: z.infer<typeof OpenAIResponseSchema>, prompt: string, content: string): RuntimeModelUsage {
   const usage = data.usage;
-  const inputTokens = usage?.prompt_tokens ?? usage?.input_tokens;
+  const promptTotal = usage?.prompt_tokens ?? usage?.input_tokens;
   const outputTokens = usage?.completion_tokens ?? usage?.output_tokens;
-  if (inputTokens !== undefined || outputTokens !== undefined) {
-    const input = inputTokens || 0;
+  if (promptTotal !== undefined || outputTokens !== undefined) {
+    const cacheReadTokens = usage?.prompt_tokens_details?.cached_tokens
+      ?? usage?.cache_read_input_tokens
+      ?? usage?.cached_tokens
+      ?? 0;
+    const cacheWriteTokens = usage?.prompt_tokens_details?.cache_write_tokens
+      ?? usage?.cache_creation_input_tokens
+      ?? 0;
+    const inputTokens = Math.max(0, (promptTotal || 0) - cacheReadTokens - cacheWriteTokens);
     const output = outputTokens || 0;
-    return { inputTokens: input, outputTokens: output, totalTokens: usage?.total_tokens || input + output, estimated: false };
+    const reasoningTokens = usage?.completion_tokens_details?.reasoning_tokens
+      ?? usage?.reasoning_tokens
+      ?? 0;
+    return {
+      inputTokens,
+      cacheReadTokens,
+      cacheWriteTokens,
+      outputTokens: output,
+      reasoningTokens,
+      totalTokens: inputTokens + cacheReadTokens + cacheWriteTokens + output,
+      estimated: false,
+    };
   }
   const input = estimateTokens(prompt);
   const output = estimateTokens(content);
-  return { inputTokens: input, outputTokens: output, totalTokens: input + output, estimated: true };
+  return {
+    inputTokens: input,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    outputTokens: output,
+    reasoningTokens: 0,
+    totalTokens: input + output,
+    estimated: true,
+  };
 }
 
 function circuitKey(config: ResolvedRoleConfig): string {
@@ -462,7 +502,15 @@ async function callHermesCliTransport(
 ): Promise<RuntimeModelResult> {
   const binary = process.env.ZENOS_HERMES_CLI || '/root/.local/bin/zenos';
   const inputEstimate = estimateTokens(prompt);
-  const emptyUsage: RuntimeModelUsage = { inputTokens: inputEstimate, outputTokens: 0, totalTokens: inputEstimate, estimated: true };
+  const emptyUsage: RuntimeModelUsage = {
+    inputTokens: inputEstimate,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    outputTokens: 0,
+    reasoningTokens: 0,
+    totalTokens: inputEstimate,
+    estimated: true,
+  };
   const started = Date.now();
   const maxAttempts = Math.min(Math.max((options.retries ?? 1) + 1, 1), 3);
   let lastError = 'Hermes CLI model call failed';
@@ -524,7 +572,10 @@ async function callHermesCliTransport(
       });
       const usage: RuntimeModelUsage = {
         inputTokens: inputEstimate,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
         outputTokens: estimateTokens(content),
+        reasoningTokens: 0,
         totalTokens: inputEstimate + estimateTokens(content),
         estimated: true,
       };
@@ -597,7 +648,15 @@ export async function callRuntimeModel(
   const inputEstimate = estimateTokenCount(prompt);
   const requestId = options.requestId || crypto.randomUUID();
   const started = Date.now();
-  const emptyUsage: RuntimeModelUsage = { inputTokens: inputEstimate, outputTokens: 0, totalTokens: inputEstimate, estimated: true };
+  const emptyUsage: RuntimeModelUsage = {
+    inputTokens: inputEstimate,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    outputTokens: 0,
+    reasoningTokens: 0,
+    totalTokens: inputEstimate,
+    estimated: true,
+  };
   recordModelCallLifecycle({
     sessionId: options.sessionId,
     requestId,
