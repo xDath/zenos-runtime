@@ -580,6 +580,7 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
   const verifierMandatory = input.userRequestedVerification
     || decision.risk === 'high'
     || decision.risk === 'critical';
+  const verifierMayRewriteHost = verifierMandatory || decision.requiresApproval || request.failed;
   const deterministicValidation = deterministicValidationState(request.toolSummary);
   const deterministicPassReplacesOptionalVerifier = deterministicValidation === 'passed'
     && ['coding_change', 'debugging', 'repo_question'].includes(decision.taskType)
@@ -620,7 +621,7 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
       verifier.result ? 'success' : 'failed',
     );
 
-    if (verifier.result?.verdict === 'revise') {
+    if (verifier.result?.verdict === 'revise' && verifierMayRewriteHost) {
       const fixes = verifier.result.issues.map((issue) => issue.requiredFix || issue.issue).filter(Boolean);
       const revision = await runHostRevision(input, finalAnswer, fixes, stored.workerResult, {
         requestId: `${request.runId}:gateway-host-revision:1`,
@@ -634,7 +635,7 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
         recordActivity(
           request.sessionId,
           'host',
-          `Runtime Host ${revision.model} revised the Hermes draft from verifier feedback.`,
+          `Runtime Host ${revision.model} revised the Hermes draft from mandatory verifier feedback.`,
           {
             runId: request.runId,
             turnId: request.turnId,
@@ -645,6 +646,19 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
           },
         );
       }
+    } else if (verifier.result?.verdict === 'revise') {
+      recordActivity(
+        request.sessionId,
+        'verifier',
+        'Optional verifier feedback was recorded as advisory; Hermes Host retained final-answer authority.',
+        {
+          runId: request.runId,
+          turnId: request.turnId,
+          verdict: verifier.result.verdict,
+          advisoryIssues: verifier.result.issues.length,
+        },
+        'success',
+      );
     } else if (verifier.result?.verdict === 'block') {
       finalAnswer = blockedAnswer(
         verifier.result.issues.map((issue) => issue.issue).join('; ') || 'verifier safety gate failed',

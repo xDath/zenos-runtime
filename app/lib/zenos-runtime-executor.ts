@@ -58,6 +58,7 @@ import {
   buildDeltaRevisionContext,
   createTokenBudgetPlan,
   estimateTokenCount,
+  recordTokenEstimateCalibration,
   roleBudget,
   TokenBudgetPlan,
   truncateToTokenBudget,
@@ -709,6 +710,12 @@ export async function callRuntimeModel(
     trigger: options.trigger,
   });
   const finalize = (result: RuntimeModelResult): RuntimeModelResult => {
+    if (result.attempts > 0 && !result.usage.estimated) {
+      recordTokenEstimateCalibration(
+        inputEstimate,
+        result.usage.inputTokens + (result.usage.cacheReadTokens || 0) + (result.usage.cacheWriteTokens || 0),
+      );
+    }
     if (options.tokenBudgetPlan && governorAuthorized) {
       settleTokenSpend({
         plan: options.tokenBudgetPlan,

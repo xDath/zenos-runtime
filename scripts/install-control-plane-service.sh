@@ -59,21 +59,36 @@ chown -R root:root "${STAGING}"
 mv "${STAGING}" "${RELEASE_ROOT}"
 ln -sfn "${RELEASE_ROOT}" /opt/zenos-runtime/current
 
-copy_secret_file() {
-  local source="$1"
-  local destination="$2"
-  if [[ -f "${source}" ]]; then
-    install -o root -g "${SERVICE_GROUP}" -m 0640 "${source}" "${destination}"
-  else
-    rm -f "${destination}"
-  fi
+install -d -o root -g root -m 0700 /etc/credstore.encrypted
+CREDENTIAL_TMP="$(mktemp)"
+SANITIZED_CONFIG_TMP="$(mktemp)"
+cleanup() {
+  rm -f "${CREDENTIAL_TMP}" "${SANITIZED_CONFIG_TMP}"
 }
+trap cleanup EXIT
 
-copy_secret_file "${SOURCE_ROOT}/.env.local" /etc/zenos-runtime/runtime.env
-copy_secret_file /root/.hermes/profiles/zenos/.env /etc/zenos-runtime/profile.env
-copy_secret_file /root/.hermes/.env /etc/zenos-runtime/global.env
-copy_secret_file /root/.hermes/profiles/zenos/config.yaml /etc/zenos-runtime/hermes-config.yaml
-copy_secret_file /root/.hermes/profiles/zenos/zenos-runtime.json /etc/zenos-runtime/models.json
+python3 "${SOURCE_ROOT}/scripts/prepare-runtime-service-files.py" \
+  "${CREDENTIAL_TMP}" \
+  "${SANITIZED_CONFIG_TMP}" \
+  /root/.hermes/profiles/zenos/config.yaml \
+  "${SOURCE_ROOT}/.env.local" \
+  /root/.hermes/profiles/zenos/.env \
+  /root/.hermes/.env
+
+rm -f /etc/credstore.encrypted/zenos-runtime.env.cred
+systemd-creds encrypt --with-key=host --name=zenos-runtime.env \
+  "${CREDENTIAL_TMP}" /etc/credstore.encrypted/zenos-runtime.env.cred >/dev/null
+chmod 0600 /etc/credstore.encrypted/zenos-runtime.env.cred
+rm -f /etc/zenos-runtime/runtime.env /etc/zenos-runtime/profile.env /etc/zenos-runtime/global.env
+install -o root -g "${SERVICE_GROUP}" -m 0640 \
+  "${SANITIZED_CONFIG_TMP}" /etc/zenos-runtime/hermes-config.yaml
+
+if [[ -f /root/.hermes/profiles/zenos/zenos-runtime.json ]]; then
+  install -o root -g "${SERVICE_GROUP}" -m 0640 \
+    /root/.hermes/profiles/zenos/zenos-runtime.json /etc/zenos-runtime/models.json
+else
+  rm -f /etc/zenos-runtime/models.json
+fi
 
 install -o root -g root -m 0644 "${SOURCE_ROOT}/zenos-runtime.service" /etc/systemd/system/zenos-runtime.service
 install -o root -g root -m 0644 "${SOURCE_ROOT}/zenos-memory-secondary-backup.service" /etc/systemd/system/zenos-memory-secondary-backup.service

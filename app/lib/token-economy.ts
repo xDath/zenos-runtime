@@ -33,11 +33,49 @@ export type TokenBudgetPlan = z.infer<typeof TokenBudgetPlanSchema>;
 
 export type TokenUsageByRole = Record<RuntimeRole, { input: number; output: number; calls: number }>;
 
-export function estimateTokenCount(text: string): number {
+let tokenEstimatorScale = Math.max(0.65, Math.min(1.8, Number(process.env.ZENOS_TOKEN_ESTIMATOR_SCALE || '1')));
+let tokenEstimatorSamples = 0;
+let tokenEstimatorMeanAbsoluteError = 0;
+
+function baseTokenEstimate(text: string): number {
   if (!text) return 0;
   const ascii = (text.match(/[\x00-\x7F]/g) || []).length;
   const nonAscii = Math.max(0, text.length - ascii);
   return Math.max(1, Math.ceil(ascii / 4 + nonAscii / 2.2));
+}
+
+export function estimateTokenCount(text: string): number {
+  const base = baseTokenEstimate(text);
+  return base ? Math.max(1, Math.ceil(base * tokenEstimatorScale)) : 0;
+}
+
+export function recordTokenEstimateCalibration(estimatedTokens: number, actualTokens: number): void {
+  const estimated = Math.max(0, estimatedTokens);
+  const actual = Math.max(0, actualTokens);
+  if (estimated < 128 || actual < 128) return;
+  const ratio = Math.max(0.5, Math.min(2, actual / estimated));
+  const alpha = tokenEstimatorSamples < 8 ? 0.16 : 0.06;
+  tokenEstimatorScale = Math.max(0.65, Math.min(1.8, tokenEstimatorScale * (1 - alpha + alpha * ratio)));
+  const absoluteError = Math.abs(actual - estimated) / actual;
+  tokenEstimatorSamples += 1;
+  tokenEstimatorMeanAbsoluteError += (absoluteError - tokenEstimatorMeanAbsoluteError) / tokenEstimatorSamples;
+  setGauge('runtime_token_estimator_scale', tokenEstimatorScale);
+  setGauge('runtime_token_estimator_mean_absolute_error', tokenEstimatorMeanAbsoluteError);
+  incrementMetric('runtime_token_estimator_samples_total');
+}
+
+export function tokenEstimatorSnapshot(): { scale: number; samples: number; meanAbsoluteError: number } {
+  return {
+    scale: tokenEstimatorScale,
+    samples: tokenEstimatorSamples,
+    meanAbsoluteError: tokenEstimatorMeanAbsoluteError,
+  };
+}
+
+export function resetTokenEstimatorForTests(): void {
+  tokenEstimatorScale = 1;
+  tokenEstimatorSamples = 0;
+  tokenEstimatorMeanAbsoluteError = 0;
 }
 
 function riskMultiplier(risk: z.infer<typeof RiskLevelSchema>): number {
@@ -172,14 +210,85 @@ export function roleBudget(plan: TokenBudgetPlan, role: RuntimeRole): RoleTokenB
   return plan[role];
 }
 
+const HIGH_SIGNAL_CONTEXT = /\b(must|must not|do not|don't|jangan|harus|error|failed|failure|bug|regression|blocker|unknown|decision|constraint|acceptance|test|verify|security|credential|deadline|pending|todo)\b/i;
+
+function contextSegments(text: string): string[] {
+  const paragraphs = text.split(/\n{2,}/).map((value) => value.trim()).filter(Boolean);
+  if (paragraphs.length > 1) return paragraphs;
+  const lines = text.split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
+  return lines.length > 1 ? lines : [text];
+}
+
+function segmentPriority(segment: string, index: number, total: number): number {
+  const recentness = total <= 1 ? 0 : index / (total - 1);
+  const heading = /^(?:#{1,6}\s|[A-Z][A-Za-z ]{2,40}:$)/.test(segment) ? 0.7 : 0;
+  const highSignal = HIGH_SIGNAL_CONTEXT.test(segment) ? 1.6 : 0;
+  const firstContext = index === 0 ? 0.8 : 0;
+  const lastContext = index === total - 1 ? 1.2 : 0;
+  return highSignal + heading + firstContext + lastContext + recentness;
+}
+
 export function truncateToTokenBudget(text: string, maxTokens: number, marker = '\n[CONTEXT TRUNCATED]'): string {
-  if (estimateTokenCount(text) <= maxTokens) return text;
-  const maxChars = Math.max(64, Math.floor(maxTokens * 3.4));
-  if (text.length <= maxChars) return text;
-  const markerLength = marker.length;
-  const headChars = Math.max(32, Math.floor((maxChars - markerLength) * 0.72));
-  const tailChars = Math.max(16, maxChars - markerLength - headChars);
-  return `${text.slice(0, headChars).trimEnd()}${marker}${text.slice(-tailChars).trimStart()}`;
+  const budget = Math.max(16, Math.floor(maxTokens));
+  if (estimateTokenCount(text) <= budget) return text;
+
+  const segments = contextSegments(text);
+  if (segments.length === 1) {
+    const maxChars = Math.max(64, Math.floor((budget / Math.max(0.65, tokenEstimatorScale)) * 3.1));
+    const available = Math.max(32, maxChars - marker.length);
+    const headChars = Math.max(16, Math.floor(available * 0.5));
+    const tailChars = Math.max(16, available - headChars);
+    return `${text.slice(0, headChars).trimEnd()}${marker}${text.slice(-tailChars).trimStart()}`;
+  }
+
+  const selected = new Set<number>();
+  const ranked = segments
+    .map((segment, index) => ({ index, score: segmentPriority(segment, index, segments.length) }))
+    .sort((left, right) => right.score - left.score || right.index - left.index);
+  for (const candidate of ranked) {
+    selected.add(candidate.index);
+    const rendered = [...selected]
+      .sort((left, right) => left - right)
+      .map((index) => segments[index])
+      .join('\n\n');
+    if (estimateTokenCount(`${rendered}${marker}`) > budget) selected.delete(candidate.index);
+  }
+
+  if (selected.size === 0) {
+    const maxChars = Math.max(64, Math.floor((budget / Math.max(0.65, tokenEstimatorScale)) * 3.1));
+    const available = Math.max(32, maxChars - marker.length);
+    const headChars = Math.max(16, Math.floor(available * 0.5));
+    const tailChars = Math.max(16, available - headChars);
+    return `${text.slice(0, headChars).trimEnd()}${marker}${text.slice(-tailChars).trimStart()}`;
+  }
+
+  const ordered = [...selected].sort((left, right) => left - right);
+  const output: string[] = [];
+  let previous = -1;
+  for (const index of ordered) {
+    if (previous >= 0 && index > previous + 1) output.push(marker.trim());
+    output.push(segments[index]);
+    previous = index;
+  }
+  let rendered = output.join('\n\n');
+  while (estimateTokenCount(rendered) > budget && ordered.length > 2) {
+    const removable = ordered
+      .slice(1, -1)
+      .sort((left, right) => segmentPriority(segments[left], left, segments.length) - segmentPriority(segments[right], right, segments.length))[0];
+    selected.delete(removable);
+    ordered.splice(ordered.indexOf(removable), 1);
+    rendered = ordered.map((index, position) => {
+      const previousIndex = ordered[position - 1];
+      return `${position > 0 && index > previousIndex + 1 ? `${marker.trim()}\n\n` : ''}${segments[index]}`;
+    }).join('\n\n');
+  }
+  if (estimateTokenCount(rendered) <= budget) return rendered;
+
+  const maxChars = Math.max(64, Math.floor((budget / Math.max(0.65, tokenEstimatorScale)) * 3.1));
+  const available = Math.max(32, maxChars - marker.length);
+  const headChars = Math.max(16, Math.floor(available * 0.5));
+  const tailChars = Math.max(16, available - headChars);
+  return `${rendered.slice(0, headChars).trimEnd()}${marker}${rendered.slice(-tailChars).trimStart()}`;
 }
 
 export function buildDeltaRevisionContext(input: {

@@ -3,18 +3,22 @@ import { spawn } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
-function loadEnvFile(file) {
-  if (!existsSync(file)) return;
+function loadEnvFile(file, overwrite = false) {
+  if (!file || !existsSync(file)) return;
+  const values = new Map();
   for (const sourceLine of readFileSync(file, 'utf8').split(/\r?\n/)) {
     const line = sourceLine.trim();
     if (!line || line.startsWith('#')) continue;
     const index = line.indexOf('=');
     if (index <= 0) continue;
-    const key = line.slice(0, index).trim();
+    const key = line.slice(0, index).trim().replace(/^export\s+/, '');
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
     let value = line.slice(index + 1).trim();
     if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) value = value.slice(1, -1);
-    if (process.env[key] === undefined || process.env[key] === '') process.env[key] = value;
+    values.set(key, value);
+  }
+  for (const [key, value] of values) {
+    if (overwrite || process.env[key] === undefined || process.env[key] === '') process.env[key] = value;
   }
 }
 
@@ -91,12 +95,16 @@ function configureFromHermes() {
   if (process.env.ZENOS_LLM_API_KEY && !process.env.ZENOS_MODEL_TRANSPORT) process.env.ZENOS_MODEL_TRANSPORT = 'http';
 }
 
+const credentialDirectory = process.env.CREDENTIALS_DIRECTORY || '';
+loadEnvFile(credentialDirectory ? `${credentialDirectory}/zenos-runtime.env` : '', false);
 for (const file of [
   '.env.local',
   '.env',
   '/root/.hermes/profiles/zenos/.env',
   '/root/.hermes/.env',
 ]) loadEnvFile(file);
+if (!process.env.ZENOS_LLM_BASE_URL && process.env.LLM_BASE_URL) process.env.ZENOS_LLM_BASE_URL = process.env.LLM_BASE_URL;
+if (!process.env.ZENOS_LLM_API_KEY && process.env.LLM_API_KEY) process.env.ZENOS_LLM_API_KEY = process.env.LLM_API_KEY;
 configureFromHermes();
 
 if (process.env.NODE_ENV === 'production') {

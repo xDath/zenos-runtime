@@ -12,9 +12,7 @@ Type=simple
 User=zenos-runtime
 Group=zenos-runtime
 WorkingDirectory=/opt/zenos-runtime/current
-EnvironmentFile=-/etc/zenos-runtime/runtime.env
-EnvironmentFile=-/etc/zenos-runtime/profile.env
-EnvironmentFile=-/etc/zenos-runtime/global.env
+LoadCredentialEncrypted=zenos-runtime.env:/etc/credstore.encrypted/zenos-runtime.env.cred
 Environment=HOME=/var/lib/zenos-runtime
 Environment=NODE_ENV=production
 Environment=NODE_OPTIONS=--disable-warning=ExperimentalWarning
@@ -24,6 +22,8 @@ Environment=ZENOS_RUNTIME_DB_PATH=/var/lib/zenos-runtime/runtime.db
 Environment=ZENOS_MEMORY_BASE_URL=http://127.0.0.1:3091
 Environment=ZENOS_RUNTIME_LEGACY_STORE_PATH=/var/lib/zenos-runtime/legacy-sessions.json
 Environment=ZENOS_RUNTIME_CONFIG_PATH=/etc/zenos-runtime/models.json
+Environment=ZENOS_VERIFIER_MODEL=ag/gemini-3.5-flash-low
+Environment=ZENOS_VERIFIER_PROVIDER=etla-router
 Environment=ZENOS_RUNTIME_SESSION_MODEL_DIR=/var/lib/zenos-runtime/session-models
 Environment=HERMES_CONFIG_PATH=/etc/zenos-runtime/hermes-config.yaml
 Environment=ZENOS_RUNTIME_EXECUTION_MODE=control-plane

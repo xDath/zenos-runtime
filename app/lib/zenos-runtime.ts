@@ -196,7 +196,9 @@ export type RuntimeReadinessReport = z.infer<typeof RuntimeReadinessReportSchema
 
 const SECURITY_PATTERN = /\b(secret|credential|api[ _-]?key|password|private key|oauth|hmac|jwt|auth(?:entication|orization)?|token leak|secret leak|redact)\b/i;
 const EVAL_PATTERN = /\b(eval(?:uation)?|benchmark|regression|pass rate|quality metric|scorecard)\b/i;
-const SUMMARY_PATTERN = /\b(summar(?:y|ize)|ringkas|rangkum|extract|condense|compress|kompres)\b/i;
+const SUMMARY_VERB_PATTERN = /\b(summarize|ringkaskan|rangkum|extract|condense|compress|kompres)\b/i;
+const SUMMARY_OBJECT_PATTERN = /\bringkas\b.{0,24}\b(dokumen|document|teks|text|catatan|notes?|artikel|article|file|konten|content|percakapan|conversation)\b/i;
+const SUMMARY_NOUN_PATTERN = /\b(buat|berikan|provide|give|butuh|need)\b.{0,32}\b(summary|ringkasan|rangkuman)\b/i;
 const MEMORY_PATTERN = /\b(remember|memory|recall|bootstrap|compact|previous|sebelumnya|tadi|dulu|keputusan sebelumnya|roadmap kemarin)\b/i;
 const ARCH_PATTERN = /\b(architecture|arsitektur|roadmap|design|desain|strategy|strategi|rfc|spec(?:ification)?|rancang|rencana|planning|plan)\b/i;
 const DEBUG_PATTERN = /\b(debug|error|exception|stack trace|traceback|crash|gagal|nggak jalan|tidak jalan|bug|race condition|deadlock|memory leak|segfault|panic)\b/i;
@@ -217,6 +219,12 @@ function hasDestructiveIntent(context: z.infer<typeof RuntimeContextSchema>): bo
     || (DEPLOY_ACTION_PATTERN.test(context.request) && (context.intent === 'execute' || context.intent === 'mutate'));
 }
 
+function hasSummaryIntent(text: string): boolean {
+  return SUMMARY_VERB_PATTERN.test(text)
+    || SUMMARY_OBJECT_PATTERN.test(text)
+    || SUMMARY_NOUN_PATTERN.test(text);
+}
+
 function hasDeployAction(context: z.infer<typeof RuntimeContextSchema>): boolean {
   const executionIntent = context.intent === 'execute' || context.intent === 'mutate';
   const immediateImperative = /\b(deploy|release|rollback|publish)\b.{0,30}\b(sekarang|now|langsung|immediately)\b/i.test(context.request);
@@ -235,7 +243,7 @@ export function classifyTask(input: RuntimeContext): TaskType {
   if (EVAL_PATTERN.test(text)) return 'eval_or_benchmark';
   if (context.hasCodeChangeIntent) return DEBUG_PATTERN.test(text) ? 'debugging' : 'coding_change';
   if (DEBUG_PATTERN.test(text) && (context.hasFiles || context.hasLogs || CODE_PATTERN.test(text))) return 'debugging';
-  if (SUMMARY_PATTERN.test(text)) return 'summarization';
+  if (hasSummaryIntent(text)) return 'summarization';
   if (MEMORY_PATTERN.test(text)) return 'memory_question';
   if (ARCH_PATTERN.test(text)) return 'planning_or_architecture';
   if (CODE_PATTERN.test(text) || context.hasFiles || context.hasLogs) {
@@ -432,7 +440,7 @@ export function validateVerifierResult(value: unknown): VerifierResult {
   return VerifierResultSchema.parse(value);
 }
 
-export const defaultRuntimeEvalCases: RuntimeEvalCase[] = [
+const baseRuntimeEvalCases: RuntimeEvalCase[] = [
   { name: 'simple chat stays direct', input: { request: 'jelasin singkat konsep host dan worker' }, expect: { taskType: 'simple_chat', pipelineMode: 'direct_fast_path', useWorker: false, useVerifier: false } },
   { name: 'memory continuation uses memory', input: { request: 'tadi keputusan roadmap Zenos apa?' }, expect: { taskType: 'memory_question', useMemory: true } },
   { name: 'large summarization uses worker', input: { request: 'ringkas dokumen besar ini', estimatedContextTokens: 10_000 }, expect: { taskType: 'summarization', useWorker: true, workerTier: 'cheap' } },
@@ -459,6 +467,29 @@ export const defaultRuntimeEvalCases: RuntimeEvalCase[] = [
   { name: 'editing prose is not coding', input: { request: 'hapus kalimat terakhir dari jawaban ini', intent: 'mutate' }, expect: { taskType: 'simple_chat', useTools: false } },
   { name: 'future deploy reminder is not execution', input: { request: 'ingatkan aku deploy production besok', intent: 'analyze' }, expect: { taskType: 'simple_chat', requiresApproval: false } },
 ];
+
+const ROUTING_EVAL_FRAMES = [
+  (request: string) => request,
+  (request: string) => `Tolong bantu dengan permintaan berikut. ${request}`,
+  (request: string) => `Konteks tambahan: jawab dengan jelas. ${request}`,
+  (request: string) => `Mohon fokus pada tujuan utama. ${request}`,
+  (request: string) => `Please respond accurately. ${request}`,
+  (request: string) => `Aku ingin hasil yang ringkas dan tepat. ${request}`,
+  (request: string) => `Gunakan bukti yang tersedia tanpa mengarang. ${request}`,
+  (request: string) => `Kerjakan sesuai instruksi ini. ${request}`,
+  (request: string) => `Bantu gue ya. ${request}`,
+] as const;
+
+export const defaultRuntimeEvalCases: RuntimeEvalCase[] = baseRuntimeEvalCases.flatMap((testCase) =>
+  ROUTING_EVAL_FRAMES.map((frame, index) => ({
+    ...testCase,
+    name: index === 0 ? testCase.name : `${testCase.name} [frame ${index}]`,
+    input: {
+      ...testCase.input,
+      request: frame(testCase.input.request),
+    },
+  })),
+);
 
 export function estimateRouteTokens(decision: RouteDecision, input: RuntimeContext): {
   premiumInputTokens: number;

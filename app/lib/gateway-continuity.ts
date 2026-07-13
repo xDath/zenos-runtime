@@ -1,3 +1,4 @@
+import * as crypto from 'node:crypto';
 import path from 'node:path';
 import { evaluateExecutionBoundary } from './execution-boundary';
 import { GatewayMemoryBrief, GatewayTurnPreflightRequest } from './gateway-contracts';
@@ -32,10 +33,120 @@ export async function repositoryContextFor(
 }
 
 function memoryTokenBudget(decision: RouteDecision): number {
-  if (decision.taskType === 'memory_question') return 1_800;
-  if (['coding_change', 'debugging', 'repo_question'].includes(decision.taskType)) return 1_000;
-  if (['planning_or_architecture', 'security_or_secret', 'deploy_or_destructive_action'].includes(decision.taskType)) return 1_400;
-  return 500;
+  const byTask: Record<RouteDecision['taskType'], number> = {
+    simple_chat: 400,
+    memory_question: 2_200,
+    repo_question: 1_200,
+    coding_change: 1_300,
+    debugging: 1_400,
+    summarization: 1_000,
+    planning_or_architecture: 1_600,
+    security_or_secret: 1_800,
+    deploy_or_destructive_action: 1_800,
+    eval_or_benchmark: 1_000,
+  };
+  const riskBoost = decision.risk === 'critical' ? 300 : decision.risk === 'high' ? 200 : 0;
+  return Math.max(300, Math.min(2_500, byTask[decision.taskType] + riskBoost));
+}
+
+function contextSoftLimit(decision: RouteDecision): number {
+  const configured = Number(process.env.ZENOS_HOST_CONTEXT_SOFT_LIMIT_TOKENS || '0');
+  if (Number.isFinite(configured) && configured > 0 && process.env.ZENOS_ADAPTIVE_CONTEXT_LIMITS === 'false') {
+    return Math.max(24_000, Math.min(configured, 96_000));
+  }
+  const byTask: Record<RouteDecision['taskType'], number> = {
+    simple_chat: 24_000,
+    memory_question: 32_000,
+    repo_question: 56_000,
+    coding_change: 64_000,
+    debugging: 56_000,
+    summarization: 96_000,
+    planning_or_architecture: 48_000,
+    security_or_secret: 40_000,
+    deploy_or_destructive_action: 40_000,
+    eval_or_benchmark: 56_000,
+  };
+  const baseline = byTask[decision.taskType];
+  const riskFactor = decision.risk === 'critical' ? 0.8 : decision.risk === 'high' ? 0.9 : 1;
+  return Math.max(24_000, Math.min(96_000, Math.round(baseline * riskFactor)));
+}
+
+function safeNamespacePart(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || 'workspace';
+}
+
+function memoryNamespaces(request: GatewayTurnPreflightRequest): { primary: string; shared?: string } {
+  const shared = process.env.ZENOS_MEMORY_NAMESPACE || 'zenos';
+  if (!request.workspaceRoot || process.env.ZENOS_MEMORY_PROJECT_NAMESPACES === 'false') return { primary: shared };
+  const projectName = safeNamespacePart(path.basename(request.workspaceRoot));
+  const projectHash = crypto.createHash('sha256').update(path.resolve(request.workspaceRoot)).digest('hex').slice(0, 10);
+  return {
+    primary: `${safeNamespacePart(shared)}.project.${projectName}.${projectHash}`.slice(0, 120),
+    shared,
+  };
+}
+
+async function recallAcrossNamespaces(input: {
+  query: string;
+  primary: string;
+  shared?: string;
+  limit: number;
+  maxChars: number;
+}): Promise<GatewayMemoryBrief> {
+  const namespaces = [...new Set([input.primary, input.shared].filter((value): value is string => Boolean(value)))];
+  const perNamespaceChars = Math.max(800, Math.floor(input.maxChars / namespaces.length));
+  const results = await Promise.all(namespaces.map((namespace) => recallMemoryContext({
+    query: input.query,
+    namespace,
+    limit: input.limit,
+    maxChars: perNamespaceChars,
+  })));
+  const contexts = results
+    .map((result, index) => result.ok && result.value ? `[namespace=${namespaces[index]}]\n${result.value}` : '')
+    .filter(Boolean);
+  if (!contexts.length) {
+    return {
+      context: '',
+      source: 'none',
+      degraded: true,
+      latencyMs: Math.max(0, ...results.map((result) => result.latencyMs || 0)),
+    };
+  }
+  return {
+    context: contexts.join('\n\n'),
+    source: 'recall',
+    degraded: results.some((result) => result.degraded),
+    cacheHit: results.every((result) => result.cacheHit),
+    latencyMs: Math.max(0, ...results.map((result) => result.latencyMs || 0)),
+  };
+}
+
+async function bootstrapAcrossNamespaces(input: {
+  query: string;
+  primary: string;
+  shared?: string;
+  limit: number;
+  maxChars: number;
+}): Promise<GatewayMemoryBrief> {
+  const namespaces = [...new Set([input.primary, input.shared].filter((value): value is string => Boolean(value)))];
+  const perNamespaceChars = Math.max(800, Math.floor(input.maxChars / namespaces.length));
+  const results = await Promise.all(namespaces.map((namespace) => bootstrapMemoryContext({
+    namespace,
+    queries: [input.query],
+    limit: input.limit,
+    maxChars: perNamespaceChars,
+  })));
+  const contexts = results
+    .map((result, index) => result.ok && result.value ? `[namespace=${namespaces[index]}]\n${result.value}` : '')
+    .filter(Boolean);
+  if (!contexts.length) return { context: '', source: 'none', degraded: true };
+  return {
+    context: contexts.join('\n\n'),
+    source: 'bootstrap',
+    degraded: results.some((result) => result.degraded),
+    cacheHit: results.every((result) => result.cacheHit),
+    latencyMs: Math.max(0, ...results.map((result) => result.latencyMs || 0)),
+  };
 }
 
 export async function gatewayMemoryContextFor(
@@ -43,8 +154,8 @@ export async function gatewayMemoryContextFor(
   decision: RouteDecision,
   existingSession: boolean,
 ): Promise<GatewayMemoryBrief> {
-  const namespace = process.env.ZENOS_MEMORY_NAMESPACE || 'zenos';
-  const softLimit = Math.max(24_000, Number(process.env.ZENOS_HOST_CONTEXT_SOFT_LIMIT_TOKENS || 64_000));
+  const namespaces = memoryNamespaces(request);
+  const softLimit = contextSoftLimit(decision);
   const contextBudget = memoryTokenBudget(decision);
   const projectName = request.workspaceRoot ? path.basename(request.workspaceRoot) : '';
   const memoryQuery = projectName
@@ -56,24 +167,25 @@ export async function gatewayMemoryContextFor(
   if (underPressure && hasHandoffSource) {
     const compact = await compactMemoryHandoff({
       messages: request.handoffMessages,
-      namespace,
+      namespace: namespaces.primary,
       sessionId: request.sessionId,
       conversationId: request.turnId,
       approxTokens: request.estimatedContextTokens,
       maxChars: 8_000,
       inputMaxChars: 120_000,
-      reason: 'hermes-host-working-set-pressure',
+      reason: `hermes-host-working-set-pressure:${decision.taskType}:${softLimit}`,
     });
     if (compact.ok && compact.value?.context) {
       let context = compact.value.context;
       if (decision.taskType === 'memory_question') {
-        const recalled = await recallMemoryContext({
+        const recalled = await recallAcrossNamespaces({
           query: memoryQuery,
-          namespace,
+          primary: namespaces.primary,
+          shared: namespaces.shared,
           limit: Math.max(4, decision.maxMemoryItems),
           maxChars: 5_000,
         });
-        if (recalled.ok && recalled.value) context = `${context}\n\n${recalled.value}`;
+        if (recalled.context) context = `${context}\n\n${recalled.context}`;
       }
       return {
         context: truncateToTokenBudget(context, contextBudget, '\n[MEMORY BRIEF TRUNCATED]'),
@@ -89,39 +201,35 @@ export async function gatewayMemoryContextFor(
   if (!decision.useMemory) return { context: '', source: 'none' };
 
   if (!existingSession) {
-    const bootstrap = await bootstrapMemoryContext({
-      namespace,
-      queries: [memoryQuery],
+    const bootstrap = await bootstrapAcrossNamespaces({
+      query: memoryQuery,
+      primary: namespaces.primary,
+      shared: namespaces.shared,
       limit: Math.max(4, decision.maxMemoryItems),
       maxChars: Math.ceil(contextBudget * 3.4),
     });
-    if (bootstrap.ok && bootstrap.value) {
+    if (bootstrap.context) {
       return {
-        context: truncateToTokenBudget(bootstrap.value, contextBudget, '\n[MEMORY BOOTSTRAP TRUNCATED]'),
-        source: 'bootstrap',
-        degraded: bootstrap.degraded,
-        cacheHit: bootstrap.cacheHit,
-        latencyMs: bootstrap.latencyMs,
+        ...bootstrap,
+        context: truncateToTokenBudget(bootstrap.context, contextBudget, '\n[MEMORY BOOTSTRAP TRUNCATED]'),
       };
     }
   }
 
-  const recalled = await recallMemoryContext({
+  const recalled = await recallAcrossNamespaces({
     query: memoryQuery,
-    namespace,
+    primary: namespaces.primary,
+    shared: namespaces.shared,
     limit: Math.max(1, decision.maxMemoryItems),
     maxChars: Math.ceil(contextBudget * 3.4),
   });
-  if (recalled.ok && recalled.value) {
+  if (recalled.context) {
     return {
-      context: truncateToTokenBudget(recalled.value, contextBudget, '\n[MEMORY RECALL TRUNCATED]'),
-      source: 'recall',
-      degraded: recalled.degraded,
-      cacheHit: recalled.cacheHit,
-      latencyMs: recalled.latencyMs,
+      ...recalled,
+      context: truncateToTokenBudget(recalled.context, contextBudget, '\n[MEMORY RECALL TRUNCATED]'),
     };
   }
-  return { context: '', source: 'none', degraded: true, latencyMs: recalled.latencyMs };
+  return recalled;
 }
 
 export async function prepareGatewayContexts(input: {

@@ -1,7 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { choosePipeline, RuntimeContextSchema } from '../app/lib/zenos-runtime';
-import { createTokenBudgetPlan, estimateTokenCount } from '../app/lib/token-economy';
+import {
+  createTokenBudgetPlan,
+  estimateTokenCount,
+  recordTokenEstimateCalibration,
+  resetTokenEstimatorForTests,
+  tokenEstimatorSnapshot,
+  truncateToTokenBudget,
+} from '../app/lib/token-economy';
 import { compileRuntimeContext, renderRolePacket } from '../app/lib/runtime-context-compiler';
 import { SkillRegistry, createDefaultSkillRegistry } from '../app/lib/skill-registry';
 import { ToolBroker, ToolEvidenceSchema } from '../app/lib/tool-broker';
@@ -24,6 +31,46 @@ test('token economy keeps Boss bounded and allocates cheap work first', () => {
   assert.ok(budget.verifier.outputTokens >= 1_200);
   assert.ok(budget.host.outputTokens >= 1_600);
   assert.ok(budget.worker.inputTokens > budget.boss.inputTokens);
+});
+
+test('token estimator calibrates from provider usage without changing the public budget contract', () => {
+  resetTokenEstimatorForTests();
+  const sample = 'calibration sample '.repeat(300);
+  const before = estimateTokenCount(sample);
+  recordTokenEstimateCalibration(1_000, 1_300);
+  const snapshot = tokenEstimatorSnapshot();
+  const after = estimateTokenCount(sample);
+
+  assert.equal(snapshot.samples, 1);
+  assert.ok(snapshot.scale > 1);
+  assert.ok(after > before);
+  resetTokenEstimatorForTests();
+});
+
+test('context truncation preserves high-signal middle evidence instead of blind head-tail slicing', () => {
+  const source = [
+    `Background context ${'ordinary '.repeat(500)}`,
+    `Historical notes ${'low-signal '.repeat(500)}`,
+    'MUST preserve the database transaction boundary because the prior deployment failed this acceptance test.',
+    `Additional discussion ${'routine '.repeat(500)}`,
+    'Final instruction: verify the regression test before claiming success.',
+  ].join('\n\n');
+  const truncated = truncateToTokenBudget(source, 260);
+
+  assert.ok(estimateTokenCount(truncated) <= 260);
+  assert.match(truncated, /MUST preserve the database transaction boundary/);
+  assert.match(truncated, /verify the regression test/);
+});
+
+test('concise response preferences do not override the actual task classification', () => {
+  const decision = choosePipeline({
+    request: 'Aku ingin hasil yang ringkas dan tepat. review source code ini',
+    hasFiles: true,
+    containsUntrustedInput: true,
+  });
+  assert.equal(decision.taskType, 'repo_question');
+  assert.equal(decision.risk, 'high');
+  assert.equal(decision.useVerifier, true);
 });
 
 test('four-role orchestration reserves enough structured output budget to avoid truncated contracts', () => {

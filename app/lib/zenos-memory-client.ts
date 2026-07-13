@@ -56,6 +56,12 @@ const AuthenticatedStatusSchema = z.object({
   namespace: z.string(),
 }).passthrough();
 
+const RevisionResponseSchema = z.object({
+  success: z.boolean(),
+  namespace: z.string(),
+  revision: z.string().min(8),
+}).passthrough();
+
 export type MemoryItem = z.infer<typeof MemoryResultSchema>;
 export type MemoryCoverage = z.infer<typeof MemoryCoverageSchema>;
 export type MemoryScope = 'memory:read' | 'memory:write' | 'memory:admin';
@@ -77,6 +83,8 @@ type CircuitState = { failures: number; openUntil: number; lastError?: string };
 const tokens = new Map<string, TokenRecord>();
 let circuit: CircuitState = { failures: 0, openUntil: 0 };
 const inFlightTokens = new Map<string, Promise<string>>();
+const namespaceRevisions = new Map<string, { revision: string; expiresAt: number }>();
+const inFlightRevisions = new Map<string, Promise<string>>();
 const EMPTY_SHA256 = crypto.createHash('sha256').update('').digest('hex');
 
 function memoryBaseUrl(): string {
@@ -272,6 +280,47 @@ async function memoryFetch<T>(
   return { ok: false, skipped: false, error: 'Memory authentication retry exhausted', degraded: true };
 }
 
+function fallbackRevision(namespace: string): string {
+  return `${process.env.ZENOS_MEMORY_REVISION || 'cloud'}:${namespace}`;
+}
+
+function setNamespaceRevision(namespace: string, revision: string, ttlMs?: number): string {
+  namespaceRevisions.set(namespace, {
+    revision,
+    expiresAt: Date.now() + Math.max(500, ttlMs || Number(process.env.ZENOS_MEMORY_REVISION_CACHE_MS || 2_000)),
+  });
+  return revision;
+}
+
+function bumpNamespaceRevision(namespace: string, evidence = ''): string {
+  const revision = crypto.createHash('sha256')
+    .update(`${namespace}\n${evidence}\n${Date.now()}\n${crypto.randomUUID()}`)
+    .digest('hex');
+  return setNamespaceRevision(namespace, revision, 2_000);
+}
+
+async function currentNamespaceRevision(namespace: string, force = false): Promise<string> {
+  const cached = namespaceRevisions.get(namespace);
+  if (!force && cached && Date.now() < cached.expiresAt) return cached.revision;
+  if (!force) {
+    const existing = inFlightRevisions.get(namespace);
+    if (existing) return existing;
+  }
+  const request = (async () => {
+    const result = await memoryFetch<z.infer<typeof RevisionResponseSchema>>(
+      '/api/memory/revision',
+      { namespace },
+      { scopes: ['memory:read'], parser: RevisionResponseSchema, timeoutMs: 10_000 },
+    );
+    if (!result.ok || !result.value?.revision) {
+      return cached?.revision || fallbackRevision(namespace);
+    }
+    return setNamespaceRevision(namespace, result.value.revision);
+  })().finally(() => inFlightRevisions.delete(namespace));
+  inFlightRevisions.set(namespace, request);
+  return request;
+}
+
 export async function recallMemoryItems(input: {
   query: string;
   namespace?: string;
@@ -283,10 +332,11 @@ export async function recallMemoryItems(input: {
   }
   const namespace = input.namespace || process.env.ZENOS_MEMORY_NAMESPACE || 'zenos';
   const limit = Math.min(Math.max(input.limit || 5, 1), 20);
+  const revision = await currentNamespaceRevision(namespace);
   const cache = getRuntimeCache();
   const cacheInput = { query: input.query, namespace, limit, tags: input.tags || [] };
-  const cacheKey = runtimeCacheKey('memory', cacheInput, { memory: process.env.ZENOS_MEMORY_REVISION || 'cloud' });
-  const cached = cache.get<MemoryItem[]>(cacheKey, { memory: process.env.ZENOS_MEMORY_REVISION || 'cloud' });
+  const cacheKey = runtimeCacheKey('memory', cacheInput, { memory: revision });
+  const cached = cache.get<MemoryItem[]>(cacheKey, { memory: revision });
   if (cached) return { ok: true, skipped: false, value: cached, cacheHit: true, latencyMs: 0 };
 
   const result = await memoryFetch<z.infer<typeof RecallResponseSchema>>('/api/memory/hybrid-recall', {
@@ -310,7 +360,7 @@ export async function recallMemoryItems(input: {
   const items = (result.value.results || []).filter((item) => item.type !== 'credential' && item.metadata?.is_secret !== true);
   cache.set(cacheKey, items, {
     ttlMs: Math.max(5_000, Number(process.env.ZENOS_MEMORY_RECALL_CACHE_MS || 60_000)),
-    revisions: { memory: process.env.ZENOS_MEMORY_REVISION || 'cloud' },
+    revisions: { memory: revision },
   });
   return { ...result, value: items };
 }
@@ -381,6 +431,7 @@ export async function compactMemoryHandoff(input: {
     .update(JSON.stringify(input.messages.slice(-300)))
     .digest('hex')
     .slice(0, 24);
+  const revision = await currentNamespaceRevision(namespace);
   const cache = getRuntimeCache();
   const cacheKey = runtimeCacheKey('memory', { kind: 'handoff',
     namespace,
@@ -389,13 +440,13 @@ export async function compactMemoryHandoff(input: {
     fingerprint,
     maxChars,
     inputMaxChars,
-  }, { memory: process.env.ZENOS_MEMORY_REVISION || 'cloud' });
+  }, { memory: revision });
   const cached = cache.get<{
     context: string;
     coverage?: MemoryCoverage;
     strategy?: string;
     memoryId?: string;
-  }>(cacheKey, { memory: process.env.ZENOS_MEMORY_REVISION || 'cloud' });
+  }>(cacheKey, { memory: revision });
   if (cached) return { ok: true, skipped: false, value: cached, cacheHit: true, latencyMs: 0 };
 
   const result = await memoryFetch<z.infer<typeof CompactResponseSchema>>('/api/memory/compact', {
@@ -429,9 +480,18 @@ export async function compactMemoryHandoff(input: {
     strategy: result.value.strategy,
     memoryId: result.value.compact.id,
   };
-  cache.set(cacheKey, value, {
+  const postWriteRevision = bumpNamespaceRevision(namespace, result.value.compact.id || fingerprint);
+  const postWriteKey = runtimeCacheKey('memory', { kind: 'handoff',
+    namespace,
+    sessionId: input.sessionId,
+    conversationId: input.conversationId || '',
+    fingerprint,
+    maxChars,
+    inputMaxChars,
+  }, { memory: postWriteRevision });
+  cache.set(postWriteKey, value, {
     ttlMs: Math.max(60_000, Number(process.env.ZENOS_MEMORY_HANDOFF_CACHE_MS || 600_000)),
-    revisions: { memory: process.env.ZENOS_MEMORY_REVISION || 'cloud' },
+    revisions: { memory: postWriteRevision },
   });
   return { ...result, value };
 }
@@ -445,14 +505,15 @@ export async function bootstrapMemoryContext(input: {
   const namespace = input.namespace || process.env.ZENOS_MEMORY_NAMESPACE || 'zenos';
   const limit = Math.min(Math.max(input.limit || 10, 1), 30);
   const maxChars = Math.min(Math.max(input.maxChars || 6_000, 500), 12_000);
+  const revision = await currentNamespaceRevision(namespace);
   const cache = getRuntimeCache();
   const cacheKey = runtimeCacheKey('memory', { kind: 'bootstrap',
     namespace,
     queries: input.queries || [],
     limit,
     maxChars,
-  }, { memory: process.env.ZENOS_MEMORY_REVISION || 'cloud' });
-  const cached = cache.get<string>(cacheKey, { memory: process.env.ZENOS_MEMORY_REVISION || 'cloud' });
+  }, { memory: revision });
+  const cached = cache.get<string>(cacheKey, { memory: revision });
   if (cached !== undefined) return { ok: true, skipped: false, value: cached, cacheHit: true, latencyMs: 0 };
 
   const result = await memoryFetch<z.infer<typeof BootstrapResponseSchema>>('/api/memory/bootstrap', {
@@ -474,7 +535,7 @@ export async function bootstrapMemoryContext(input: {
   const value = redactText(result.value.bootstrap).slice(0, maxChars);
   cache.set(cacheKey, value, {
     ttlMs: Math.max(30_000, Number(process.env.ZENOS_MEMORY_BOOTSTRAP_CACHE_MS || 300_000)),
-    revisions: { memory: process.env.ZENOS_MEMORY_REVISION || 'cloud' },
+    revisions: { memory: revision },
   });
   return { ...result, value };
 }
@@ -508,7 +569,12 @@ export async function persistRouteEventToMemory(input: {
     },
     idempotency_key: input.runId ? `runtime-route-${input.runId}` : undefined,
   }, { scopes: ['memory:read', 'memory:write'] });
-  if (!result.ok && !result.skipped) {
+  if (result.ok) {
+    bumpNamespaceRevision(
+      namespace,
+      input.runId || crypto.createHash('sha256').update(JSON.stringify(input.event)).digest('hex').slice(0, 24),
+    );
+  } else if (!result.skipped) {
     log('warn', 'Failed to persist distilled Runtime event to Zenos Memory', {
       runId: input.runId,
       sessionId: input.sessionId,
@@ -646,5 +712,7 @@ export function memoryConfigurationSummary(): {
 export function resetMemoryClientForTests(): void {
   tokens.clear();
   inFlightTokens.clear();
+  namespaceRevisions.clear();
+  inFlightRevisions.clear();
   circuit = { failures: 0, openUntil: 0 };
 }
