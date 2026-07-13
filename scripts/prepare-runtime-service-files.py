@@ -23,7 +23,18 @@ def parse_env(path: Path) -> dict[str, str]:
     return values
 
 
-def prepare_environment(destination: Path, sources: list[Path]) -> None:
+def runtime_provider(source: Path) -> tuple[str, dict]:
+    if not source.is_file():
+        return "etla-router", {}
+    data = yaml.safe_load(source.read_text(encoding="utf-8")) or {}
+    model = data.get("model") if isinstance(data.get("model"), dict) else {}
+    provider_name = str(model.get("provider") or "etla-router").replace("custom:", "")
+    providers = data.get("providers") if isinstance(data.get("providers"), dict) else {}
+    provider = providers.get(provider_name) if isinstance(providers.get(provider_name), dict) else {}
+    return provider_name, provider
+
+
+def prepare_environment(destination: Path, sources: list[Path], config_source: Path) -> None:
     values: dict[str, str] = {}
     for source in sources:
         for key, value in parse_env(source).items():
@@ -31,6 +42,10 @@ def prepare_environment(destination: Path, sources: list[Path]) -> None:
             candidate = value.strip().strip('"\'')
             if key not in values or (not current and candidate):
                 values[key] = value
+    _, provider = runtime_provider(config_source)
+    provider_credential = str(provider.get("api_key") or "").strip()
+    if provider_credential and not values.get("ZENOS_LLM_API_KEY", "").strip().strip('"\''):
+        values["ZENOS_LLM_API_KEY"] = provider_credential
     if not values:
         raise SystemExit("No Runtime environment source was found")
     destination.write_text(
@@ -46,9 +61,7 @@ def prepare_config(source: Path, destination: Path) -> None:
         return
     data = yaml.safe_load(source.read_text(encoding="utf-8")) or {}
     model = data.get("model") if isinstance(data.get("model"), dict) else {}
-    provider_name = str(model.get("provider") or "etla-router").replace("custom:", "")
-    providers = data.get("providers") if isinstance(data.get("providers"), dict) else {}
-    provider = providers.get(provider_name) if isinstance(providers.get(provider_name), dict) else {}
+    provider_name, provider = runtime_provider(source)
     sanitized = {
         "model": {
             "default": model.get("default") or "grok",
@@ -75,7 +88,7 @@ def main() -> None:
     config_output = Path(sys.argv[2])
     config_input = Path(sys.argv[3])
     sources = [Path(value) for value in sys.argv[4:]]
-    prepare_environment(environment_output, sources)
+    prepare_environment(environment_output, sources, config_input)
     prepare_config(config_input, config_output)
 
 
