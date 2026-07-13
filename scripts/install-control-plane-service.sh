@@ -86,7 +86,7 @@ systemctl daemon-reload
 systemctl enable zenos-runtime.service zenos-memory-secondary-backup.timer >/dev/null
 systemctl restart zenos-runtime.service
 systemctl start zenos-memory-secondary-backup.timer
-if [[ -f "${HERMES_ZENOS_UNIT}" ]]; then
+if [[ -f "${HERMES_ZENOS_UNIT}" && "${ZENOS_DEPLOY_RESTART_HERMES:-true}" == "true" ]]; then
   systemctl enable hermes-gateway.service >/dev/null
   systemctl restart hermes-gateway.service
 fi
