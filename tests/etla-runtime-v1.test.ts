@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { choosePipeline, RuntimeContextSchema } from '../app/lib/zenos-runtime';
 import {
   createTokenBudgetPlan,
+  estimateModelInputTokens,
   estimateTokenCount,
   recordTokenEstimateCalibration,
   resetTokenEstimatorForTests,
@@ -26,7 +27,7 @@ test('token economy keeps Boss bounded and allocates cheap work first', () => {
   const budget = createTokenBudgetPlan(decision, context);
   assert.ok(budget.worker.maxCalls >= 1);
   assert.ok(budget.boss.inputTokens <= 1_500);
-  assert.equal(budget.boss.outputTokens, 500);
+  assert.ok(budget.boss.outputTokens >= 900);
   assert.ok(budget.worker.outputTokens >= 1_600);
   assert.ok(budget.verifier.outputTokens >= 1_200);
   assert.ok(budget.host.outputTokens >= 1_600);
@@ -43,6 +44,21 @@ test('token estimator calibrates from provider usage without changing the public
 
   assert.equal(snapshot.samples, 1);
   assert.ok(snapshot.scale > 1);
+  assert.ok(after > before);
+  resetTokenEstimatorForTests();
+});
+
+test('model input estimator accounts for persistent provider framing separately from text size', () => {
+  resetTokenEstimatorForTests();
+  const prompt = 'bounded verifier prompt '.repeat(120);
+  const visible = estimateTokenCount(prompt, 'ag/gemini-3.5-flash-low');
+  const before = estimateModelInputTokens(prompt, 'ag/gemini-3.5-flash-low');
+  assert.ok(before >= visible + 2_400);
+
+  recordTokenEstimateCalibration(before, before + 1_000, 'ag/gemini-3.5-flash-low');
+  const after = estimateModelInputTokens(prompt, 'ag/gemini-3.5-flash-low');
+  const snapshot = tokenEstimatorSnapshot('ag/gemini-3.5-flash-low');
+  assert.ok(snapshot.overheadTokens > 2_400);
   assert.ok(after > before);
   resetTokenEstimatorForTests();
 });
@@ -87,10 +103,10 @@ test('four-role orchestration reserves enough structured output budget to avoid 
   assert.equal(decision.useWorker, true);
   assert.equal(decision.useVerifier, true);
   assert.equal(decision.useBoss, true);
-  assert.ok(budget.totalTokens >= 12_000);
+  assert.ok(budget.totalTokens >= 18_000);
   assert.ok(budget.worker.outputTokens >= 1_600);
-  assert.ok(budget.verifier.outputTokens >= 1_200);
-  assert.equal(budget.boss.outputTokens, 500);
+  assert.ok(budget.verifier.outputTokens >= 2_200);
+  assert.ok(budget.boss.outputTokens >= 900);
 });
 
 test('context compiler reduces raw context and emits role-specific packets', () => {

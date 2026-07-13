@@ -34,7 +34,7 @@ export type TokenBudgetPlan = z.infer<typeof TokenBudgetPlanSchema>;
 
 export type TokenUsageByRole = Record<RuntimeRole, { input: number; output: number; calls: number }>;
 
-type EstimatorState = { scale: number; samples: number; meanAbsoluteError: number };
+type EstimatorState = { scale: number; overheadTokens: number; samples: number; meanAbsoluteError: number };
 const DEFAULT_ESTIMATOR_KEY = 'default';
 const estimatorStates = new Map<string, EstimatorState>();
 let estimatorsLoaded = false;
@@ -42,6 +42,7 @@ let estimatorsLoaded = false;
 function defaultEstimator(): EstimatorState {
   return {
     scale: Math.max(0.65, Math.min(1.8, Number(process.env.ZENOS_TOKEN_ESTIMATOR_SCALE || '1'))),
+    overheadTokens: 0,
     samples: 0,
     meanAbsoluteError: 0,
   };
@@ -51,12 +52,13 @@ function loadEstimators(): void {
   if (estimatorsLoaded) return;
   estimatorsLoaded = true;
   try {
-    const raw = getRuntimeStore().getMetaValue('token_estimator_v2');
+    const raw = getRuntimeStore().getMetaValue('token_estimator_v3');
     const parsed = raw ? JSON.parse(raw) as Record<string, EstimatorState> : {};
     for (const [model, state] of Object.entries(parsed)) {
       if (!state || !Number.isFinite(state.scale) || !Number.isFinite(state.samples)) continue;
       estimatorStates.set(model, {
         scale: Math.max(0.65, Math.min(1.8, state.scale)),
+        overheadTokens: Math.max(0, Math.min(8_000, Number(state.overheadTokens || 0))),
         samples: Math.max(0, Math.round(state.samples)),
         meanAbsoluteError: Math.max(0, Number(state.meanAbsoluteError || 0)),
       });
@@ -71,13 +73,20 @@ function estimatorFor(model = DEFAULT_ESTIMATOR_KEY): EstimatorState {
   const key = model.trim() || DEFAULT_ESTIMATOR_KEY;
   const current = estimatorStates.get(key);
   if (current) return current;
-  const created = defaultEstimator();
+  const created = {
+    ...defaultEstimator(),
+    overheadTokens: /(?:^|\/)gemini(?:-|$)/i.test(model)
+      ? Math.max(0, Math.min(8_000, Number(process.env.ZENOS_GEMINI_INPUT_OVERHEAD_TOKENS || '2400')))
+      : /^(?:grok|build|codex)(?:$|[-/])/i.test(model)
+        ? Math.max(0, Math.min(8_000, Number(process.env.ZENOS_MODEL_INPUT_OVERHEAD_TOKENS || '2000')))
+        : 0,
+  };
   estimatorStates.set(key, created);
   return created;
 }
 
 function persistEstimators(): void {
-  getRuntimeStore().setMetaValue('token_estimator_v2', JSON.stringify(Object.fromEntries(estimatorStates)));
+  getRuntimeStore().setMetaValue('token_estimator_v3', JSON.stringify(Object.fromEntries(estimatorStates)));
 }
 
 function baseTokenEstimate(text: string): number {
@@ -92,6 +101,14 @@ export function estimateTokenCount(text: string, model = DEFAULT_ESTIMATOR_KEY):
   return base ? Math.max(1, Math.ceil(base * estimatorFor(model).scale)) : 0;
 }
 
+// Provider and router usage includes hidden transport/system framing that is not
+// present in the visible prompt. Keep that fixed cost out of text truncation,
+// but include it when authorizing a real model call.
+export function estimateModelInputTokens(text: string, model: string): number {
+  const visible = estimateTokenCount(text, model);
+  return visible ? Math.max(1, Math.ceil(visible + estimatorFor(model).overheadTokens)) : 0;
+}
+
 export function recordTokenEstimateCalibration(estimatedTokens: number, actualTokens: number, model = DEFAULT_ESTIMATOR_KEY): void {
   const state = estimatorFor(model);
   const estimated = Math.max(0, estimatedTokens);
@@ -100,11 +117,17 @@ export function recordTokenEstimateCalibration(estimatedTokens: number, actualTo
   const ratio = Math.max(0.5, Math.min(2, actual / estimated));
   const alpha = state.samples < 8 ? 0.16 : 0.06;
   state.scale = Math.max(0.65, Math.min(1.8, state.scale * (1 - alpha + alpha * ratio)));
+  const overheadAlpha = state.samples < 4 ? 0.35 : 0.12;
+  state.overheadTokens = Math.max(
+    0,
+    Math.min(8_000, state.overheadTokens + (actual - estimated) * overheadAlpha),
+  );
   const absoluteError = Math.abs(actual - estimated) / actual;
   state.samples += 1;
   state.meanAbsoluteError += (absoluteError - state.meanAbsoluteError) / state.samples;
   persistEstimators();
   setGauge('runtime_token_estimator_scale', state.scale, { model });
+  setGauge('runtime_token_estimator_overhead_tokens', state.overheadTokens, { model });
   setGauge('runtime_token_estimator_mean_absolute_error', state.meanAbsoluteError, { model });
   incrementMetric('runtime_token_estimator_samples_total', { model });
 }
@@ -116,7 +139,7 @@ export function tokenEstimatorSnapshot(model = DEFAULT_ESTIMATOR_KEY): Estimator
 export function resetTokenEstimatorForTests(): void {
   estimatorsLoaded = true;
   estimatorStates.clear();
-  estimatorStates.set(DEFAULT_ESTIMATOR_KEY, { scale: 1, samples: 0, meanAbsoluteError: 0 });
+  estimatorStates.set(DEFAULT_ESTIMATOR_KEY, { scale: 1, overheadTokens: 0, samples: 0, meanAbsoluteError: 0 });
 }
 
 function riskMultiplier(risk: z.infer<typeof RiskLevelSchema>): number {
@@ -168,7 +191,7 @@ export function createTokenBudgetPlan(
   const retryPressure = 1 + Math.min(Math.max(options.priorFailures || 0, 0), 3) * 0.08;
   const highAssurance = decision.risk === 'high' || decision.risk === 'critical';
   const orchestrationFloor = decision.useWorker && decision.useVerifier && decision.useBoss
-    ? highAssurance ? 12_000 : 10_500
+    ? highAssurance ? 18_000 : 15_000
     : decision.useWorker && decision.useVerifier
       ? highAssurance ? 9_000 : 8_000
       : decision.useBoss
@@ -199,10 +222,11 @@ export function createTokenBudgetPlan(
     inputCap: number,
     outputCap: number,
     outputFloor = 64,
+    inputFloor = 128,
   ): RoleTokenBudget => {
     const allocation = totalTokens * share;
     return RoleTokenBudgetSchema.parse({
-      inputTokens: bounded(allocation * (1 - outputRatio), 128, inputCap),
+      inputTokens: bounded(allocation * (1 - outputRatio), inputFloor, inputCap),
       outputTokens: bounded(allocation * outputRatio, outputFloor, outputCap),
       maxCalls,
       maxRetries,
@@ -231,8 +255,8 @@ export function createTokenBudgetPlan(
       decision.useWorker ? 1_600 : 64,
     ),
     host: roleBudget(hostShare, 0.35, 1 + Math.min(1, decision.maxRevisionAttempts), 0, 120_000, 10_000, 3_200, 1_600),
-    verifier: roleBudget(verifierShare, 0.35, decision.useVerifier ? 1 + Math.min(1, decision.maxRevisionAttempts) : 0, 0, 90_000, 5_000, 1_400, decision.useVerifier ? 1_200 : 64),
-    boss: roleBudget(bossShare, 0.3, bossEnabled ? 1 : 0, 0, 120_000, 1_500, 500, bossEnabled ? 500 : 64),
+    verifier: roleBudget(verifierShare, 0.45, decision.useVerifier ? 1 + Math.min(1, decision.maxRevisionAttempts) : 0, 0, 90_000, 5_000, 2_600, decision.useVerifier ? 2_200 : 64),
+    boss: roleBudget(bossShare, 0.45, bossEnabled ? 1 : 0, 0, 120_000, 2_500, 1_400, bossEnabled ? 900 : 64, bossEnabled ? 1_500 : 128),
     reserveTokens: bounded(totalTokens * reserveShare, 0, 12_000),
     reasons: [
       `task:${decision.taskType}`,

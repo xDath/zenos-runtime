@@ -57,7 +57,7 @@ import { createDefaultSkillRegistry } from './skill-registry';
 import {
   buildDeltaRevisionContext,
   createTokenBudgetPlan,
-  estimateTokenCount,
+  estimateModelInputTokens,
   recordTokenEstimateCalibration,
   roleBudget,
   TokenBudgetPlan,
@@ -655,7 +655,7 @@ export async function callRuntimeModel(
     content: truncateToTokenBudget(message.content, perMessageBudget),
   }));
   const prompt = boundedMessages.map((message) => `${message.role}: ${message.content}`).join('\n');
-  const inputEstimate = estimateTokenCount(prompt, config.model);
+  const inputEstimate = estimateModelInputTokens(prompt, config.model);
   const requestId = options.requestId || crypto.randomUUID();
   const requestedOutputTokens = Math.min(
     Math.max(options.maxTokens || (role === 'host' ? 2_400 : 1_400), 64),
@@ -1749,6 +1749,8 @@ export async function runZenosPipeline(request: RuntimeRunRequest): Promise<Runt
         sessionId,
         modelOverrides: input.modelOverrides,
         requestId: `${runId}:boss`,
+        maxInputTokens: budgetPlan.boss.inputTokens,
+        maxOutputTokens: budgetPlan.boss.outputTokens,
         tokenBudgetPlan: budgetPlan,
         mandatory: input.userRequestedBoss || decision.requiresApproval,
       });
