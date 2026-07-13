@@ -1,6 +1,6 @@
 import { z } from 'zod';
 
-export const RUNTIME_POLICY_VERSION = '2026.07.12-v3-host-led';
+export const RUNTIME_POLICY_VERSION = '2026.07.13-v4-personal-economy';
 
 export const TaskTypeSchema = z.enum([
   'simple_chat',
@@ -199,11 +199,11 @@ const EVAL_PATTERN = /\b(eval(?:uation)?|benchmark|regression|pass rate|quality 
 const SUMMARY_PATTERN = /\b(summar(?:y|ize)|ringkas|rangkum|extract|condense|compress|kompres)\b/i;
 const MEMORY_PATTERN = /\b(remember|memory|recall|bootstrap|compact|previous|sebelumnya|tadi|dulu|keputusan sebelumnya|roadmap kemarin)\b/i;
 const ARCH_PATTERN = /\b(architecture|arsitektur|roadmap|design|desain|strategy|strategi|rfc|spec(?:ification)?|rancang|rencana|planning|plan)\b/i;
-const DEBUG_PATTERN = /\b(debug|error|exception|stack trace|traceback|crash|gagal|nggak jalan|tidak jalan|bug)\b/i;
-const CODE_PATTERN = /\b(patch|implement|refactor|typescript|javascript|python|repository|repo|source code|function|class|module|lint|unit test|integration test)\b/i;
+const DEBUG_PATTERN = /\b(debug|error|exception|stack trace|traceback|crash|gagal|nggak jalan|tidak jalan|bug|race condition|deadlock|memory leak|segfault|panic)\b/i;
+const CODE_PATTERN = /\b(patch|implement|implementation|refactor|typescript|javascript|python|golang|go code|rust|java|kotlin|php|repository|repo|source(?: code)?|kode|coding|ngoding|function|fungsi|class|module|package|lint|unit test|integration test|test terkait|api|endpoint|route|handler|controller|service|schema|database|migration|migrasi|table|kolom|column|query|sql|frontend|backend|component|hook|build|compile)\b/i;
 const DESTRUCTIVE_PATTERN = /\b(rm\s+-rf|drop\s+(?:table|database)|truncate\s+table|reset\s+--hard|force\s+push|git\s+push\s+--force|wipe|destroy|hapus\s+semua|delete\s+all|format\s+disk)\b/i;
 const DEPLOY_ACTION_PATTERN = /(?:\b(deploy|release|rollback|publish|push)\b.{0,30}\b(prod|production|sekarang|now|live)\b)|(?:\b(prod|production|live)\b.{0,30}\b(deploy|release|rollback|publish|push)\b)/i;
-const MUTATION_PATTERN = /\b(edit|ubah|change|fix|perbaiki|buat|create|delete|hapus|deploy|release|restart|install|update|upgrade|migrate)\b/i;
+const MUTATION_PATTERN = /\b(edit|ubah|change|fix|perbaiki|benerin|betulin|buat|bikin|tambahkan?|tambah|create|generate|delete|hapus|implement(?:asi)?|refactor|deploy|release|restart|install|update|upgrade|migrate|migrasi|replace|ganti)\b/i;
 
 function sizeBucket(tokens: number): RouteEvent['inputSizeBucket'] {
   if (tokens < 1_500) return 'small';
@@ -302,13 +302,23 @@ export function choosePipeline(input: RuntimeContext): RouteDecision {
     reasons.push('source-grounded inspection is required');
   }
 
-  if (taskType === 'summarization' || largeContext || ((taskType === 'coding_change' || taskType === 'debugging') && (context.hasFiles || mediumContext))) {
+  const summaryNeedsWorker = taskType === 'summarization' && context.estimatedContextTokens >= 4_000;
+  if (
+    summaryNeedsWorker
+    || largeContext
+    || (
+      (taskType === 'coding_change' || taskType === 'debugging')
+      && (context.hasFiles || mediumContext || context.intent === 'mutate' || context.intent === 'execute')
+    )
+  ) {
     useWorker = true;
     workerTier = taskType === 'coding_change' || taskType === 'debugging' ? 'standard' : 'cheap';
-    maxWorkerCalls = largeContext ? 3 : 1;
+    maxWorkerCalls = largeContext ? 2 : 1;
     pipelineMode = 'worker_compression_path';
     maxContextTokens = largeContext ? 16_000 : 12_000;
     reasons.push('bounded worker passes reduce host context grinding');
+  } else if (taskType === 'summarization') {
+    reasons.push('small summary stays with Host to avoid an extra model call');
   }
 
   if (taskType === 'eval_or_benchmark') {
@@ -322,10 +332,18 @@ export function choosePipeline(input: RuntimeContext): RouteDecision {
   }
 
   if (risk === 'medium') {
-    useVerifier = taskType !== 'planning_or_architecture' || context.userRequestedVerification;
+    const mediumNeedsVerifier = [
+      'coding_change',
+      'debugging',
+      'eval_or_benchmark',
+      'security_or_secret',
+      'deploy_or_destructive_action',
+    ].includes(taskType);
+    useVerifier = mediumNeedsVerifier || context.userRequestedVerification;
     verifierTier = useVerifier ? 'cheap' : 'none';
     maxRevisionAttempts = useVerifier ? 1 : 0;
     if (useVerifier && pipelineMode === 'direct_fast_path') pipelineMode = 'verified_path';
+    if (!useVerifier) reasons.push('medium general reasoning remains Host-owned without an extra verifier call');
   }
 
   if (risk === 'high' || risk === 'critical' || lowConfidence) {
@@ -336,7 +354,7 @@ export function choosePipeline(input: RuntimeContext): RouteDecision {
     requiresApproval = risk === 'critical';
     pipelineMode = useBoss ? 'escalated_deep_path' : 'verified_path';
     hostTier = 'premium';
-    maxRevisionAttempts = 2;
+    maxRevisionAttempts = 1;
     reasons.push(lowConfidence ? 'low confidence permits Boss escalation' : 'risk requires verifier and escalation policy');
   }
 
@@ -434,7 +452,12 @@ export const defaultRuntimeEvalCases: RuntimeEvalCase[] = [
   { name: 'user verification enables verifier', input: { request: 'jawab ini', userRequestedVerification: true }, expect: { useVerifier: true } },
   { name: 'fresh data requires tools', input: { request: 'cek informasi terbaru', requiresFreshData: true }, expect: { useTools: true } },
   { name: 'untrusted code input raises risk', input: { request: 'review source code ini', hasFiles: true, containsUntrustedInput: true }, expect: { risk: 'high', useVerifier: true } },
-  { name: 'small summary still uses worker', input: { request: 'summarize catatan ini', estimatedContextTokens: 500 }, expect: { taskType: 'summarization', useWorker: true } },
+  { name: 'small summary stays with Host', input: { request: 'summarize catatan ini', estimatedContextTokens: 500 }, expect: { taskType: 'summarization', useWorker: false } },
+  { name: 'natural Indonesian endpoint creation is coding', input: { request: 'tolong bikin endpoint login baru di project ini', intent: 'mutate' }, expect: { taskType: 'coding_change', useTools: true, useWorker: true } },
+  { name: 'Go race condition repair is debugging', input: { request: 'cek source Go ini dan perbaiki race condition', intent: 'mutate' }, expect: { taskType: 'debugging', useTools: true, useWorker: true } },
+  { name: 'database migration creation is coding', input: { request: 'buat database migration untuk kolom user_id', intent: 'mutate' }, expect: { taskType: 'coding_change', useTools: true } },
+  { name: 'editing prose is not coding', input: { request: 'hapus kalimat terakhir dari jawaban ini', intent: 'mutate' }, expect: { taskType: 'simple_chat', useTools: false } },
+  { name: 'future deploy reminder is not execution', input: { request: 'ingatkan aku deploy production besok', intent: 'analyze' }, expect: { taskType: 'simple_chat', requiresApproval: false } },
 ];
 
 export function estimateRouteTokens(decision: RouteDecision, input: RuntimeContext): {

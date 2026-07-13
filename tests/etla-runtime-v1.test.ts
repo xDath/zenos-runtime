@@ -40,7 +40,7 @@ test('four-role orchestration reserves enough structured output budget to avoid 
   assert.equal(decision.useWorker, true);
   assert.equal(decision.useVerifier, true);
   assert.equal(decision.useBoss, true);
-  assert.ok(budget.totalTokens >= 12_000);
+  assert.ok(budget.totalTokens >= 9_000);
   assert.ok(budget.worker.outputTokens >= 1_600);
   assert.ok(budget.verifier.outputTokens >= 1_200);
   assert.equal(budget.boss.outputTokens, 500);

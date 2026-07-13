@@ -63,6 +63,7 @@ import {
   truncateToTokenBudget,
 } from './token-economy';
 import { createLatencyBudgetPlan, LatencyObservation, observeLatency } from './latency-budget';
+import { authorizeTokenSpend, settleTokenSpend } from './token-governor';
 import { recordOutcomePassport } from './outcome-ledger';
 
 export const RuntimeRunRequestSchema = RuntimeContextSchema.extend({
@@ -74,11 +75,11 @@ export const RuntimeRunRequestSchema = RuntimeContextSchema.extend({
   namespace: z.string().trim().min(1).max(120).optional().default('zenos'),
   autoRecallMemory: z.boolean().optional().default(true),
   persistRouteEvent: z.boolean().optional().default(false),
-  tokenPriority: z.enum(['economy', 'balanced', 'quality']).optional().default('balanced'),
+  tokenPriority: z.enum(['economy', 'balanced', 'quality']).optional().default('economy'),
   approvalGranted: z.boolean().optional().default(false),
   dryRun: z.boolean().optional().default(false),
   modelOverrides: RuntimeModelSlotsSchema.optional().default({}),
-  maxRevisionAttempts: z.number().int().min(0).max(3).optional(),
+  maxRevisionAttempts: z.number().int().min(0).max(1).optional(),
   workspaceRoot: z.string().trim().min(1).max(4_096).optional(),
   enableRepositoryIntelligence: z.boolean().optional().default(true),
   codingTaskId: z.string().trim().min(1).max(220).optional(),
@@ -641,6 +642,8 @@ export async function callRuntimeModel(
     modelOverrides?: RuntimeModelSlots;
     requestId?: string;
     trigger?: string;
+    tokenBudgetPlan?: TokenBudgetPlan;
+    mandatory?: boolean;
   } = {},
 ): Promise<RuntimeModelResult> {
   const config = resolveRoleConfig(role, options.sessionId, options.modelOverrides || {});
@@ -653,6 +656,10 @@ export async function callRuntimeModel(
   const prompt = boundedMessages.map((message) => `${message.role}: ${message.content}`).join('\n');
   const inputEstimate = estimateTokenCount(prompt);
   const requestId = options.requestId || crypto.randomUUID();
+  const requestedOutputTokens = Math.min(
+    Math.max(options.maxTokens || (role === 'host' ? 2_400 : 1_400), 64),
+    16_000,
+  );
   const started = Date.now();
   const emptyUsage: RuntimeModelUsage = {
     inputTokens: inputEstimate,
@@ -663,6 +670,33 @@ export async function callRuntimeModel(
     totalTokens: inputEstimate,
     estimated: true,
   };
+  let governorAuthorized = false;
+  if (options.tokenBudgetPlan) {
+    const authorization = authorizeTokenSpend({
+      plan: options.tokenBudgetPlan,
+      requestId,
+      role,
+      estimatedTokens: inputEstimate + requestedOutputTokens,
+      mandatory: options.mandatory,
+    });
+    if (!authorization.allowed) {
+      incrementMetric('model_calls_total', { role, model: config.model, status: 'budget_denied' });
+      return {
+        ok: false,
+        role,
+        model: config.model,
+        provider: config.provider,
+        usage: { ...emptyUsage, inputTokens: 0, totalTokens: 0 },
+        inputTokensEstimate: inputEstimate,
+        outputTokensEstimate: 0,
+        latencyMs: 0,
+        attempts: 0,
+        requestId,
+        error: authorization.reason || 'Global token budget denied the model call',
+      };
+    }
+    governorAuthorized = true;
+  }
   recordModelCallLifecycle({
     sessionId: options.sessionId,
     requestId,
@@ -675,6 +709,15 @@ export async function callRuntimeModel(
     trigger: options.trigger,
   });
   const finalize = (result: RuntimeModelResult): RuntimeModelResult => {
+    if (options.tokenBudgetPlan && governorAuthorized) {
+      settleTokenSpend({
+        plan: options.tokenBudgetPlan,
+        requestId,
+        role,
+        actualTokens: result.usage.totalTokens || (result.attempts > 0 ? inputEstimate : 0),
+        attempted: result.attempts > 0,
+      });
+    }
     recordModelCallLifecycle({
       sessionId: options.sessionId,
       requestId,
@@ -730,12 +773,12 @@ export async function callRuntimeModel(
     ].filter(Boolean).join('\n\n');
     return finalize(await callHermesCliTransport(config, cliPrompt, {
       timeoutMs: options.timeoutMs,
-      retries: options.retries,
+      retries: options.retries ?? 0,
       requestId,
     }));
   }
 
-  const maxAttempts = Math.min(Math.max((options.retries ?? 2) + 1, 1), 4);
+  const maxAttempts = Math.min(Math.max((options.retries ?? 0) + 1, 1), 2);
   let lastError = 'Unknown model error';
   let useJsonFormat = Boolean(options.json);
 
@@ -757,7 +800,7 @@ export async function callRuntimeModel(
           model: config.model,
           messages: boundedMessages,
           temperature: options.temperature ?? (role === 'host' ? 0.2 : role === 'boss' ? 0.1 : 0.05),
-          max_tokens: Math.min(Math.max(options.maxTokens || (role === 'host' ? 2_400 : 1_400), 64), 16_000),
+          max_tokens: requestedOutputTokens,
           stream: false,
           ...(useJsonFormat ? { response_format: { type: 'json_object' } } : {}),
         }),
@@ -844,7 +887,17 @@ export async function callRuntimeModel(
 
 export async function runBossReviewModel(
   packet: unknown,
-  options: { sessionId?: string; modelOverrides?: RuntimeModelSlots; requestId?: string; maxInputTokens?: number; maxOutputTokens?: number; timeoutMs?: number; trigger?: string } = {},
+  options: {
+    sessionId?: string;
+    modelOverrides?: RuntimeModelSlots;
+    requestId?: string;
+    maxInputTokens?: number;
+    maxOutputTokens?: number;
+    timeoutMs?: number;
+    trigger?: string;
+    tokenBudgetPlan?: TokenBudgetPlan;
+    mandatory?: boolean;
+  } = {},
 ): Promise<RuntimeModelResult> {
   return callRuntimeModel('boss', [
     {
@@ -893,6 +946,7 @@ Return ONLY JSON matching:
     modelOverrides: input.modelOverrides,
     requestId: options.requestId,
     trigger: 'host_delegation',
+    tokenBudgetPlan: options.budget,
   });
   if (!call.ok || !call.parsed) return { call };
   try {
@@ -933,6 +987,8 @@ ${sourceWarning}`,
     sessionId: input.sessionId,
     modelOverrides: input.modelOverrides,
     requestId: options.requestId,
+    tokenBudgetPlan: options.budget,
+    mandatory: true,
   });
 }
 
@@ -968,6 +1024,7 @@ Apply every required change that is supported. Remove unsupported claims. Do not
     sessionId: input.sessionId,
     modelOverrides: input.modelOverrides,
     requestId: options.requestId,
+    tokenBudgetPlan: options.budget,
   });
 }
 
@@ -975,7 +1032,7 @@ export async function runVerifier(
   input: z.infer<typeof RuntimeRunRequestSchema>,
   draft: string,
   workerResult?: WorkerResult,
-  options: { requestId?: string; packet?: RuntimeWorkPacket; budget?: TokenBudgetPlan } = {},
+  options: { requestId?: string; packet?: RuntimeWorkPacket; budget?: TokenBudgetPlan; mandatory?: boolean } = {},
 ): Promise<{ result?: VerifierResult; call: RuntimeModelResult }> {
   const budget = options.budget ? roleBudget(options.budget, 'verifier') : undefined;
   const verificationContext = options.packet ? renderRolePacket(options.packet) : compactSourceContext(input).slice(0, 8_000);
@@ -998,6 +1055,8 @@ Return ONLY JSON:
     sessionId: input.sessionId,
     modelOverrides: input.modelOverrides,
     requestId: options.requestId,
+    tokenBudgetPlan: options.budget,
+    mandatory: options.mandatory,
   });
   if (!call.ok || !call.parsed) return { call };
   try {
@@ -1352,7 +1411,10 @@ export async function runZenosPipeline(request: RuntimeRunRequest): Promise<Runt
   const started = Date.now();
   const runId = `run_${crypto.randomUUID()}`;
   const decision = choosePipeline(input);
-  const budgetPlan = createTokenBudgetPlan(decision, input, { userPriority: input.tokenPriority });
+  const budgetPlan = createTokenBudgetPlan(decision, input, {
+    userPriority: input.tokenPriority,
+    budgetId: runId,
+  });
   const contextPackets: Partial<Record<RuntimeModelRole, RuntimeWorkPacket>> = {};
   const modelCalls: RuntimeModelResult[] = [];
   const warnings: string[] = [];
@@ -1527,10 +1589,9 @@ export async function runZenosPipeline(request: RuntimeRunRequest): Promise<Runt
           decision,
           targetRole: 'worker',
           tokenBudget: budgetPlan.worker.inputTokens,
-          memoryContext: input.memoryContext,
+          // chunk is already produced from compactSourceContext(input), so do
+          // not serialize memory/tool/session context a second time.
           sourceContext: chunk,
-          toolContext: input.toolContext,
-          sessionContext: input.context,
           selectedProcedure,
         });
         if (index === 0) contextPackets.worker = packet;
@@ -1574,7 +1635,6 @@ export async function runZenosPipeline(request: RuntimeRunRequest): Promise<Runt
       memoryContext: input.memoryContext,
       sourceContext: input.context,
       toolContext: input.toolContext,
-      sessionContext: input.context,
       workerResult,
       selectedProcedure,
     });
@@ -1593,7 +1653,7 @@ export async function runZenosPipeline(request: RuntimeRunRequest): Promise<Runt
     let draft = host.content;
     hostDrafts.push(draft);
 
-    const maxRevisions = Math.min(3, Math.max(
+    const maxRevisions = Math.min(1, Math.max(
       decision.maxRevisionAttempts,
       input.maxRevisionAttempts ?? decision.maxRevisionAttempts,
     ));
@@ -1608,7 +1668,6 @@ export async function runZenosPipeline(request: RuntimeRunRequest): Promise<Runt
           memoryContext: input.memoryContext,
           sourceContext: input.context,
           toolContext: input.toolContext,
-          sessionContext: input.context,
           workerResult,
           validationResults: [`Draft revision attempt ${attempt + 1}`],
           selectedProcedure,
@@ -1634,7 +1693,10 @@ export async function runZenosPipeline(request: RuntimeRunRequest): Promise<Runt
         if (verifier.result.verdict === 'escalate') break;
         if (verifier.result.verdict === 'revise' && attempt < maxRevisions) {
           const fixes = verifier.result.issues.map((issue) => issue.requiredFix || issue.issue);
-          const revision = await runHostRevision(input, draft, fixes, workerResult, { requestId: `${runId}:host-revision:${attempt + 1}` });
+          const revision = await runHostRevision(input, draft, fixes, workerResult, {
+            requestId: `${runId}:host-revision:${attempt + 1}`,
+            budget: budgetPlan,
+          });
           modelCalls.push(revision);
           if (!revision.ok || !revision.content) {
             throw new Error(`Host revision failed: ${revision.error || 'no revised content'}`);
@@ -1664,7 +1726,13 @@ export async function runZenosPipeline(request: RuntimeRunRequest): Promise<Runt
           verifierIssues: verifierResult?.issues || [],
         })
         : createEscalationPacketWithoutSession(input, runId, draft, workerResult, verifierResult, decision);
-      const boss = await runBossReviewModel(packet, { sessionId, modelOverrides: input.modelOverrides, requestId: `${runId}:boss` });
+      const boss = await runBossReviewModel(packet, {
+        sessionId,
+        modelOverrides: input.modelOverrides,
+        requestId: `${runId}:boss`,
+        tokenBudgetPlan: budgetPlan,
+        mandatory: input.userRequestedBoss || decision.requiresApproval,
+      });
       modelCalls.push(boss);
       if (!boss.ok || !boss.parsed) {
         throw new Error(boss.error || 'Boss review failed for an escalated route');
@@ -1764,7 +1832,13 @@ export async function runZenosPipeline(request: RuntimeRunRequest): Promise<Runt
               workerResult = mergeWorkerResults(workerResults, input.request);
             }
           }
-          const revision = await runHostRevision(input, draft, bossDecision.requiredChanges.length ? bossDecision.requiredChanges : [bossDecision.reasoningSummary], workerResult, { requestId: `${runId}:host-boss-revision` });
+          const revision = await runHostRevision(
+            input,
+            draft,
+            bossDecision.requiredChanges.length ? bossDecision.requiredChanges : [bossDecision.reasoningSummary],
+            workerResult,
+            { requestId: `${runId}:host-boss-revision`, budget: budgetPlan },
+          );
           modelCalls.push(revision);
           if (!revision.ok || !revision.content) throw new Error(revision.error || 'Boss-requested revision failed');
           draft = revision.content;

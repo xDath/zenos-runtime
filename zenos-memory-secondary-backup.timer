@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily encrypted secondary backup for Zenos Memory
+
+[Timer]
+OnCalendar=*-*-* 03:20:00
+Persistent=true
+RandomizedDelaySec=900
+Unit=zenos-memory-secondary-backup.service
+
+[Install]
+WantedBy=timers.target

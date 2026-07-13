@@ -176,16 +176,23 @@ test('native gateway worker path calls the configured Worker and injects its bou
   }
 });
 
-test('clear coding work uses deterministic Host orchestration without spending a separate planner call', async () => {
+test('clear coding work keeps Host as orchestrator before bounded Worker delegation', async () => {
   const originalFetch = globalThis.fetch;
   const calledModels: string[] = [];
   globalThis.fetch = async (_input: string | URL | Request, init?: RequestInit) => {
     const body = JSON.parse(String(init?.body || '{}')) as { model: string };
     calledModels.push(body.model);
+    if (body.model === 'runtime-host') {
+      return modelResponse(hostPlan({
+        useWorker: true,
+        workerTask: 'Inspect the bounded parser change and return evidence only.',
+        rationale: 'Host delegates repository inspection while retaining the final decision.',
+      }));
+    }
     if (body.model !== 'runtime-worker') throw new Error(`Unexpected model ${body.model}`);
     return modelResponse({
       task: 'inspect and bound the requested code change',
-      summary: ['The deterministic route delegated source inspection while Host remains final.'],
+      summary: ['Host delegated source inspection while retaining final orchestration.'],
       findings: [{ claim: 'The change is scoped to one implementation path.', evidence: ['repository-context'], confidence: 0.9, risk: 'medium' }],
       contradictions: [],
       unknowns: [],
@@ -212,8 +219,8 @@ test('clear coding work uses deterministic Host orchestration without spending a
 
     assert.equal(preflight.decision.taskType, 'coding_change');
     assert.equal(preflight.decision.useWorker, true);
-    assert.equal(preflight.receipt.host.plannerInvoked, false);
-    assert.deepEqual(calledModels, ['runtime-worker']);
+    assert.equal(preflight.receipt.host.plannerInvoked, true);
+    assert.deepEqual(calledModels, ['runtime-host', 'runtime-worker']);
   } finally {
     globalThis.fetch = originalFetch;
   }

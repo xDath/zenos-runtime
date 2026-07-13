@@ -1,3 +1,4 @@
+import path from 'node:path';
 import { evaluateExecutionBoundary } from './execution-boundary';
 import { GatewayMemoryBrief, GatewayTurnPreflightRequest } from './gateway-contracts';
 import { LatencyBudgetPlan, LatencyObservation, observeLatency } from './latency-budget';
@@ -30,13 +31,25 @@ export async function repositoryContextFor(
   }
 }
 
+function memoryTokenBudget(decision: RouteDecision): number {
+  if (decision.taskType === 'memory_question') return 1_800;
+  if (['coding_change', 'debugging', 'repo_question'].includes(decision.taskType)) return 1_000;
+  if (['planning_or_architecture', 'security_or_secret', 'deploy_or_destructive_action'].includes(decision.taskType)) return 1_400;
+  return 500;
+}
+
 export async function gatewayMemoryContextFor(
   request: GatewayTurnPreflightRequest,
   decision: RouteDecision,
   existingSession: boolean,
 ): Promise<GatewayMemoryBrief> {
   const namespace = process.env.ZENOS_MEMORY_NAMESPACE || 'zenos';
-  const softLimit = Math.max(40_000, Number(process.env.ZENOS_HOST_CONTEXT_SOFT_LIMIT_TOKENS || 160_000));
+  const softLimit = Math.max(24_000, Number(process.env.ZENOS_HOST_CONTEXT_SOFT_LIMIT_TOKENS || 64_000));
+  const contextBudget = memoryTokenBudget(decision);
+  const projectName = request.workspaceRoot ? path.basename(request.workspaceRoot) : '';
+  const memoryQuery = projectName
+    ? `Active project ${projectName}. ${request.request}`
+    : request.request;
   const underPressure = request.estimatedContextTokens >= softLimit;
   const hasHandoffSource = request.handoffMessages.length >= 4;
 
@@ -47,15 +60,15 @@ export async function gatewayMemoryContextFor(
       sessionId: request.sessionId,
       conversationId: request.turnId,
       approxTokens: request.estimatedContextTokens,
-      maxChars: 10_000,
-      inputMaxChars: 240_000,
+      maxChars: 8_000,
+      inputMaxChars: 120_000,
       reason: 'hermes-host-working-set-pressure',
     });
     if (compact.ok && compact.value?.context) {
       let context = compact.value.context;
       if (decision.taskType === 'memory_question') {
         const recalled = await recallMemoryContext({
-          query: request.request,
+          query: memoryQuery,
           namespace,
           limit: Math.max(4, decision.maxMemoryItems),
           maxChars: 5_000,
@@ -63,7 +76,7 @@ export async function gatewayMemoryContextFor(
         if (recalled.ok && recalled.value) context = `${context}\n\n${recalled.value}`;
       }
       return {
-        context: truncateToTokenBudget(context, 4_000, '\n[MEMORY BRIEF TRUNCATED]'),
+        context: truncateToTokenBudget(context, contextBudget, '\n[MEMORY BRIEF TRUNCATED]'),
         source: 'handoff',
         coverage: compact.value.coverage,
         degraded: compact.degraded,
@@ -78,13 +91,13 @@ export async function gatewayMemoryContextFor(
   if (!existingSession) {
     const bootstrap = await bootstrapMemoryContext({
       namespace,
-      queries: [request.request, 'current active project goal decisions blockers pending work'],
-      limit: Math.max(8, decision.maxMemoryItems),
-      maxChars: 6_000,
+      queries: [memoryQuery],
+      limit: Math.max(4, decision.maxMemoryItems),
+      maxChars: Math.ceil(contextBudget * 3.4),
     });
     if (bootstrap.ok && bootstrap.value) {
       return {
-        context: bootstrap.value,
+        context: truncateToTokenBudget(bootstrap.value, contextBudget, '\n[MEMORY BOOTSTRAP TRUNCATED]'),
         source: 'bootstrap',
         degraded: bootstrap.degraded,
         cacheHit: bootstrap.cacheHit,
@@ -94,14 +107,14 @@ export async function gatewayMemoryContextFor(
   }
 
   const recalled = await recallMemoryContext({
-    query: request.request,
+    query: memoryQuery,
     namespace,
     limit: Math.max(1, decision.maxMemoryItems),
-    maxChars: 8_000,
+    maxChars: Math.ceil(contextBudget * 3.4),
   });
   if (recalled.ok && recalled.value) {
     return {
-      context: recalled.value,
+      context: truncateToTokenBudget(recalled.value, contextBudget, '\n[MEMORY RECALL TRUNCATED]'),
       source: 'recall',
       degraded: recalled.degraded,
       cacheHit: recalled.cacheHit,

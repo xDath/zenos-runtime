@@ -40,6 +40,7 @@ export const RuntimeWorkPacketSchema = z.object({
 
 export type EvidenceItem = z.infer<typeof EvidenceItemSchema>;
 export type RuntimeWorkPacket = z.infer<typeof RuntimeWorkPacketSchema>;
+type RuntimeWorkPacketBase = Omit<RuntimeWorkPacket, 'contextReduction'>;
 
 export type ContextCompilerInput = {
   request: string;
@@ -81,6 +82,20 @@ function unique(items: string[], max: number): string[] {
     seen.add(key);
     result.push(item);
     if (result.length >= max) break;
+  }
+  return result;
+}
+
+function distinctTextParts(parts: Array<string | undefined>): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const raw of parts) {
+    const value = String(raw || '').trim();
+    if (!value) continue;
+    const key = crypto.createHash('sha256').update(value).digest('hex');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(value);
   }
   return result;
 }
@@ -194,10 +209,94 @@ function workerEvidence(result?: WorkerResult): EvidenceItem[] {
   }));
 }
 
+function compactEvidence(item: EvidenceItem, maxClaimTokens = 220): EvidenceItem {
+  return EvidenceItemSchema.parse({
+    ...item,
+    claim: truncateToTokenBudget(item.claim, maxClaimTokens, ' [TRUNCATED]'),
+    source: truncateToTokenBudget(item.source, 80, ' [TRUNCATED]'),
+  });
+}
+
+function fitPacketToBudget(packet: RuntimeWorkPacketBase, tokenBudget: number): RuntimeWorkPacketBase {
+  const effectiveBudget = Math.max(256, Math.floor(tokenBudget));
+  let candidate: RuntimeWorkPacketBase = {
+    ...packet,
+    constraints: [...packet.constraints],
+    verifiedFacts: packet.verifiedFacts.map((item) => compactEvidence(item)),
+    relevantFiles: [...packet.relevantFiles],
+    procedures: [...packet.procedures],
+    previousFailures: [...packet.previousFailures],
+    unknowns: [...packet.unknowns],
+    contradictions: [...packet.contradictions],
+    acceptanceCriteria: [...packet.acceptanceCriteria],
+    forbiddenActions: [...packet.forbiddenActions],
+    evidenceMap: packet.evidenceMap.map((item) => compactEvidence(item, 160)),
+  };
+  const count = () => estimateTokenCount(JSON.stringify(candidate));
+
+  const reducible: Array<keyof Pick<RuntimeWorkPacketBase,
+    'evidenceMap' | 'verifiedFacts' | 'procedures' | 'relevantFiles' | 'previousFailures' |
+    'unknowns' | 'contradictions' | 'constraints' | 'acceptanceCriteria' | 'forbiddenActions'>> = [
+    'evidenceMap',
+    'verifiedFacts',
+    'procedures',
+    'relevantFiles',
+    'previousFailures',
+    'unknowns',
+    'contradictions',
+    'constraints',
+    'acceptanceCriteria',
+    'forbiddenActions',
+  ];
+  const minimums: Partial<Record<(typeof reducible)[number], number>> = {
+    verifiedFacts: 2,
+    acceptanceCriteria: 2,
+    forbiddenActions: 2,
+  };
+
+  let safety = 256;
+  while (count() > effectiveBudget && safety-- > 0) {
+    let changed = false;
+    for (const key of reducible) {
+      const values = candidate[key] as unknown[];
+      const minimum = minimums[key] || 0;
+      if (values.length > minimum) {
+        (candidate[key] as unknown[]) = values.slice(0, -1);
+        changed = true;
+        break;
+      }
+    }
+    if (!changed) break;
+  }
+
+  if (count() > effectiveBudget) {
+    candidate = {
+      ...candidate,
+      goal: truncateToTokenBudget(candidate.goal, Math.max(48, Math.floor(effectiveBudget * 0.24)), ' [TRUNCATED]'),
+      constraints: candidate.constraints.slice(0, 2).map((item) => truncateToTokenBudget(item, 80)),
+      verifiedFacts: candidate.verifiedFacts.slice(0, 2).map((item) => compactEvidence(item, 100)),
+      relevantFiles: candidate.relevantFiles.slice(0, 4),
+      procedures: candidate.procedures.slice(0, 2).map((item) => truncateToTokenBudget(item, 80)),
+      previousFailures: candidate.previousFailures.slice(0, 2).map((item) => truncateToTokenBudget(item, 80)),
+      unknowns: candidate.unknowns.slice(0, 2).map((item) => truncateToTokenBudget(item, 80)),
+      contradictions: candidate.contradictions.slice(0, 2).map((item) => truncateToTokenBudget(item, 80)),
+      acceptanceCriteria: candidate.acceptanceCriteria.slice(0, 2).map((item) => truncateToTokenBudget(item, 80)),
+      forbiddenActions: candidate.forbiddenActions.slice(0, 2).map((item) => truncateToTokenBudget(item, 80)),
+      evidenceMap: [],
+    };
+  }
+
+  return candidate;
+}
+
 export function compileRuntimeContext(input: ContextCompilerInput): RuntimeWorkPacket {
-  const raw = [input.request, input.memoryContext, input.sourceContext, input.toolContext, input.sessionContext]
-    .filter(Boolean)
-    .join('\n\n');
+  const raw = distinctTextParts([
+    input.request,
+    input.memoryContext,
+    input.sourceContext,
+    input.toolContext,
+    input.sessionContext,
+  ]).join('\n\n');
   const allEvidence = [
     ...evidenceFromText(input.toolContext, 'tool', 'tool-context'),
     ...evidenceFromText(input.sourceContext, 'source', 'source-context'),
@@ -231,15 +330,16 @@ export function compileRuntimeContext(input: ContextCompilerInput): RuntimeWorkP
   const acceptanceCriteria = unique([...defaultAcceptance(input), ...classified.acceptance], 20);
   const forbiddenActions = unique(defaultForbidden(input.decision), 16);
 
-  const skeleton = {
-    version: 'etla-work-packet-v1' as const,
+  const factLimit = input.targetRole === 'boss' ? 8 : input.targetRole === 'worker' ? 20 : 14;
+  const skeleton: RuntimeWorkPacketBase = {
+    version: 'etla-work-packet-v1',
     packetId: `packet_${crypto.randomUUID()}`,
     goal: normalizeLine(input.request),
     taskFamily: input.decision.taskType,
     risk: input.decision.risk,
     targetRole: input.targetRole,
     constraints,
-    verifiedFacts: ranked.slice(0, input.targetRole === 'boss' ? 10 : input.targetRole === 'worker' ? 24 : 18),
+    verifiedFacts: ranked.slice(0, factLimit),
     relevantFiles,
     procedures,
     previousFailures,
@@ -247,42 +347,27 @@ export function compileRuntimeContext(input: ContextCompilerInput): RuntimeWorkP
     contradictions,
     acceptanceCriteria,
     forbiddenActions,
-    evidenceMap: ranked.slice(0, 40),
+    // Keep supplemental evidence disjoint from verifiedFacts so the same
+    // claims are not serialized twice and overweighted by downstream roles.
+    evidenceMap: ranked.slice(factLimit, factLimit + 12),
   };
 
   const rawTokens = estimateTokenCount(raw);
-  let packet = skeleton;
-  let serialized = JSON.stringify(packet);
-  if (estimateTokenCount(serialized) > input.tokenBudget) {
-    const facts = [...packet.verifiedFacts];
-    const evidence = [...packet.evidenceMap];
-    while (estimateTokenCount(serialized) > input.tokenBudget && (facts.length > 4 || evidence.length > 6)) {
-      if (evidence.length > facts.length && evidence.length > 6) evidence.pop();
-      else if (facts.length > 4) facts.pop();
-      packet = { ...packet, verifiedFacts: facts, evidenceMap: evidence };
-      serialized = JSON.stringify(packet);
-    }
-  }
-  if (estimateTokenCount(serialized) > input.tokenBudget) {
-    packet = {
+  // Reserve room for contextReduction metadata itself, then enforce the final
+  // serialized packet size rather than merely clamping the reported metric.
+  let packet = fitPacketToBudget(skeleton, Math.max(256, input.tokenBudget - 96));
+  let compiledTokens = estimateTokenCount(JSON.stringify({
+    ...packet,
+    contextReduction: { rawTokens, compiledTokens: 0, reductionRatio: 0 },
+  }));
+  if (compiledTokens > input.tokenBudget) {
+    packet = fitPacketToBudget(packet, Math.max(256, input.tokenBudget - 192));
+    compiledTokens = estimateTokenCount(JSON.stringify({
       ...packet,
-      constraints: packet.constraints.slice(0, 8),
-      procedures: packet.procedures.slice(0, 8),
-      previousFailures: packet.previousFailures.slice(0, 6),
-      unknowns: packet.unknowns.slice(0, 6),
-      contradictions: packet.contradictions.slice(0, 6),
-      acceptanceCriteria: packet.acceptanceCriteria.slice(0, 10),
-      forbiddenActions: packet.forbiddenActions.slice(0, 8),
-    };
-    serialized = truncateToTokenBudget(JSON.stringify(packet), input.tokenBudget);
-    try {
-      packet = { ...packet, goal: truncateToTokenBudget(packet.goal, Math.max(64, Math.floor(input.tokenBudget * 0.12))) };
-    } catch {
-      // The schema-safe packet below remains the deterministic fallback.
-    }
+      contextReduction: { rawTokens, compiledTokens: 0, reductionRatio: 0 },
+    }));
   }
 
-  const compiledTokens = Math.min(input.tokenBudget, estimateTokenCount(JSON.stringify(packet)));
   const result = RuntimeWorkPacketSchema.parse({
     ...packet,
     contextReduction: {
@@ -307,15 +392,14 @@ export function renderRolePacket(packet: RuntimeWorkPacket): string {
   if (packet.targetRole === 'worker') {
     return JSON.stringify({
       goal: packet.goal,
-      exactTask: packet.goal,
       relevantFiles: packet.relevantFiles,
       facts: conciseEvidence,
       procedure: packet.procedures.slice(0, 8),
       unknowns: packet.unknowns,
       acceptanceCriteria: packet.acceptanceCriteria,
       forbiddenActions: packet.forbiddenActions,
-      requiredOutput: 'Return the bounded WorkerResult JSON contract with evidence and confidence.',
-    }, null, 2);
+      requiredOutput: 'bounded WorkerResult JSON with evidence and confidence',
+    });
   }
   if (packet.targetRole === 'verifier') {
     return JSON.stringify({
@@ -326,7 +410,7 @@ export function renderRolePacket(packet: RuntimeWorkPacket): string {
       unknowns: packet.unknowns,
       acceptanceCriteria: packet.acceptanceCriteria,
       forbiddenActions: packet.forbiddenActions,
-    }, null, 2);
+    });
   }
   if (packet.targetRole === 'boss') {
     return JSON.stringify({
@@ -337,7 +421,7 @@ export function renderRolePacket(packet: RuntimeWorkPacket): string {
       unknowns: packet.unknowns,
       constraints: packet.constraints.slice(0, 8),
       forbiddenActions: packet.forbiddenActions,
-    }, null, 2);
+    });
   }
   return JSON.stringify({
     userIntent: packet.goal,
@@ -347,5 +431,5 @@ export function renderRolePacket(packet: RuntimeWorkPacket): string {
     unknowns: packet.unknowns,
     acceptanceCriteria: packet.acceptanceCriteria,
     forbiddenActions: packet.forbiddenActions,
-  }, null, 2);
+  });
 }

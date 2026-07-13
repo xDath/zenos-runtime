@@ -1,0 +1,38 @@
+[Unit]
+Description=Encrypted secondary backup for Zenos Memory
+After=network-online.target zenos-runtime.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=zenos-runtime
+Group=zenos-runtime
+WorkingDirectory=/opt/zenos-runtime/current
+EnvironmentFile=-/etc/zenos-runtime/runtime.env
+EnvironmentFile=-/etc/zenos-runtime/profile.env
+EnvironmentFile=-/etc/zenos-runtime/global.env
+Environment=HOME=/var/lib/zenos-runtime
+Environment=NODE_ENV=production
+Environment=ZENOS_MEMORY_SECONDARY_BACKUP_DIR=/var/backups/zenos-memory
+Environment=ZENOS_MEMORY_SECONDARY_BACKUP_KEEP=14
+ExecStart=/usr/bin/node /opt/zenos-runtime/current/scripts/backup-zenos-memory.mjs
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadOnlyPaths=/opt/zenos-runtime/current /etc/zenos-runtime
+ReadWritePaths=/var/backups/zenos-memory
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+TimeoutStartSec=120
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zenos-memory-backup

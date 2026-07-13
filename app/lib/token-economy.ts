@@ -1,3 +1,4 @@
+import * as crypto from 'node:crypto';
 import { z } from 'zod';
 import { incrementMetric, setGauge } from './metrics';
 import { RiskLevelSchema, RouteDecision, RuntimeContextSchema, TaskTypeSchema } from './zenos-runtime';
@@ -15,6 +16,7 @@ export const RoleTokenBudgetSchema = z.object({
 
 export const TokenBudgetPlanSchema = z.object({
   version: z.literal('etla-token-budget-v1'),
+  budgetId: z.string().min(8).max(200),
   taskType: TaskTypeSchema,
   risk: RiskLevelSchema,
   totalTokens: z.number().int().positive(),
@@ -68,21 +70,27 @@ function bounded(value: number, min: number, max: number): number {
 export function createTokenBudgetPlan(
   decision: RouteDecision,
   input: z.input<typeof RuntimeContextSchema>,
-  options: { priorFailures?: number; userPriority?: 'economy' | 'balanced' | 'quality' } = {},
+  options: {
+    priorFailures?: number;
+    userPriority?: 'economy' | 'balanced' | 'quality';
+    budgetId?: string;
+  } = {},
 ): TokenBudgetPlan {
   const context = RuntimeContextSchema.parse(input);
-  const priority = options.userPriority || 'balanced';
+  const priority = options.userPriority || 'economy';
   const priorityMultiplier = priority === 'economy' ? 0.72 : priority === 'quality' ? 1.2 : 1;
+  // Large context should trigger compaction, not automatically purchase a
+  // proportionally larger orchestration budget.
   const sourcePressure = context.estimatedContextTokens > 20_000
-    ? 1.3
+    ? 1.1
     : context.estimatedContextTokens > 6_000
-      ? 1.15
+      ? 1.05
       : 1;
   const retryPressure = 1 + Math.min(Math.max(options.priorFailures || 0, 0), 3) * 0.08;
   const orchestrationFloor = decision.useWorker && decision.useVerifier && decision.useBoss
-    ? 12_000
+    ? 9_000
     : decision.useWorker && decision.useVerifier
-      ? 10_000
+      ? 7_000
       : 2_500;
   const totalTokens = bounded(
     Math.max(
@@ -122,6 +130,7 @@ export function createTokenBudgetPlan(
 
   const plan = TokenBudgetPlanSchema.parse({
     version: 'etla-token-budget-v1',
+    budgetId: options.budgetId || `budget_${crypto.randomUUID()}`,
     taskType: decision.taskType,
     risk: decision.risk,
     totalTokens,
@@ -130,17 +139,17 @@ export function createTokenBudgetPlan(
       0.28,
       decision.useWorker
         ? ['coding_change', 'debugging'].includes(decision.taskType)
-          ? 2 + decision.maxRevisionAttempts
-          : Math.max(1, decision.maxWorkerCalls)
+          ? Math.min(2, Math.max(1, decision.maxWorkerCalls))
+          : 1
         : 0,
-      decision.useWorker ? 1 : 0,
+      0,
       90_000,
       12_000,
       2_400,
       decision.useWorker ? 1_600 : 64,
     ),
-    host: roleBudget(hostShare, 0.35, 1 + decision.maxRevisionAttempts, decision.maxRevisionAttempts, 120_000, 10_000, 3_200, 1_600),
-    verifier: roleBudget(verifierShare, 0.35, decision.useVerifier ? 1 + decision.maxRevisionAttempts : 0, 0, 90_000, 5_000, 1_400, decision.useVerifier ? 1_200 : 64),
+    host: roleBudget(hostShare, 0.35, 1 + Math.min(1, decision.maxRevisionAttempts), 0, 120_000, 10_000, 3_200, 1_600),
+    verifier: roleBudget(verifierShare, 0.35, decision.useVerifier ? 1 + Math.min(1, decision.maxRevisionAttempts) : 0, 0, 90_000, 5_000, 1_400, decision.useVerifier ? 1_200 : 64),
     boss: roleBudget(bossShare, 0.3, bossEnabled ? 1 : 0, 0, 120_000, 1_500, 500, bossEnabled ? 500 : 64),
     reserveTokens: bounded(totalTokens * reserveShare, 0, 12_000),
     reasons: [

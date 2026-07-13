@@ -10,7 +10,6 @@ import {
 import {
   RuntimeModelResult,
   RuntimeRunRequestSchema,
-  callRuntimeModel,
   runBossReviewModel,
   runHostRevision,
   runVerifier,
@@ -26,13 +25,12 @@ import {
 import { BossDecision, BossDecisionSchema } from './zenos-runtime-state';
 import { getRuntimeStore } from './zenos-runtime-store';
 import { createTokenBudgetPlan } from './token-economy';
+import { completeTokenBudget } from './token-governor';
 import {
-  GatewayHostPlan,
   GatewayMemoryBrief,
   GatewayTurnPostflightInput,
   GatewayTurnPostflightRequestSchema,
   GatewayTurnPreflightInput,
-  GatewayTurnPreflightRequest,
   GatewayTurnPreflightRequestSchema,
   GatewayTurnReceipt,
   StoredGatewayPreflight,
@@ -129,6 +127,16 @@ function memoryCoverageScore(memory: GatewayMemoryBrief): number | undefined {
   return checks.filter(Boolean).length / checks.length;
 }
 
+function deterministicValidationState(toolSummary: string): 'passed' | 'failed' | 'unknown' {
+  const text = String(toolSummary || '').toLowerCase();
+  if (!text.trim()) return 'unknown';
+  const hasValidation = /\b(test|tests|lint|typecheck|build|compile|validation|pytest|vitest|jest)\b/.test(text);
+  if (!hasValidation) return 'unknown';
+  if (/\b(fail(?:ed|ure)?|error|errors|non[- ]?zero|exit\s+[1-9]|timed out|timeout)\b/.test(text)) return 'failed';
+  if (/\b(pass(?:ed)?|success(?:ful)?|completed|green|exit\s+0|0\s+errors?)\b/.test(text)) return 'passed';
+  return 'unknown';
+}
+
 export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
   const turnStartedAtMs = Date.now();
   const request = GatewayTurnPreflightRequestSchema.parse(raw);
@@ -156,12 +164,16 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
     namespace: 'zenos',
     autoRecallMemory: false,
     persistRouteEvent: false,
-    tokenPriority: 'balanced',
+    tokenPriority: 'economy',
     approvalGranted: request.approvalGranted,
     dryRun: false,
     modelOverrides: request.modelOverrides,
     autonomousCoding: false,
     includeExecutionReceipt: false,
+  });
+  const planningBudget = createTokenBudgetPlan(baselineDecision, input, {
+    userPriority: input.tokenPriority,
+    budgetId: runId,
   });
 
   ensureGatewaySession(input, baselineDecision, runId, {
@@ -224,6 +236,7 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
     memoryBrief,
     runId,
     latencyPlan,
+    planningBudget,
   );
   if (hostPlanning.call) {
     preflightLatency.push(observeLatency('host', hostPlanning.call.latencyMs, latencyPlan.hostMs));
@@ -248,7 +261,10 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
     errors: hostPlanCall && !hostPlan ? ['Host planning failed; deterministic safety route retained'] : [],
     startedAt: now(),
   });
-  const baseBudget = createTokenBudgetPlan(decision, input, { userPriority: input.tokenPriority });
+  const baseBudget = createTokenBudgetPlan(decision, input, {
+    userPriority: input.tokenPriority,
+    budgetId: runId,
+  });
   const budget = {
     ...baseBudget,
     host: { ...baseBudget.host, timeoutMs: roleLatencyTimeout(latencyPlan, 'host') },
@@ -319,6 +335,8 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
       maxOutputTokens: 600,
       timeoutMs: roleLatencyTimeout(latencyPlan, 'boss'),
       trigger: request.userRequestedBoss ? 'user_requested_boss' : 'host_or_safety_escalation',
+      tokenBudgetPlan: budget,
+      mandatory: request.userRequestedBoss || decision.requiresApproval,
     });
     bossPreflight = safeBossDecision(bossCall);
     preflightLatency.push(observeLatency('boss', bossCall.latencyMs, latencyPlan.bossMs));
@@ -441,7 +459,10 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
       request.toolSummary,
     ].filter(Boolean).join('\n\n'),
   });
-  const baseBudget = createTokenBudgetPlan(decision, input, { userPriority: input.tokenPriority });
+  const baseBudget = createTokenBudgetPlan(decision, input, {
+    userPriority: input.tokenPriority,
+    budgetId: request.runId,
+  });
   const budget = {
     ...baseBudget,
     host: { ...baseBudget.host, timeoutMs: roleLatencyTimeout(latencyPlan, 'host') },
@@ -527,6 +548,7 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
       completedAt: now(),
     });
     updateRuntimeSession(request.sessionId, { status: 'failed', lastError: 'Hermes Host reported a failed turn', activeRunId: undefined });
+    completeTokenBudget(request.runId);
     return {
       ok: false,
       finalAnswer: request.draft,
@@ -549,15 +571,33 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
 
   let finalAnswer = request.draft;
   let transformed = false;
+  const hostInputTokens = request.hostUsage.inputTokens + request.hostUsage.cacheWriteTokens;
+  const hostInputBudget = Math.max(
+    24_000,
+    Number(process.env.ZENOS_GATEWAY_HOST_INPUT_BUDGET_TOKENS || 96_000),
+  );
+  const hostOverBudget = hostInputTokens > hostInputBudget;
+  const verifierMandatory = input.userRequestedVerification
+    || decision.risk === 'high'
+    || decision.risk === 'critical';
+  const deterministicValidation = deterministicValidationState(request.toolSummary);
+  const deterministicPassReplacesOptionalVerifier = deterministicValidation === 'passed'
+    && ['coding_change', 'debugging', 'repo_question'].includes(decision.taskType)
+    && !verifierMandatory;
   let verifierResult: VerifierResult | undefined;
   let verifierCall: RuntimeModelResult | undefined;
   let bossDecision = stored.bossPreflight;
   let bossCall = calls.find((call) => call.role === 'boss');
 
-  if (decision.useVerifier) {
+  if (
+    decision.useVerifier
+    && (!hostOverBudget || verifierMandatory)
+    && !deterministicPassReplacesOptionalVerifier
+  ) {
     const verifier = await runVerifier(input, finalAnswer, stored.workerResult, {
       requestId: `${request.runId}:gateway-verifier:1`,
       budget,
+      mandatory: verifierMandatory,
     });
     verifierResult = verifier.result;
     verifierCall = verifier.call;
@@ -616,8 +656,19 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
     recordActivity(
       request.sessionId,
       'verifier',
-      'Verifier skipped by Host orchestration and safety policy.',
-      { runId: request.runId, turnId: request.turnId },
+      deterministicPassReplacesOptionalVerifier
+        ? 'Verifier skipped because deterministic code validation passed and no high-risk review was required.'
+        : hostOverBudget && decision.useVerifier
+          ? `Verifier skipped because Hermes Host already consumed ${hostInputTokens} input tokens (budget ${hostInputBudget}).`
+          : 'Verifier skipped by Host orchestration and safety policy.',
+      {
+        runId: request.runId,
+        turnId: request.turnId,
+        hostInputTokens,
+        hostInputBudget,
+        hostOverBudget,
+        deterministicValidation,
+      },
       'skipped',
     );
   }
@@ -647,6 +698,8 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
       maxOutputTokens: 700,
       timeoutMs: roleLatencyTimeout(latencyPlan, 'boss'),
       trigger: verifierResult?.verdict === 'escalate' ? 'verifier_escalation' : 'critical_postflight_authority',
+      tokenBudgetPlan: budget,
+      mandatory: decision.requiresApproval || verifierResult?.verdict === 'escalate',
     });
     calls.push(finalBossCall);
     postflightLatency.push(observeLatency('boss', finalBossCall.latencyMs, latencyPlan.bossMs));
@@ -711,10 +764,16 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
     }
   }
 
-  if (transformed && decision.useVerifier && verifierResult?.verdict === 'revise') {
+  if (
+    transformed
+    && decision.useVerifier
+    && verifierResult?.verdict === 'revise'
+    && (decision.risk === 'high' || decision.risk === 'critical')
+  ) {
     const finalVerifier = await runVerifier(input, finalAnswer, stored.workerResult, {
       requestId: `${request.runId}:gateway-verifier:final`,
       budget,
+      mandatory: decision.risk === 'critical',
     });
     calls.push(finalVerifier.call);
     postflightLatency.push(observeLatency('verifier', finalVerifier.call.latencyMs, latencyPlan.verifierMs));
@@ -805,6 +864,7 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
     memorySource: stored.memorySource,
   });
   completeRuntimeSession(request.sessionId, finalAnswer);
+  completeTokenBudget(request.runId);
 
   return {
     ok: true,

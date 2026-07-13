@@ -49,6 +49,13 @@ const AuthResponseSchema = z.object({
   scopes: z.array(z.string()).optional().default([]),
 }).passthrough();
 
+const AuthenticatedStatusSchema = z.object({
+  success: z.boolean(),
+  authenticated: z.boolean(),
+  storage_readable: z.boolean(),
+  namespace: z.string(),
+}).passthrough();
+
 export type MemoryItem = z.infer<typeof MemoryResultSchema>;
 export type MemoryCoverage = z.infer<typeof MemoryCoverageSchema>;
 export type MemoryScope = 'memory:read' | 'memory:write' | 'memory:admin';
@@ -515,26 +522,101 @@ export async function persistRouteEventToMemory(input: {
 export async function memoryDependencyHealth(): Promise<{
   configured: boolean;
   reachable: boolean;
+  publicReachable?: boolean;
+  authConfigured?: boolean;
+  authenticated?: boolean;
+  storageReadable?: boolean;
   status?: number;
+  authenticatedStatus?: number;
   latencyMs?: number;
   error?: string;
   circuitOpen?: boolean;
 }> {
-  if (!memoryEnabled()) return { configured: false, reachable: false };
+  if (!memoryEnabled()) return { configured: false, reachable: false, authConfigured: false };
+  const authConfigured = Boolean(memorySecret() || memoryApiKey());
   const circuitError = checkCircuit();
-  if (circuitError) return { configured: true, reachable: false, error: circuitError, circuitOpen: true };
+  if (circuitError) {
+    return {
+      configured: authConfigured,
+      reachable: false,
+      authConfigured,
+      error: circuitError,
+      circuitOpen: true,
+    };
+  }
   const started = Date.now();
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 5_000);
   try {
-    const response = await fetch(`${memoryBaseUrl()}/api/memory/public-status`, { signal: controller.signal, cache: 'no-store' });
-    if (response.ok) recordSuccess();
-    else recordFailure(`Memory public status HTTP ${response.status}`);
-    return { configured: true, reachable: response.ok, status: response.status, latencyMs: Date.now() - started, circuitOpen: false };
+    const publicResponse = await fetch(`${memoryBaseUrl()}/api/memory/public-status`, {
+      signal: controller.signal,
+      cache: 'no-store',
+    });
+    if (!publicResponse.ok) {
+      const error = `Memory public status HTTP ${publicResponse.status}`;
+      recordFailure(error);
+      return {
+        configured: authConfigured,
+        reachable: false,
+        publicReachable: false,
+        authConfigured,
+        status: publicResponse.status,
+        latencyMs: Date.now() - started,
+        error,
+        circuitOpen: false,
+      };
+    }
+    if (!authConfigured) {
+      return {
+        configured: false,
+        reachable: false,
+        publicReachable: true,
+        authConfigured: false,
+        status: publicResponse.status,
+        latencyMs: Date.now() - started,
+        error: 'Zenos Memory authentication is not configured',
+        circuitOpen: false,
+      };
+    }
+    const authenticated = await memoryFetch<z.infer<typeof AuthenticatedStatusSchema>>(
+      '/api/memory/authenticated-status',
+      { namespace: process.env.ZENOS_MEMORY_NAMESPACE || 'zenos' },
+      {
+        timeoutMs: 5_000,
+        scopes: ['memory:read'],
+        parser: AuthenticatedStatusSchema,
+      },
+    );
+    const ok = Boolean(
+      authenticated.ok
+      && authenticated.value?.authenticated
+      && authenticated.value.storage_readable,
+    );
+    if (ok) recordSuccess();
+    return {
+      configured: true,
+      reachable: ok,
+      publicReachable: true,
+      authConfigured: true,
+      authenticated: Boolean(authenticated.value?.authenticated),
+      storageReadable: Boolean(authenticated.value?.storage_readable),
+      status: publicResponse.status,
+      authenticatedStatus: authenticated.status,
+      latencyMs: Date.now() - started,
+      error: authenticated.error,
+      circuitOpen: false,
+    };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     recordFailure(message);
-    return { configured: true, reachable: false, latencyMs: Date.now() - started, error: redactText(message), circuitOpen: circuit.openUntil > Date.now() };
+    return {
+      configured: authConfigured,
+      reachable: false,
+      authConfigured,
+      latencyMs: Date.now() - started,
+      error: redactText(message),
+      circuitOpen: circuit.openUntil > Date.now(),
+    };
   } finally {
     clearTimeout(timeout);
   }

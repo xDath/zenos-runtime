@@ -122,13 +122,31 @@ if (!existsSync('.next/BUILD_ID')) throw new Error('Production build is missing.
 const child = spawn(process.execPath, [nextBin, 'start', '-p', process.env.PORT || '3090', '-H', process.env.ZENOS_BIND_HOST || '127.0.0.1'], {
   stdio: 'inherit',
   env: process.env,
+  // Next may create a next-server descendant. Give the whole subtree one
+  // process group so systemd shutdown reaches every process deterministically.
+  detached: process.platform !== 'win32',
 });
 
 let shutdownSignal = '';
+let shutdownTimer;
+function signalChildTree(signal) {
+  if (!child.pid || child.killed) return;
+  try {
+    if (process.platform !== 'win32') process.kill(-child.pid, signal);
+    else child.kill(signal);
+  } catch (error) {
+    if (error?.code !== 'ESRCH') throw error;
+  }
+}
 for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
   process.on(signal, () => {
+    if (shutdownSignal) return;
     shutdownSignal = signal;
-    if (!child.killed) child.kill(signal);
+    signalChildTree(signal);
+    shutdownTimer = setTimeout(() => {
+      signalChildTree('SIGKILL');
+    }, Math.max(5_000, Number(process.env.ZENOS_SHUTDOWN_FORCE_MS || 20_000)));
+    shutdownTimer.unref();
   });
 }
 
@@ -137,6 +155,7 @@ child.on('error', (error) => {
   process.exit(1);
 });
 child.on('exit', (code, signal) => {
+  if (shutdownTimer) clearTimeout(shutdownTimer);
   if (shutdownSignal) process.exit(0);
   if (signal) process.kill(process.pid, signal);
   else process.exit(code ?? 1);
