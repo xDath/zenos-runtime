@@ -116,12 +116,29 @@ if [[ -f "${HERMES_ZENOS_UNIT}" ]]; then
 fi
 systemctl daemon-reload
 systemctl enable zenos-runtime.service zenos-memory-secondary-backup.timer zenos-runtime-backup.timer >/dev/null
-if ! systemctl restart zenos-runtime.service; then
+rollback_runtime() {
   if [[ -n "${PREVIOUS_RELEASE}" && -d "${PREVIOUS_RELEASE}" ]]; then
     ln -sfn "${PREVIOUS_RELEASE}" /opt/zenos-runtime/current
     systemctl restart zenos-runtime.service || true
   fi
+}
+if ! systemctl restart zenos-runtime.service; then
+  rollback_runtime
   echo "Zenos Runtime deployment failed; restored the previous release." >&2
+  exit 1
+fi
+RUNTIME_READY=false
+for _ in {1..30}; do
+  if curl --fail --silent --show-error --max-time 2 \
+    http://127.0.0.1:3090/api/health >/dev/null; then
+    RUNTIME_READY=true
+    break
+  fi
+  sleep 1
+done
+if [[ "${RUNTIME_READY}" != "true" ]]; then
+  rollback_runtime
+  echo "Zenos Runtime failed its post-restart HTTP health gate; restored the previous release." >&2
   exit 1
 fi
 if [[ -n "${PREVIOUS_RELEASE}" && -d "${PREVIOUS_RELEASE}" && "${PREVIOUS_RELEASE}" != "${RELEASE_ROOT}" ]]; then
