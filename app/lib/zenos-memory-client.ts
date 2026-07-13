@@ -216,7 +216,13 @@ async function authorizationHeaders(scopes: MemoryScope[], forceToken = false): 
 async function memoryFetch<T>(
   path: string,
   body: unknown,
-  options: { timeoutMs?: number; scopes?: MemoryScope[]; parser?: z.ZodType<T, z.ZodTypeDef, unknown>; retry401?: boolean } = {},
+  options: {
+    timeoutMs?: number;
+    scopes?: MemoryScope[];
+    parser?: z.ZodType<T, z.ZodTypeDef, unknown>;
+    retry401?: boolean;
+    idempotencyKey?: string;
+  } = {},
 ): Promise<MemoryClientResult<T>> {
   if (!memoryEnabled()) return { ok: false, skipped: true, error: 'Zenos Memory integration is disabled', degraded: true };
   const circuitError = checkCircuit();
@@ -233,7 +239,12 @@ async function memoryFetch<T>(
       const auth = await authorizationHeaders(scopes, attempt > 0);
       const response = await fetch(`${memoryBaseUrl()}${path}`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json', accept: 'application/json', ...auth },
+        headers: {
+          'content-type': 'application/json',
+          accept: 'application/json',
+          ...auth,
+          ...(options.idempotencyKey ? { 'idempotency-key': options.idempotencyKey.slice(0, 200) } : {}),
+        },
         body: payload,
         signal: controller.signal,
         cache: 'no-store',
@@ -406,6 +417,29 @@ export async function recallMemoryContext(input: {
   };
 }
 
+function stableMessageContent(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (content === null || content === undefined) return '';
+  if (Array.isArray(content)) return `[${content.map(stableMessageContent).join(',')}]`;
+  if (typeof content === 'object') {
+    return `{${Object.entries(content as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, value]) => `${JSON.stringify(key)}:${stableMessageContent(value)}`)
+      .join(',')}}`;
+  }
+  return String(content);
+}
+
+export function continuityFingerprint(
+  messages: Array<{ role: string; content: unknown }>,
+  limit = 80,
+): string {
+  const rendered = messages.slice(-Math.max(1, Math.min(limit, 80)))
+    .map((message) => `${String(message.role || '').trim().toLowerCase()}\n${stableMessageContent(message.content)}`)
+    .join('\n---\n');
+  return crypto.createHash('sha256').update(rendered).digest('hex');
+}
+
 export async function compactMemoryHandoff(input: {
   messages: Array<{ role: string; content: unknown; name?: string; tool_call_id?: string }>;
   namespace?: string;
@@ -427,10 +461,12 @@ export async function compactMemoryHandoff(input: {
   const namespace = input.namespace || process.env.ZENOS_MEMORY_NAMESPACE || 'zenos';
   const maxChars = Math.min(Math.max(input.maxChars || 10_000, 1_000), 24_000);
   const inputMaxChars = Math.min(Math.max(input.inputMaxChars || 180_000, 20_000), 500_000);
-  const fingerprint = crypto.createHash('sha256')
-    .update(JSON.stringify(input.messages.slice(-300)))
-    .digest('hex')
-    .slice(0, 24);
+  const boundedMessages = input.messages.slice(-80);
+  const fullFingerprint = continuityFingerprint(boundedMessages);
+  const idempotencyDigest = crypto.createHash('sha256')
+    .update(`${namespace}\n${fullFingerprint}`)
+    .digest('hex');
+  const fingerprint = fullFingerprint.slice(0, 24);
   const revision = await currentNamespaceRevision(namespace);
   const cache = getRuntimeCache();
   const cacheKey = runtimeCacheKey('memory', { kind: 'handoff',
@@ -450,7 +486,7 @@ export async function compactMemoryHandoff(input: {
   if (cached) return { ok: true, skipped: false, value: cached, cacheHit: true, latencyMs: 0 };
 
   const result = await memoryFetch<z.infer<typeof CompactResponseSchema>>('/api/memory/compact', {
-    messages: input.messages,
+    messages: boundedMessages,
     namespace,
     reason: input.reason || 'runtime-context-pressure',
     approx_tokens: input.approxTokens,
@@ -463,6 +499,7 @@ export async function compactMemoryHandoff(input: {
     scopes: ['memory:read', 'memory:write'],
     parser: CompactResponseSchema,
     timeoutMs: 60_000,
+    idempotencyKey: `continuity-compact:${idempotencyDigest}`,
   });
   if (!result.ok || !result.value) {
     return {

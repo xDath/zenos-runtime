@@ -1,6 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { compactMemoryHandoff } from '../app/lib/zenos-memory-client';
+import {
+  compactMemoryHandoff,
+  continuityFingerprint,
+  resetMemoryClientForTests,
+} from '../app/lib/zenos-memory-client';
 import {
   createRuntimeSession,
   getRuntimeSession,
@@ -10,6 +14,7 @@ import { getRuntimeStore, resetRuntimeStoreForTests } from '../app/lib/zenos-run
 
 test.beforeEach(() => {
   resetRuntimeStoreForTests(':memory:');
+  resetMemoryClientForTests();
 });
 
 test('Memory handoff sends a bounded DAG compaction contract and returns coverage metadata', async () => {
@@ -26,9 +31,14 @@ test('Memory handoff sends a bounded DAG compaction contract and returns coverag
   delete process.env.ZENOS_RUNTIME_DISABLE_MEMORY_HANDOFF;
 
   let observedBody: Record<string, unknown> | undefined;
+  let observedIdempotencyKey = '';
   globalThis.fetch = async (input: string | URL | Request, init?: RequestInit) => {
+    if (String(input) === 'http://memory.test/api/memory/revision') {
+      return Response.json({ success: true, namespace: 'zenos', revision: 'revision-test-0001' });
+    }
     assert.equal(String(input), 'http://memory.test/api/memory/compact');
     observedBody = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>;
+    observedIdempotencyKey = new Headers(init?.headers).get('idempotency-key') || '';
     return Response.json({
       success: true,
       compact: {
@@ -70,6 +80,7 @@ test('Memory handoff sends a bounded DAG compaction contract and returns coverag
     assert.equal(observedBody?.mode, 'dag');
     assert.equal(observedBody?.input_max_chars, 240_000);
     assert.equal(observedBody?.max_chars, 10_000);
+    assert.match(observedIdempotencyKey, /^continuity-compact:[a-f0-9]{64}$/);
   } finally {
     globalThis.fetch = originalFetch;
     if (previous.baseUrl === undefined) delete process.env.ZENOS_MEMORY_BASE_URL;
@@ -81,6 +92,16 @@ test('Memory handoff sends a bounded DAG compaction contract and returns coverag
     if (previous.handoffDisabled === undefined) delete process.env.ZENOS_RUNTIME_DISABLE_MEMORY_HANDOFF;
     else process.env.ZENOS_RUNTIME_DISABLE_MEMORY_HANDOFF = previous.handoffDisabled;
   }
+});
+
+test('Runtime continuity fingerprint is stable across sorted structured content', () => {
+  assert.equal(
+    continuityFingerprint([
+      { role: 'user', content: 'Keep this decision.' },
+      { role: 'assistant', content: { b: 2, a: 'ok' } },
+    ]),
+    'f09a327ce285a2205521cb4460f4f4cbfefe83677b2e7597a854f48b8d23d6b6',
+  );
 });
 
 test('stale active Runtime sessions are cancelled while fresh sessions stay active', () => {
