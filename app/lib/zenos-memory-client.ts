@@ -545,8 +545,11 @@ export async function memoryDependencyHealth(): Promise<{
     };
   }
   const started = Date.now();
+  const dependencyTimeoutMs = /^(?:https?:\/\/)?(?:127\.0\.0\.1|localhost)(?::|\/|$)/i.test(memoryBaseUrl())
+    ? 20_000
+    : 8_000;
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 5_000);
+  const timeout = setTimeout(() => controller.abort(), dependencyTimeoutMs);
   try {
     const publicResponse = await fetch(`${memoryBaseUrl()}/api/memory/public-status`, {
       signal: controller.signal,
@@ -582,7 +585,7 @@ export async function memoryDependencyHealth(): Promise<{
       '/api/memory/authenticated-status',
       { namespace: process.env.ZENOS_MEMORY_NAMESPACE || 'zenos' },
       {
-        timeoutMs: 5_000,
+        timeoutMs: dependencyTimeoutMs,
         scopes: ['memory:read'],
         parser: AuthenticatedStatusSchema,
       },
