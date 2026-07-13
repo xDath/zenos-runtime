@@ -20,7 +20,8 @@
     "runtime:watch": "node --experimental-sqlite scripts/zenos-runtime-watch.mjs",
     "start:local": "node scripts/load-env-and-start.mjs",
     "runtime:local": "node scripts/zenos-runtime-local-client.mjs",
-    "wmodel": "node scripts/wmodel.mjs"
+    "wmodel": "node scripts/wmodel.mjs",
+    "deploy:local": "bash scripts/install-control-plane-service.sh"
   },
   "dependencies": {
     "next": "16.2.10",
