@@ -26,7 +26,11 @@ def parse_env(path: Path) -> dict[str, str]:
 def prepare_environment(destination: Path, sources: list[Path]) -> None:
     values: dict[str, str] = {}
     for source in sources:
-        values.update(parse_env(source))
+        for key, value in parse_env(source).items():
+            current = values.get(key, '').strip().strip('"\'')
+            candidate = value.strip().strip('"\'')
+            if key not in values or (not current and candidate):
+                values[key] = value
     if not values:
         raise SystemExit("No Runtime environment source was found")
     destination.write_text(
