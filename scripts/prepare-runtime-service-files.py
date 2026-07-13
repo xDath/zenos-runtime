@@ -2,6 +2,7 @@
 """Prepare a merged environment bundle and an allowlisted Runtime config."""
 from __future__ import annotations
 
+import json
 import re
 import sys
 from pathlib import Path
@@ -79,17 +80,42 @@ def prepare_config(source: Path, destination: Path) -> None:
     destination.chmod(0o600)
 
 
+def prepare_model_slots(source: Path, destination: Path) -> None:
+    data = {}
+    if source.is_file():
+        try:
+            loaded = json.loads(source.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+        except json.JSONDecodeError:
+            data = {}
+    allowed = {
+        "baseUrl", "hostModel", "hostProvider", "hostBaseUrl",
+        "workerModel", "workerProvider", "workerBaseUrl",
+        "bossModel", "bossProvider", "bossBaseUrl",
+        "verifierModel", "verifierProvider", "verifierBaseUrl",
+    }
+    sanitized = {key: value for key, value in data.items() if key in allowed and isinstance(value, str) and value.strip()}
+    sanitized["verifierModel"] = "ag/gemini-3.5-flash-low"
+    sanitized["verifierProvider"] = "etla-router"
+    destination.write_text(json.dumps(sanitized, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    destination.chmod(0o600)
+
+
 def main() -> None:
-    if len(sys.argv) < 7:
+    if len(sys.argv) < 9:
         raise SystemExit(
-            "usage: prepare-runtime-service-files.py ENV_OUT CONFIG_OUT CONFIG_IN ENV_SOURCE..."
+            "usage: prepare-runtime-service-files.py ENV_OUT CONFIG_OUT CONFIG_IN MODEL_OUT MODEL_IN ENV_SOURCE..."
         )
     environment_output = Path(sys.argv[1])
     config_output = Path(sys.argv[2])
     config_input = Path(sys.argv[3])
-    sources = [Path(value) for value in sys.argv[4:]]
+    model_output = Path(sys.argv[4])
+    model_input = Path(sys.argv[5])
+    sources = [Path(value) for value in sys.argv[6:]]
     prepare_environment(environment_output, sources, config_input)
     prepare_config(config_input, config_output)
+    prepare_model_slots(model_input, model_output)
 
 
 if __name__ == "__main__":

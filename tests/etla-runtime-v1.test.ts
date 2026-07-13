@@ -87,7 +87,7 @@ test('four-role orchestration reserves enough structured output budget to avoid 
   assert.equal(decision.useWorker, true);
   assert.equal(decision.useVerifier, true);
   assert.equal(decision.useBoss, true);
-  assert.ok(budget.totalTokens >= 9_000);
+  assert.ok(budget.totalTokens >= 12_000);
   assert.ok(budget.worker.outputTokens >= 1_600);
   assert.ok(budget.verifier.outputTokens >= 1_200);
   assert.equal(budget.boss.outputTokens, 500);
@@ -118,6 +118,40 @@ test('context compiler reduces raw context and emits role-specific packets', () 
   assert.ok(packet.contextReduction.compiledTokens <= 1_200);
   assert.ok(estimateTokenCount(rendered) <= 1_500);
   assert.match(rendered, /acceptanceCriteria/);
+});
+
+test('context compiler collapses semantically identical source and Worker evidence', () => {
+  const context = RuntimeContextSchema.parse({
+    request: 'review the production readiness evidence',
+    intent: 'analyze',
+    estimatedContextTokens: 2_000,
+  });
+  const decision = choosePipeline(context);
+  const packet = compileRuntimeContext({
+    request: context.request,
+    decision,
+    targetRole: 'host',
+    tokenBudget: 1_500,
+    sourceContext: 'Evidence A: the service is loopback-only and runs as a non-root identity.',
+    workerResult: {
+      task: context.request,
+      summary: [],
+      findings: [{
+        claim: 'the service is loopback-only and runs as a non-root identity.',
+        evidence: ['source-context'],
+        confidence: 0.8,
+        risk: 'low',
+      }],
+      contradictions: [],
+      unknowns: [],
+      suggestedNextStep: 'continue',
+      needsHostAttention: [],
+      rawContextNeeded: [],
+      sourceCoverage: 1,
+    },
+  });
+  const matching = packet.verifiedFacts.filter((item) => item.claim.includes('loopback-only'));
+  assert.equal(matching.length, 1);
 });
 
 test('default skill registry selects bounded relevant skills', () => {

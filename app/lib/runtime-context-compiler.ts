@@ -86,6 +86,17 @@ function unique(items: string[], max: number): string[] {
   return result;
 }
 
+function semanticEvidenceKey(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/^evidence\s+[a-z0-9._-]+\s*:\s*/i, '')
+    .replace(/^\[(?:source|tool|worker|validation|memory|session)[^\]]*\]\s*/i, '')
+    .replace(/^["'`]+|["'`]+$/g, '')
+    .replace(/[\s.,;:!?]+/g, ' ')
+    .trim()
+    .slice(0, 1_000);
+}
+
 function distinctTextParts(parts: Array<string | undefined>): string[] {
   const seen = new Set<string>();
   const result: string[] = [];
@@ -309,7 +320,7 @@ export function compileRuntimeContext(input: ContextCompilerInput): RuntimeWorkP
   const requestTokens = new Set(input.request.toLowerCase().split(/[^\p{L}\p{N}_-]+/u).filter((token) => token.length > 2));
   const deduped = new Map<string, EvidenceItem>();
   for (const item of allEvidence) {
-    const key = item.claim.toLowerCase().replace(/\s+/g, ' ').slice(0, 1_000);
+    const key = semanticEvidenceKey(item.claim);
     const current = deduped.get(key);
     if (!current || item.confidence > current.confidence) deduped.set(key, item);
   }

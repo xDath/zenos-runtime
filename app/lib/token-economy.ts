@@ -125,10 +125,11 @@ export function createTokenBudgetPlan(
       ? 1.05
       : 1;
   const retryPressure = 1 + Math.min(Math.max(options.priorFailures || 0, 0), 3) * 0.08;
+  const highAssurance = decision.risk === 'high' || decision.risk === 'critical';
   const orchestrationFloor = decision.useWorker && decision.useVerifier && decision.useBoss
-    ? 9_000
+    ? highAssurance ? 12_000 : 10_500
     : decision.useWorker && decision.useVerifier
-      ? 7_000
+      ? highAssurance ? 9_000 : 8_000
       : 2_500;
   const totalTokens = bounded(
     Math.max(

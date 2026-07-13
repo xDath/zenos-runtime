@@ -62,8 +62,9 @@ ln -sfn "${RELEASE_ROOT}" /opt/zenos-runtime/current
 install -d -o root -g root -m 0700 /etc/credstore.encrypted
 CREDENTIAL_TMP="$(mktemp)"
 SANITIZED_CONFIG_TMP="$(mktemp)"
+SANITIZED_MODELS_TMP="$(mktemp)"
 cleanup() {
-  rm -f "${CREDENTIAL_TMP}" "${SANITIZED_CONFIG_TMP}"
+  rm -f "${CREDENTIAL_TMP}" "${SANITIZED_CONFIG_TMP}" "${SANITIZED_MODELS_TMP}"
 }
 trap cleanup EXIT
 
@@ -71,6 +72,8 @@ python3 "${SOURCE_ROOT}/scripts/prepare-runtime-service-files.py" \
   "${CREDENTIAL_TMP}" \
   "${SANITIZED_CONFIG_TMP}" \
   /root/.hermes/profiles/zenos/config.yaml \
+  "${SANITIZED_MODELS_TMP}" \
+  /root/.hermes/profiles/zenos/zenos-runtime.json \
   "${SOURCE_ROOT}/.env.local" \
   /root/.hermes/profiles/zenos/.env \
   /root/.hermes/.env
@@ -83,12 +86,8 @@ rm -f /etc/zenos-runtime/runtime.env /etc/zenos-runtime/profile.env /etc/zenos-r
 install -o root -g "${SERVICE_GROUP}" -m 0640 \
   "${SANITIZED_CONFIG_TMP}" /etc/zenos-runtime/hermes-config.yaml
 
-if [[ -f /root/.hermes/profiles/zenos/zenos-runtime.json ]]; then
-  install -o root -g "${SERVICE_GROUP}" -m 0640 \
-    /root/.hermes/profiles/zenos/zenos-runtime.json /etc/zenos-runtime/models.json
-else
-  rm -f /etc/zenos-runtime/models.json
-fi
+install -o root -g "${SERVICE_GROUP}" -m 0640 \
+  "${SANITIZED_MODELS_TMP}" /etc/zenos-runtime/models.json
 
 install -o root -g root -m 0644 "${SOURCE_ROOT}/zenos-runtime.service" /etc/systemd/system/zenos-runtime.service
 install -o root -g root -m 0644 "${SOURCE_ROOT}/zenos-memory-secondary-backup.service" /etc/systemd/system/zenos-memory-secondary-backup.service

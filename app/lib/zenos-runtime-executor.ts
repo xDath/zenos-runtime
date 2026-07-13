@@ -1665,6 +1665,10 @@ export async function runZenosPipeline(request: RuntimeRunRequest): Promise<Runt
       input.maxRevisionAttempts ?? decision.maxRevisionAttempts,
     ));
     let verifierResult: VerifierResult | undefined;
+    const verifierMandatory = input.userRequestedVerification
+      || decision.requiresApproval
+      || decision.risk === 'high'
+      || decision.risk === 'critical';
     if (decision.useVerifier) {
       for (let attempt = 0; attempt <= maxRevisions; attempt += 1) {
         const verifierPacket = compileRuntimeContext({
@@ -1680,7 +1684,12 @@ export async function runZenosPipeline(request: RuntimeRunRequest): Promise<Runt
           selectedProcedure,
         });
         contextPackets.verifier = verifierPacket;
-        const verifier = await runVerifier(input, draft, workerResult, { requestId: `${runId}:verifier:${attempt + 1}`, packet: verifierPacket, budget: budgetPlan });
+        const verifier = await runVerifier(input, draft, workerResult, {
+          requestId: `${runId}:verifier:${attempt + 1}`,
+          packet: verifierPacket,
+          budget: budgetPlan,
+          mandatory: verifierMandatory,
+        });
         modelCalls.push(verifier.call);
         if (!verifier.result) {
           throw new Error(`Verifier unavailable: ${verifier.call.error || 'invalid verifier output'}`);
