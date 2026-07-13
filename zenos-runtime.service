@@ -1,9 +1,9 @@
 [Unit]
 Description=Zenos Runtime v0.5 - Non-root Control Plane and Outcome Intelligence
 Documentation=file:/opt/zenos-runtime/current/README.md
-After=network-online.target 9router.service
+After=network-online.target 9router.service zenos-memory.service
 Wants=network-online.target
-Requires=9router.service
+Requires=9router.service zenos-memory.service
 StartLimitIntervalSec=60
 StartLimitBurst=8
 
@@ -21,13 +21,14 @@ Environment=NODE_OPTIONS=--disable-warning=ExperimentalWarning
 Environment=PORT=3090
 Environment=ZENOS_BIND_HOST=127.0.0.1
 Environment=ZENOS_RUNTIME_DB_PATH=/var/lib/zenos-runtime/runtime.db
+Environment=ZENOS_MEMORY_BASE_URL=http://127.0.0.1:3091
 Environment=ZENOS_RUNTIME_LEGACY_STORE_PATH=/var/lib/zenos-runtime/legacy-sessions.json
 Environment=ZENOS_RUNTIME_CONFIG_PATH=/etc/zenos-runtime/models.json
 Environment=ZENOS_RUNTIME_SESSION_MODEL_DIR=/var/lib/zenos-runtime/session-models
 Environment=HERMES_CONFIG_PATH=/etc/zenos-runtime/hermes-config.yaml
 Environment=ZENOS_RUNTIME_EXECUTION_MODE=control-plane
 Environment=ZENOS_RUNTIME_REMOTE_VALIDATION_ENABLED=false
-Environment=ZENOS_RUNTIME_READ_ROOTS=/opt/zenos-runtime/current:/usr/local/lib/hermes-agent:/var/lib/zenos-runtime/validation-workspaces
+Environment=ZENOS_RUNTIME_READ_ROOTS=/opt/zenos-runtime/current:/usr/local/lib/hermes-agent:/root/openclaw-projects:/var/lib/zenos-runtime/validation-workspaces
 Environment=ZENOS_RUNTIME_VALIDATION_ROOTS=/var/lib/zenos-runtime/validation-workspaces
 Environment=ZENOS_RUNTIME_MUTATION_ROOTS=/var/lib/zenos-runtime/executor-workspaces
 Environment=ZENOS_ALLOW_LEGACY_HMAC=false
