@@ -107,6 +107,10 @@ def prepare_environment(destination: Path, sources: list[Path], config_source: P
             values.setdefault(secret_environment_name(field_path), shlex.quote(value))
     if not values:
         raise SystemExit("No Runtime environment source was found")
+    # The VPS installs Memory as a loopback sidecar. Keep Runtime on that
+    # release-consistent path instead of silently drifting to an older public
+    # Vercel deployment inherited from a historical environment file.
+    values["ZENOS_MEMORY_URL"] = "http://127.0.0.1:3091"
     destination.write_text(
         "".join(f"{key}={value}\n" for key, value in sorted(values.items())),
         encoding="utf-8",
