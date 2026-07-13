@@ -1,3 +1,5 @@
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { authConfigurationStatus } from './auth';
 import { executionBoundaryStatus } from './execution-boundary';
 import { getRuntimeModelConfigSummary, hasRuntimeModels } from './zenos-runtime-executor';
@@ -5,7 +7,7 @@ import { memoryConfigurationSummary, memoryDependencyHealth } from './zenos-memo
 import { runtimeReadinessReport } from './zenos-runtime';
 import { getRuntimeStore } from './zenos-runtime-store';
 
-export const ZENOS_RUNTIME_VERSION = '0.5.2';
+export const ZENOS_RUNTIME_VERSION = '0.6.0';
 
 export type ReadinessCheck = {
   name: string;
@@ -15,6 +17,37 @@ export type ReadinessCheck = {
   evidence: string;
   latencyMs?: number;
 };
+
+function runtimeBackupHealth(): { passed: boolean; evidence: string } {
+  if (process.env.NODE_ENV !== 'production') return { passed: true, evidence: 'Production backup freshness is enforced by the systemd deployment.' };
+  const directory = process.env.ZENOS_RUNTIME_BACKUP_DIR || '/var/backups/zenos-runtime';
+  try {
+    const backups = fs.readdirSync(directory)
+      .filter((name) => /^zenos-runtime-.*\.json\.enc$/.test(name))
+      .map((name) => ({ name, modified: fs.statSync(path.join(directory, name)).mtimeMs }))
+      .sort((left, right) => right.modified - left.modified);
+    if (!backups.length) return { passed: false, evidence: `No encrypted Runtime backup exists in ${directory}` };
+    const ageHours = (Date.now() - backups[0].modified) / 3_600_000;
+    return {
+      passed: ageHours <= 36,
+      evidence: `Latest encrypted verified backup ${backups[0].name} is ${ageHours.toFixed(1)}h old`,
+    };
+  } catch (error) {
+    return { passed: false, evidence: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+function credentialDeliveryHealth(): { passed: boolean; evidence: string } {
+  if (process.env.NODE_ENV !== 'production') return { passed: true, evidence: 'Local development does not require systemd credentials.' };
+  const directory = process.env.CREDENTIALS_DIRECTORY || '';
+  const credential = directory ? path.join(directory, 'zenos-runtime.env') : '';
+  return {
+    passed: Boolean(credential && fs.existsSync(credential)),
+    evidence: credential && fs.existsSync(credential)
+      ? 'Runtime environment is delivered through an ephemeral systemd credential.'
+      : 'Encrypted systemd credential was not mounted into the service.',
+  };
+}
 
 async function routerHealth(): Promise<{ configured: boolean; reachable: boolean; status?: number; latencyMs?: number; error?: string }> {
   const summary = getRuntimeModelConfigSummary();
@@ -48,6 +81,8 @@ export async function buildRuntimeReadiness(options: { includeDependencies?: boo
   const auth = authConfigurationStatus();
   const models = getRuntimeModelConfigSummary();
   const execution = executionBoundaryStatus();
+  const backup = runtimeBackupHealth();
+  const credentials = credentialDeliveryHealth();
   const checks: ReadinessCheck[] = [
     {
       name: 'routing policy regression',
@@ -82,8 +117,20 @@ export async function buildRuntimeReadiness(options: { includeDependencies?: boo
     {
       name: 'versioned outcome ledger',
       required: true,
-      passed: store.schemaVersion >= 4,
-      evidence: `SQLite schema ${store.schemaVersion} includes immutable outcome revisions and shadow-route passports`,
+      passed: store.schemaVersion >= 5,
+      evidence: `SQLite schema ${store.schemaVersion} includes immutable outcome revisions, shadow-route passports, and persistent token reservations`,
+    },
+    {
+      name: 'encrypted credential delivery',
+      required: true,
+      passed: credentials.passed,
+      evidence: credentials.evidence,
+    },
+    {
+      name: 'Runtime backup freshness',
+      required: true,
+      passed: backup.passed,
+      evidence: backup.evidence,
     },
     {
       name: 'legacy HMAC compatibility',

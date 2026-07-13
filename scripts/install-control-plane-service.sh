@@ -20,6 +20,7 @@ BUILD_ID="$(tr -cd 'A-Za-z0-9._-' < .next/BUILD_ID | cut -c1-32)"
 [[ -n "${BUILD_ID}" ]] || BUILD_ID="build-$(date +%s)"
 RELEASE_ROOT="/opt/zenos-runtime/releases/${VERSION}-${COMMIT}-${BUILD_ID}"
 STAGING="${RELEASE_ROOT}.staging"
+PREVIOUS_RELEASE="$(readlink -f /opt/zenos-runtime/current 2>/dev/null || true)"
 SERVICE_USER="zenos-runtime"
 SERVICE_GROUP="zenos-runtime"
 
@@ -38,7 +39,8 @@ install -d -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" -m 0700 \
   /var/lib/zenos-runtime/validation-workspaces \
   /var/lib/zenos-runtime/executor-workspaces \
   /var/lib/zenos-runtime/artifacts \
-  /var/backups/zenos-memory
+  /var/backups/zenos-memory \
+  /var/backups/zenos-runtime
 # Preserve the existing SQLite/audit state while transferring ownership from
 # the legacy root service to the dedicated control-plane identity.
 chown -R "${SERVICE_USER}:${SERVICE_GROUP}" /var/lib/zenos-runtime
@@ -65,10 +67,18 @@ install -d -o root -g root -m 0700 /etc/credstore.encrypted
 CREDENTIAL_TMP="$(mktemp)"
 SANITIZED_CONFIG_TMP="$(mktemp)"
 SANITIZED_MODELS_TMP="$(mktemp)"
+SANITIZED_HERMES_CONFIG_TMP="$(mktemp)"
+EXISTING_CREDENTIAL_TMP="$(mktemp)"
 cleanup() {
-  rm -f "${CREDENTIAL_TMP}" "${SANITIZED_CONFIG_TMP}" "${SANITIZED_MODELS_TMP}"
+  rm -f "${CREDENTIAL_TMP}" "${SANITIZED_CONFIG_TMP}" "${SANITIZED_MODELS_TMP}" \
+    "${SANITIZED_HERMES_CONFIG_TMP}" "${EXISTING_CREDENTIAL_TMP}"
 }
 trap cleanup EXIT
+
+if [[ -s /etc/credstore.encrypted/zenos-runtime.env.cred ]]; then
+  systemd-creds decrypt --name=zenos-runtime.env \
+    /etc/credstore.encrypted/zenos-runtime.env.cred "${EXISTING_CREDENTIAL_TMP}" >/dev/null
+fi
 
 python3 "${SOURCE_ROOT}/scripts/prepare-runtime-service-files.py" \
   "${CREDENTIAL_TMP}" \
@@ -76,9 +86,11 @@ python3 "${SOURCE_ROOT}/scripts/prepare-runtime-service-files.py" \
   /root/.hermes/profiles/zenos/config.yaml \
   "${SANITIZED_MODELS_TMP}" \
   /root/.hermes/profiles/zenos/zenos-runtime.json \
+  "${SANITIZED_HERMES_CONFIG_TMP}" \
   "${SOURCE_ROOT}/.env.local" \
   /root/.hermes/profiles/zenos/.env \
-  /root/.hermes/.env
+  /root/.hermes/.env \
+  "${EXISTING_CREDENTIAL_TMP}"
 
 rm -f /etc/credstore.encrypted/zenos-runtime.env.cred
 systemd-creds encrypt --with-key=host --name=zenos-runtime.env \
@@ -90,22 +102,58 @@ install -o root -g "${SERVICE_GROUP}" -m 0640 \
 
 install -o root -g "${SERVICE_GROUP}" -m 0640 \
   "${SANITIZED_MODELS_TMP}" /etc/zenos-runtime/models.json
+install -o root -g root -m 0600 \
+  "${SANITIZED_HERMES_CONFIG_TMP}" /root/.hermes/profiles/zenos/config.yaml
 
 install -o root -g root -m 0644 "${SOURCE_ROOT}/zenos-runtime.service" /etc/systemd/system/zenos-runtime.service
 install -o root -g root -m 0644 "${SOURCE_ROOT}/zenos-memory-secondary-backup.service" /etc/systemd/system/zenos-memory-secondary-backup.service
 install -o root -g root -m 0644 "${SOURCE_ROOT}/zenos-memory-secondary-backup.timer" /etc/systemd/system/zenos-memory-secondary-backup.timer
+install -o root -g root -m 0644 "${SOURCE_ROOT}/zenos-runtime-backup.service" /etc/systemd/system/zenos-runtime-backup.service
+install -o root -g root -m 0644 "${SOURCE_ROOT}/zenos-runtime-backup.timer" /etc/systemd/system/zenos-runtime-backup.timer
 HERMES_ZENOS_UNIT=/usr/local/lib/hermes-agent/deploy/hermes-gateway-zenos.service
 if [[ -f "${HERMES_ZENOS_UNIT}" ]]; then
   install -o root -g root -m 0644 "${HERMES_ZENOS_UNIT}" /etc/systemd/system/hermes-gateway.service
 fi
 systemctl daemon-reload
-systemctl enable zenos-runtime.service zenos-memory-secondary-backup.timer >/dev/null
-systemctl restart zenos-runtime.service
+systemctl enable zenos-runtime.service zenos-memory-secondary-backup.timer zenos-runtime-backup.timer >/dev/null
+if ! systemctl restart zenos-runtime.service; then
+  if [[ -n "${PREVIOUS_RELEASE}" && -d "${PREVIOUS_RELEASE}" ]]; then
+    ln -sfn "${PREVIOUS_RELEASE}" /opt/zenos-runtime/current
+    systemctl restart zenos-runtime.service || true
+  fi
+  echo "Zenos Runtime deployment failed; restored the previous release." >&2
+  exit 1
+fi
+if [[ -n "${PREVIOUS_RELEASE}" && -d "${PREVIOUS_RELEASE}" && "${PREVIOUS_RELEASE}" != "${RELEASE_ROOT}" ]]; then
+  ln -sfn "${PREVIOUS_RELEASE}" /opt/zenos-runtime/previous
+fi
 systemctl start zenos-memory-secondary-backup.timer
+systemctl start zenos-runtime-backup.timer
+systemctl start zenos-runtime-backup.service
 if [[ -f "${HERMES_ZENOS_UNIT}" && "${ZENOS_DEPLOY_RESTART_HERMES:-true}" == "true" ]]; then
   systemctl enable hermes-gateway.service >/dev/null
   systemctl restart hermes-gateway.service
 fi
+
+# Services now receive the same values from encrypted systemd credentials.
+# Remove persistent plaintext copies only after both Runtime and Hermes have
+# restarted successfully.
+rm -f \
+  "${SOURCE_ROOT}/.env.local" \
+  /root/.hermes/profiles/zenos/.env \
+  /root/.hermes/.env
+
+CURRENT_RELEASE="$(readlink -f /opt/zenos-runtime/current)"
+ROLLBACK_RELEASE="$(readlink -f /opt/zenos-runtime/previous 2>/dev/null || true)"
+for candidate in /opt/zenos-runtime/releases/*; do
+  [[ -d "${candidate}" ]] || continue
+  resolved="$(readlink -f "${candidate}")"
+  [[ "${resolved}" == "${CURRENT_RELEASE}" || "${resolved}" == "${ROLLBACK_RELEASE}" ]] && continue
+  case "${resolved}" in
+    /opt/zenos-runtime/releases/*) rm -rf -- "${resolved}" ;;
+    *) echo "Refusing unsafe release cleanup target: ${resolved}" >&2; exit 1 ;;
+  esac
+done
 
 printf 'Installed Zenos Runtime %s (%s) at %s\n' "${VERSION}" "${COMMIT}" "${RELEASE_ROOT}"
 systemctl --no-pager --full status zenos-runtime.service

@@ -13,7 +13,7 @@ import {
 } from './zenos-runtime-state';
 import { log } from './logger';
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 
 function defaultDatabasePath(): string {
   if (process.env.ZENOS_RUNTIME_DB_PATH) return process.env.ZENOS_RUNTIME_DB_PATH;
@@ -81,6 +81,19 @@ export type OutcomeLedgerRecord = {
   pipelineMode: string;
   record: unknown;
   createdAt: string;
+};
+
+export type TokenGovernorStoreRecord = {
+  budgetId: string;
+  limitTokens: number;
+  reserveTokens: number;
+  spentTokens: number;
+  calls: number;
+  reservations: Record<string, number>;
+  status: 'active' | 'completed';
+  updatedAt: string;
+  expiresAt: string;
+  completedAt?: string;
 };
 
 export class RuntimeStore {
@@ -250,6 +263,22 @@ export class RuntimeStore {
       CREATE INDEX IF NOT EXISTS idx_outcomes_session ON outcome_ledger(session_id, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_outcomes_task ON outcome_ledger(task_type, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_outcomes_verdict ON outcome_ledger(verdict, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS token_governors (
+        budget_id TEXT PRIMARY KEY,
+        limit_tokens INTEGER NOT NULL,
+        reserve_tokens INTEGER NOT NULL,
+        spent_tokens INTEGER NOT NULL,
+        calls INTEGER NOT NULL,
+        reservations_json TEXT NOT NULL,
+        status TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        completed_at TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_token_governors_expiry ON token_governors(expires_at);
+      CREATE INDEX IF NOT EXISTS idx_token_governors_status ON token_governors(status, updated_at DESC);
     `);
 
     const current = this.db.prepare('SELECT value FROM runtime_meta WHERE key = ?').get('schema_version');
@@ -363,6 +392,78 @@ export class RuntimeStore {
       }
       throw error;
     }
+  }
+
+  getMetaValue(key: string): string | undefined {
+    const row = this.db.prepare('SELECT value FROM runtime_meta WHERE key = ?').get(key);
+    return row ? asString(row.value) : undefined;
+  }
+
+  setMetaValue(key: string, value: string): void {
+    this.db.prepare(`
+      INSERT INTO runtime_meta(key, value) VALUES(?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).run(key, value);
+  }
+
+  getTokenGovernor(budgetId: string): TokenGovernorStoreRecord | undefined {
+    const row = this.db.prepare('SELECT * FROM token_governors WHERE budget_id = ?').get(budgetId);
+    if (!row || asString(row.status) !== 'active') return undefined;
+    return {
+      budgetId: asString(row.budget_id),
+      limitTokens: asNumber(row.limit_tokens),
+      reserveTokens: asNumber(row.reserve_tokens),
+      spentTokens: asNumber(row.spent_tokens),
+      calls: asNumber(row.calls),
+      reservations: parseJson<Record<string, number>>(row.reservations_json, {}),
+      status: 'active',
+      updatedAt: asString(row.updated_at),
+      expiresAt: asString(row.expires_at),
+      completedAt: row.completed_at ? asString(row.completed_at) : undefined,
+    };
+  }
+
+  saveTokenGovernor(record: TokenGovernorStoreRecord): void {
+    this.db.prepare(`
+      INSERT INTO token_governors(
+        budget_id, limit_tokens, reserve_tokens, spent_tokens, calls,
+        reservations_json, status, updated_at, expires_at, completed_at
+      ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(budget_id) DO UPDATE SET
+        limit_tokens = excluded.limit_tokens,
+        reserve_tokens = excluded.reserve_tokens,
+        spent_tokens = excluded.spent_tokens,
+        calls = excluded.calls,
+        reservations_json = excluded.reservations_json,
+        status = excluded.status,
+        updated_at = excluded.updated_at,
+        expires_at = excluded.expires_at,
+        completed_at = excluded.completed_at
+    `).run(
+      record.budgetId,
+      record.limitTokens,
+      record.reserveTokens,
+      record.spentTokens,
+      record.calls,
+      json(record.reservations),
+      record.status,
+      record.updatedAt,
+      record.expiresAt,
+      record.completedAt || null,
+    );
+  }
+
+  completeTokenGovernor(budgetId: string, completedAt = new Date().toISOString()): void {
+    const retention = new Date(Date.parse(completedAt) + 30 * 24 * 60 * 60 * 1_000).toISOString();
+    this.db.prepare(`
+      UPDATE token_governors
+      SET status = 'completed', reservations_json = '{}', updated_at = ?, completed_at = ?, expires_at = ?
+      WHERE budget_id = ?
+    `).run(completedAt, completedAt, retention, budgetId);
+  }
+
+  pruneTokenGovernors(now = new Date().toISOString()): number {
+    return Number(this.db.prepare('DELETE FROM token_governors WHERE expires_at <= ?').run(now).changes);
   }
 
   saveSession(input: RuntimeSessionState): RuntimeSessionState {

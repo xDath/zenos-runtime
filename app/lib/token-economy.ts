@@ -1,6 +1,7 @@
 import * as crypto from 'node:crypto';
 import { z } from 'zod';
 import { incrementMetric, setGauge } from './metrics';
+import { getRuntimeStore } from './zenos-runtime-store';
 import { RiskLevelSchema, RouteDecision, RuntimeContextSchema, TaskTypeSchema } from './zenos-runtime';
 
 export const RuntimeRoleSchema = z.enum(['worker', 'host', 'verifier', 'boss']);
@@ -33,9 +34,51 @@ export type TokenBudgetPlan = z.infer<typeof TokenBudgetPlanSchema>;
 
 export type TokenUsageByRole = Record<RuntimeRole, { input: number; output: number; calls: number }>;
 
-let tokenEstimatorScale = Math.max(0.65, Math.min(1.8, Number(process.env.ZENOS_TOKEN_ESTIMATOR_SCALE || '1')));
-let tokenEstimatorSamples = 0;
-let tokenEstimatorMeanAbsoluteError = 0;
+type EstimatorState = { scale: number; samples: number; meanAbsoluteError: number };
+const DEFAULT_ESTIMATOR_KEY = 'default';
+const estimatorStates = new Map<string, EstimatorState>();
+let estimatorsLoaded = false;
+
+function defaultEstimator(): EstimatorState {
+  return {
+    scale: Math.max(0.65, Math.min(1.8, Number(process.env.ZENOS_TOKEN_ESTIMATOR_SCALE || '1'))),
+    samples: 0,
+    meanAbsoluteError: 0,
+  };
+}
+
+function loadEstimators(): void {
+  if (estimatorsLoaded) return;
+  estimatorsLoaded = true;
+  try {
+    const raw = getRuntimeStore().getMetaValue('token_estimator_v2');
+    const parsed = raw ? JSON.parse(raw) as Record<string, EstimatorState> : {};
+    for (const [model, state] of Object.entries(parsed)) {
+      if (!state || !Number.isFinite(state.scale) || !Number.isFinite(state.samples)) continue;
+      estimatorStates.set(model, {
+        scale: Math.max(0.65, Math.min(1.8, state.scale)),
+        samples: Math.max(0, Math.round(state.samples)),
+        meanAbsoluteError: Math.max(0, Number(state.meanAbsoluteError || 0)),
+      });
+    }
+  } catch {
+    // Start with a conservative estimator if a previous calibration is unreadable.
+  }
+}
+
+function estimatorFor(model = DEFAULT_ESTIMATOR_KEY): EstimatorState {
+  loadEstimators();
+  const key = model.trim() || DEFAULT_ESTIMATOR_KEY;
+  const current = estimatorStates.get(key);
+  if (current) return current;
+  const created = defaultEstimator();
+  estimatorStates.set(key, created);
+  return created;
+}
+
+function persistEstimators(): void {
+  getRuntimeStore().setMetaValue('token_estimator_v2', JSON.stringify(Object.fromEntries(estimatorStates)));
+}
 
 function baseTokenEstimate(text: string): number {
   if (!text) return 0;
@@ -44,38 +87,36 @@ function baseTokenEstimate(text: string): number {
   return Math.max(1, Math.ceil(ascii / 4 + nonAscii / 2.2));
 }
 
-export function estimateTokenCount(text: string): number {
+export function estimateTokenCount(text: string, model = DEFAULT_ESTIMATOR_KEY): number {
   const base = baseTokenEstimate(text);
-  return base ? Math.max(1, Math.ceil(base * tokenEstimatorScale)) : 0;
+  return base ? Math.max(1, Math.ceil(base * estimatorFor(model).scale)) : 0;
 }
 
-export function recordTokenEstimateCalibration(estimatedTokens: number, actualTokens: number): void {
+export function recordTokenEstimateCalibration(estimatedTokens: number, actualTokens: number, model = DEFAULT_ESTIMATOR_KEY): void {
+  const state = estimatorFor(model);
   const estimated = Math.max(0, estimatedTokens);
   const actual = Math.max(0, actualTokens);
   if (estimated < 128 || actual < 128) return;
   const ratio = Math.max(0.5, Math.min(2, actual / estimated));
-  const alpha = tokenEstimatorSamples < 8 ? 0.16 : 0.06;
-  tokenEstimatorScale = Math.max(0.65, Math.min(1.8, tokenEstimatorScale * (1 - alpha + alpha * ratio)));
+  const alpha = state.samples < 8 ? 0.16 : 0.06;
+  state.scale = Math.max(0.65, Math.min(1.8, state.scale * (1 - alpha + alpha * ratio)));
   const absoluteError = Math.abs(actual - estimated) / actual;
-  tokenEstimatorSamples += 1;
-  tokenEstimatorMeanAbsoluteError += (absoluteError - tokenEstimatorMeanAbsoluteError) / tokenEstimatorSamples;
-  setGauge('runtime_token_estimator_scale', tokenEstimatorScale);
-  setGauge('runtime_token_estimator_mean_absolute_error', tokenEstimatorMeanAbsoluteError);
-  incrementMetric('runtime_token_estimator_samples_total');
+  state.samples += 1;
+  state.meanAbsoluteError += (absoluteError - state.meanAbsoluteError) / state.samples;
+  persistEstimators();
+  setGauge('runtime_token_estimator_scale', state.scale, { model });
+  setGauge('runtime_token_estimator_mean_absolute_error', state.meanAbsoluteError, { model });
+  incrementMetric('runtime_token_estimator_samples_total', { model });
 }
 
-export function tokenEstimatorSnapshot(): { scale: number; samples: number; meanAbsoluteError: number } {
-  return {
-    scale: tokenEstimatorScale,
-    samples: tokenEstimatorSamples,
-    meanAbsoluteError: tokenEstimatorMeanAbsoluteError,
-  };
+export function tokenEstimatorSnapshot(model = DEFAULT_ESTIMATOR_KEY): EstimatorState {
+  return { ...estimatorFor(model) };
 }
 
 export function resetTokenEstimatorForTests(): void {
-  tokenEstimatorScale = 1;
-  tokenEstimatorSamples = 0;
-  tokenEstimatorMeanAbsoluteError = 0;
+  estimatorsLoaded = true;
+  estimatorStates.clear();
+  estimatorStates.set(DEFAULT_ESTIMATOR_KEY, { scale: 1, samples: 0, meanAbsoluteError: 0 });
 }
 
 function riskMultiplier(risk: z.infer<typeof RiskLevelSchema>): number {
@@ -130,6 +171,8 @@ export function createTokenBudgetPlan(
     ? highAssurance ? 12_000 : 10_500
     : decision.useWorker && decision.useVerifier
       ? highAssurance ? 9_000 : 8_000
+      : decision.useBoss
+        ? highAssurance ? 7_000 : 6_000
       : 2_500;
   const totalTokens = bounded(
     Math.max(
@@ -235,7 +278,7 @@ export function truncateToTokenBudget(text: string, maxTokens: number, marker = 
 
   const segments = contextSegments(text);
   if (segments.length === 1) {
-    const maxChars = Math.max(64, Math.floor((budget / Math.max(0.65, tokenEstimatorScale)) * 3.1));
+    const maxChars = Math.max(64, Math.floor((budget / Math.max(0.65, estimatorFor().scale)) * 3.1));
     const available = Math.max(32, maxChars - marker.length);
     const headChars = Math.max(16, Math.floor(available * 0.5));
     const tailChars = Math.max(16, available - headChars);
@@ -256,7 +299,7 @@ export function truncateToTokenBudget(text: string, maxTokens: number, marker = 
   }
 
   if (selected.size === 0) {
-    const maxChars = Math.max(64, Math.floor((budget / Math.max(0.65, tokenEstimatorScale)) * 3.1));
+    const maxChars = Math.max(64, Math.floor((budget / Math.max(0.65, estimatorFor().scale)) * 3.1));
     const available = Math.max(32, maxChars - marker.length);
     const headChars = Math.max(16, Math.floor(available * 0.5));
     const tailChars = Math.max(16, available - headChars);
@@ -285,7 +328,7 @@ export function truncateToTokenBudget(text: string, maxTokens: number, marker = 
   }
   if (estimateTokenCount(rendered) <= budget) return rendered;
 
-  const maxChars = Math.max(64, Math.floor((budget / Math.max(0.65, tokenEstimatorScale)) * 3.1));
+  const maxChars = Math.max(64, Math.floor((budget / Math.max(0.65, estimatorFor().scale)) * 3.1));
   const available = Math.max(32, maxChars - marker.length);
   const headChars = Math.max(16, Math.floor(available * 0.5));
   const tailChars = Math.max(16, available - headChars);

@@ -122,3 +122,12 @@ export type GatewayTurnReceipt = {
   boss: { model?: string; provider?: string; invoked: boolean; verdict?: string; ok?: boolean };
   transformed: boolean;
 };
+
+export const GatewayHostBudgetSchema = z.object({
+  budgetId: z.string(),
+  reservationId: z.string(),
+  reservedTokens: z.number().int().nonnegative(),
+  maxCalls: z.number().int().positive(),
+  maxOutputTokens: z.number().int().positive(),
+  accounting: z.literal('uncached-input-plus-cache-write-plus-output'),
+});

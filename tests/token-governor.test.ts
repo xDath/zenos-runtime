@@ -5,9 +5,11 @@ import { createTokenBudgetPlan } from '../app/lib/token-economy';
 import {
   authorizeTokenSpend,
   completeTokenBudget,
+  resetTokenGovernorProcessCacheForTests,
   settleTokenSpend,
   tokenGovernorSnapshot,
 } from '../app/lib/token-governor';
+import { resetRuntimeStoreForTests } from '../app/lib/zenos-runtime-store';
 
 function plan(id: string) {
   const context = RuntimeContextSchema.parse({
@@ -76,5 +78,33 @@ test('optional calls preserve final-answer reserve while mandatory calls may con
   });
   assert.equal(settled.calls, 1);
   assert.equal(settled.spentTokens, 1_000);
+  completeTokenBudget(budget.budgetId);
+});
+
+test('governor reservations and spend survive a process-cache reset', () => {
+  resetRuntimeStoreForTests(':memory:');
+  const budget = plan('budget-durable-process-restart');
+  const authorization = authorizeTokenSpend({
+    plan: budget,
+    requestId: 'host-before-restart',
+    role: 'host',
+    estimatedTokens: 2_000,
+    mandatory: true,
+  });
+  assert.equal(authorization.allowed, true);
+
+  resetTokenGovernorProcessCacheForTests();
+  const restored = tokenGovernorSnapshot(budget);
+  assert.equal(restored.reservedTokens, 2_000);
+
+  const settled = settleTokenSpend({
+    plan: budget,
+    requestId: 'host-before-restart',
+    role: 'host',
+    actualTokens: 1_500,
+    attempted: true,
+  });
+  assert.equal(settled.reservedTokens, 0);
+  assert.equal(settled.spentTokens, 1_500);
   completeTokenBudget(budget.budgetId);
 });

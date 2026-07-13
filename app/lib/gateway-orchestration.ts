@@ -24,8 +24,8 @@ import {
 } from './zenos-runtime-three-agent';
 import { BossDecision, BossDecisionSchema } from './zenos-runtime-state';
 import { getRuntimeStore } from './zenos-runtime-store';
-import { createTokenBudgetPlan } from './token-economy';
-import { completeTokenBudget } from './token-governor';
+import { createTokenBudgetPlan, estimateTokenCount } from './token-economy';
+import { authorizeTokenSpend, completeTokenBudget, settleTokenSpend, tokenGovernorSnapshot } from './token-governor';
 import {
   GatewayMemoryBrief,
   GatewayTurnPostflightInput,
@@ -272,6 +272,25 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
     verifier: { ...baseBudget.verifier, timeoutMs: roleLatencyTimeout(latencyPlan, 'verifier') },
     boss: { ...baseBudget.boss, timeoutMs: roleLatencyTimeout(latencyPlan, 'boss') },
   };
+  const hostCallId = `${runId}:hermes-host`;
+  const hostReservationTokens = Math.min(
+    budget.host.inputTokens + budget.host.outputTokens,
+    estimateTokenCount([
+      request.request,
+      repositoryContext,
+      memoryBrief.context,
+    ].filter(Boolean).join('\n\n'), request.host.model) + budget.host.outputTokens,
+  );
+  const hostAuthorization = authorizeTokenSpend({
+    plan: budget,
+    requestId: hostCallId,
+    role: 'host',
+    estimatedTokens: hostReservationTokens,
+    mandatory: true,
+  });
+  if (!hostAuthorization.allowed) {
+    throw new Error(hostAuthorization.reason || 'Unable to reserve the mandatory Hermes Host token budget');
+  }
 
   let workerResult: WorkerResult | undefined;
   let workerCall: RuntimeModelResult | undefined;
@@ -366,7 +385,6 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
     );
   }
 
-  const hostCallId = `${runId}:hermes-host`;
   recordActivity(
     request.sessionId,
     'host',
@@ -425,6 +443,14 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
     decision,
     holdFinalDelivery,
     hostContext: renderHostContext(decision, hostPlan, workerResult, bossPreflight, memoryBrief, runId),
+    hostBudget: {
+      budgetId: budget.budgetId,
+      reservationId: hostCallId,
+      reservedTokens: hostReservationTokens,
+      maxCalls: budget.host.maxCalls,
+      maxOutputTokens: budget.host.outputTokens,
+      accounting: 'uncached-input-plus-cache-write-plus-output' as const,
+    },
     receipt: {
       pipeline: decision.pipelineMode,
       host: {
@@ -487,6 +513,15 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
     const parsed = stored.bossCall as RuntimeModelResult;
     if (parsed.role === 'boss') calls.push(parsed);
   }
+  const hostGovernor = settleTokenSpend({
+    plan: budget,
+    requestId: `${request.runId}:hermes-host`,
+    role: 'host',
+    actualTokens: request.hostUsage.inputTokens
+      + request.hostUsage.cacheWriteTokens
+      + request.hostUsage.outputTokens,
+    attempted: request.hostUsage.calls > 0,
+  });
 
   recordActivity(
     request.sessionId,
@@ -543,7 +578,7 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
     store.saveRun({
       ...run,
       status: 'failed',
-      result: { ...stored, finalAnswer: request.draft, failed: true },
+      result: { ...stored, finalAnswer: request.draft, failed: true, tokenBudget: hostGovernor },
       errors: ['Hermes Host reported a failed turn'],
       completedAt: now(),
     });
@@ -837,6 +872,7 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
     transformed,
   };
 
+  const finalTokenBudget = tokenGovernorSnapshot(budget);
   store.saveRun({
     ...run,
     status: bossDecision?.verdict === 'block' || verifierResult?.verdict === 'block' ? 'blocked' : 'done',
@@ -847,6 +883,7 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
       bossDecision,
       receipt,
       modelCalls: calls,
+      tokenBudget: finalTokenBudget,
     },
     errors: [],
     completedAt: now(),
@@ -887,5 +924,6 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
     receipt,
     verifier: verifierResult,
     boss: bossDecision,
+    tokenBudget: finalTokenBudget,
   };
 }

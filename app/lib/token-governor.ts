@@ -1,5 +1,6 @@
 import { incrementMetric, setGauge } from './metrics';
 import type { RuntimeRole, TokenBudgetPlan } from './token-economy';
+import { getRuntimeStore } from './zenos-runtime-store';
 
 export type TokenGovernorSnapshot = {
   budgetId: string;
@@ -27,6 +28,26 @@ function cleanup(now = Date.now()): void {
   for (const [id, state] of governors) {
     if (now - state.updatedAt > STATE_TTL_MS) governors.delete(id);
   }
+  try {
+    getRuntimeStore().pruneTokenGovernors(new Date(now).toISOString());
+  } catch {
+    // The in-memory guard remains fail-safe if persistence is temporarily unavailable.
+  }
+}
+
+function persistState(id: string, state: GovernorState): void {
+  const updatedAt = new Date(state.updatedAt).toISOString();
+  getRuntimeStore().saveTokenGovernor({
+    budgetId: id,
+    limitTokens: state.limitTokens,
+    reserveTokens: state.reserveTokens,
+    spentTokens: state.spentTokens,
+    calls: state.calls,
+    reservations: Object.fromEntries(state.reservations),
+    status: 'active',
+    updatedAt,
+    expiresAt: new Date(state.updatedAt + STATE_TTL_MS).toISOString(),
+  });
 }
 
 function stateFor(plan: TokenBudgetPlan): GovernorState {
@@ -38,6 +59,20 @@ function stateFor(plan: TokenBudgetPlan): GovernorState {
     current.updatedAt = Date.now();
     return current;
   }
+  const persisted = getRuntimeStore().getTokenGovernor(plan.budgetId);
+  if (persisted && Date.parse(persisted.expiresAt) > Date.now()) {
+    const restored: GovernorState = {
+      limitTokens: Math.max(persisted.limitTokens, plan.totalTokens),
+      reserveTokens: Math.max(persisted.reserveTokens, plan.reserveTokens),
+      spentTokens: persisted.spentTokens,
+      calls: persisted.calls,
+      updatedAt: Date.now(),
+      reservations: new Map(Object.entries(persisted.reservations)),
+    };
+    governors.set(plan.budgetId, restored);
+    persistState(plan.budgetId, restored);
+    return restored;
+  }
   const created: GovernorState = {
     limitTokens: plan.totalTokens,
     reserveTokens: plan.reserveTokens,
@@ -47,6 +82,7 @@ function stateFor(plan: TokenBudgetPlan): GovernorState {
     reservations: new Map(),
   };
   governors.set(plan.budgetId, created);
+  persistState(plan.budgetId, created);
   return created;
 }
 
@@ -81,6 +117,7 @@ export function authorizeTokenSpend(input: {
   }
   state.reservations.set(input.requestId, estimate);
   state.updatedAt = Date.now();
+  persistState(input.plan.budgetId, state);
   setGauge('runtime_token_governor_remaining_tokens', remainingTokens - estimate, {
     budget: input.plan.budgetId,
   });
@@ -103,6 +140,7 @@ export function settleTokenSpend(input: {
     incrementMetric('runtime_token_governor_spent_total', { role: input.role }, actual);
   }
   state.updatedAt = Date.now();
+  persistState(input.plan.budgetId, state);
   return tokenGovernorSnapshot(input.plan);
 }
 
@@ -121,5 +159,10 @@ export function tokenGovernorSnapshot(plan: TokenBudgetPlan): TokenGovernorSnaps
 }
 
 export function completeTokenBudget(budgetId: string): void {
+  getRuntimeStore().completeTokenGovernor(budgetId);
   governors.delete(budgetId);
+}
+
+export function resetTokenGovernorProcessCacheForTests(): void {
+  governors.clear();
 }

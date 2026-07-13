@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import { gzipSync, gunzipSync } from 'node:zlib';
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   readdirSync,
   readFileSync,
@@ -11,6 +12,22 @@ import {
   writeFileSync,
 } from 'node:fs';
 import path from 'node:path';
+
+const credentialDirectory = process.env.CREDENTIALS_DIRECTORY || '';
+const credentialFile = credentialDirectory ? path.join(credentialDirectory, 'zenos-runtime.env') : '';
+if (credentialFile && existsSync(credentialFile)) {
+  for (const sourceLine of readFileSync(credentialFile, 'utf8').split(/\r?\n/)) {
+    const line = sourceLine.trim();
+    if (!line || line.startsWith('#')) continue;
+    const separator = line.indexOf('=');
+    if (separator <= 0) continue;
+    const key = line.slice(0, separator).trim().replace(/^export\s+/, '');
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) || process.env[key]) continue;
+    let value = line.slice(separator + 1).trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) value = value.slice(1, -1);
+    process.env[key] = value;
+  }
+}
 
 const baseUrl = (process.env.ZENOS_MEMORY_BASE_URL || process.env.ZENOS_MEMORY_URL || 'https://zenos-memory.vercel.app').replace(/\/$/, '');
 const namespace = process.env.ZENOS_MEMORY_NAMESPACE || 'zenos';

@@ -655,7 +655,7 @@ export async function callRuntimeModel(
     content: truncateToTokenBudget(message.content, perMessageBudget),
   }));
   const prompt = boundedMessages.map((message) => `${message.role}: ${message.content}`).join('\n');
-  const inputEstimate = estimateTokenCount(prompt);
+  const inputEstimate = estimateTokenCount(prompt, config.model);
   const requestId = options.requestId || crypto.randomUUID();
   const requestedOutputTokens = Math.min(
     Math.max(options.maxTokens || (role === 'host' ? 2_400 : 1_400), 64),
@@ -714,6 +714,7 @@ export async function callRuntimeModel(
       recordTokenEstimateCalibration(
         inputEstimate,
         result.usage.inputTokens + (result.usage.cacheReadTokens || 0) + (result.usage.cacheWriteTokens || 0),
+        config.model,
       );
     }
     if (options.tokenBudgetPlan && governorAuthorized) {
@@ -721,7 +722,9 @@ export async function callRuntimeModel(
         plan: options.tokenBudgetPlan,
         requestId,
         role,
-        actualTokens: result.usage.totalTokens || (result.attempts > 0 ? inputEstimate : 0),
+        actualTokens: result.attempts > 0
+          ? result.usage.inputTokens + (result.usage.cacheWriteTokens || 0) + result.usage.outputTokens
+          : 0,
         attempted: result.attempts > 0,
       });
     }

@@ -65,7 +65,7 @@ export default function Home() {
     <main className="shell">
       <nav className="topbar" aria-label="Zenos Runtime identity">
         <span className="wordmark"><i /> ZENOS RUNTIME</span>
-        <span className="version">CONTROL PLANE · V0.5</span>
+        <span className="version">CONTROL PLANE · V0.6</span>
       </nav>
 
       <section className="hero">

@@ -1,7 +1,7 @@
 [Unit]
-Description=Encrypted secondary backup for Zenos Memory
-After=network-online.target zenos-runtime.service
-Wants=network-online.target
+Description=Encrypted verified backup for Zenos Runtime
+After=zenos-runtime.service
+Requires=zenos-runtime.service
 
 [Service]
 Type=oneshot
@@ -11,11 +11,13 @@ WorkingDirectory=/opt/zenos-runtime/current
 LoadCredentialEncrypted=zenos-runtime.env:/etc/credstore.encrypted/zenos-runtime.env.cred
 Environment=HOME=/var/lib/zenos-runtime
 Environment=NODE_ENV=production
-Environment=ZENOS_MEMORY_SECONDARY_BACKUP_DIR=/var/backups/zenos-memory
-Environment=ZENOS_MEMORY_SECONDARY_BACKUP_KEEP=14
-ExecStart=/usr/bin/node /opt/zenos-runtime/current/scripts/backup-zenos-memory.mjs
+Environment=ZENOS_RUNTIME_DB_PATH=/var/lib/zenos-runtime/runtime.db
+Environment=ZENOS_RUNTIME_BACKUP_DIR=/var/backups/zenos-runtime
+Environment=ZENOS_RUNTIME_BACKUP_KEEP=14
+ExecStart=/usr/bin/node /opt/zenos-runtime/current/scripts/backup-zenos-runtime.mjs
 UMask=0077
 NoNewPrivileges=true
+CapabilityBoundingSet=
 PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
@@ -23,9 +25,9 @@ ProtectHome=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
-ReadOnlyPaths=/opt/zenos-runtime/current /etc/zenos-runtime
-ReadWritePaths=/var/backups/zenos-memory
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadOnlyPaths=/opt/zenos-runtime/current /etc/zenos-runtime /var/lib/zenos-runtime
+ReadWritePaths=/var/backups/zenos-runtime
+RestrictAddressFamilies=AF_UNIX
 RestrictNamespaces=true
 RestrictSUIDSGID=true
 LockPersonality=true
@@ -33,4 +35,4 @@ SystemCallArchitectures=native
 TimeoutStartSec=120
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=zenos-memory-backup
+SyslogIdentifier=zenos-runtime-backup

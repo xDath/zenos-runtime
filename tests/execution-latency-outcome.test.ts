@@ -171,7 +171,7 @@ test('Outcome Passport is immutable, revisioned, and keeps shadow routing observ
   assert.deepEqual(records.map((item) => item.revision).sort(), [1, 2]);
   assert.notEqual(records[0].outcomeId, records[1].outcomeId);
   const analytics = buildOutcomeAnalytics(records);
-  assert.equal(getRuntimeStore().health().schemaVersion, 4);
+  assert.ok(getRuntimeStore().health().schemaVersion >= 5);
   assert.equal(analytics.mode, 'shadow-only');
   assert.equal(analytics.automaticPromotionAllowed, false);
   assert.equal(analytics.routes[0]?.sampleSize, 1);

@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily encrypted backup for Zenos Runtime
+
+[Timer]
+OnCalendar=*-*-* 03:45:00
+Persistent=true
+RandomizedDelaySec=900
+Unit=zenos-runtime-backup.service
+
+[Install]
+WantedBy=timers.target
