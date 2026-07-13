@@ -16,7 +16,9 @@ fi
 
 VERSION="$(node -p "require('./package.json').version")"
 COMMIT="$(git rev-parse --short=12 HEAD 2>/dev/null || printf 'uncommitted')"
-RELEASE_ROOT="/opt/zenos-runtime/releases/${VERSION}-${COMMIT}"
+BUILD_ID="$(tr -cd 'A-Za-z0-9._-' < .next/BUILD_ID | cut -c1-32)"
+[[ -n "${BUILD_ID}" ]] || BUILD_ID="build-$(date +%s)"
+RELEASE_ROOT="/opt/zenos-runtime/releases/${VERSION}-${COMMIT}-${BUILD_ID}"
 STAGING="${RELEASE_ROOT}.staging"
 SERVICE_USER="zenos-runtime"
 SERVICE_GROUP="zenos-runtime"
