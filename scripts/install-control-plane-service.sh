@@ -78,10 +78,18 @@ copy_secret_file /root/.hermes/profiles/zenos/zenos-runtime.json /etc/zenos-runt
 install -o root -g root -m 0644 "${SOURCE_ROOT}/zenos-runtime.service" /etc/systemd/system/zenos-runtime.service
 install -o root -g root -m 0644 "${SOURCE_ROOT}/zenos-memory-secondary-backup.service" /etc/systemd/system/zenos-memory-secondary-backup.service
 install -o root -g root -m 0644 "${SOURCE_ROOT}/zenos-memory-secondary-backup.timer" /etc/systemd/system/zenos-memory-secondary-backup.timer
+HERMES_ZENOS_UNIT=/usr/local/lib/hermes-agent/deploy/hermes-gateway-zenos.service
+if [[ -f "${HERMES_ZENOS_UNIT}" ]]; then
+  install -o root -g root -m 0644 "${HERMES_ZENOS_UNIT}" /etc/systemd/system/hermes-gateway.service
+fi
 systemctl daemon-reload
 systemctl enable zenos-runtime.service zenos-memory-secondary-backup.timer >/dev/null
 systemctl restart zenos-runtime.service
 systemctl start zenos-memory-secondary-backup.timer
+if [[ -f "${HERMES_ZENOS_UNIT}" ]]; then
+  systemctl enable hermes-gateway.service >/dev/null
+  systemctl restart hermes-gateway.service
+fi
 
 printf 'Installed Zenos Runtime %s (%s) at %s\n' "${VERSION}" "${COMMIT}" "${RELEASE_ROOT}"
 systemctl --no-pager --full status zenos-runtime.service
