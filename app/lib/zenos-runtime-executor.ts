@@ -1034,6 +1034,7 @@ Apply every required change that is supported. Remove unsupported claims. Do not
     modelOverrides: input.modelOverrides,
     requestId: options.requestId,
     tokenBudgetPlan: options.budget,
+    mandatory: true,
   });
 }
 

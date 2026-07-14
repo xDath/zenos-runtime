@@ -1,8 +1,11 @@
 #!/usr/bin/env node
 
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { resolve } from 'node:path';
+
+const runtimeVersion = JSON.parse(readFileSync(resolve('package.json'), 'utf8')).version;
 
 process.env.ZENOS_RUNTIME_DISABLE_MEMORY = 'true';
 process.env.ZENOS_RUNTIME_DISABLE_MEMORY_AUTO_RECALL = 'true';
@@ -134,4 +137,4 @@ assert.ok(models.workerModel, 'Worker model must resolve');
 assert.ok(models.bossModel, 'Boss model must resolve');
 assert.ok(models.verifierModel, 'Verifier model must resolve');
 
-console.log(`Zenos Runtime v0.5 smoke passed: ${report.total} routing cases, SQLite WAL state, canonical non-root control-plane boundary, latency budgets, Outcome Passports, Memory continuity, dry-run pipeline, route integration, and four role model slots.`);
+console.log(`Zenos Runtime v${runtimeVersion} smoke passed: ${report.total} routing cases, SQLite WAL state, canonical non-root control-plane boundary, latency budgets, Outcome Passports, Memory continuity, dry-run pipeline, route integration, and four role model slots.`);

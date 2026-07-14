@@ -107,6 +107,10 @@ export class RuntimeStore {
     this.configure();
     this.migrate();
     this.migrateLegacyJsonStore();
+    const recoveredRuns = this.reconcileAbandonedRuns();
+    if (recoveredRuns > 0) {
+      log('warn', 'Recovered abandoned Runtime runs after process restart', { recoveredRuns });
+    }
   }
 
   private configure(): void {
@@ -392,6 +396,33 @@ export class RuntimeStore {
       }
       throw error;
     }
+  }
+
+  reconcileAbandonedRuns(): number {
+    const abandoned = this.db.prepare(`
+      SELECT run_id, errors_json
+      FROM runtime_runs
+      WHERE status = 'running'
+    `).all().map((row) => ({
+      runId: asString(row.run_id),
+      errors: parseJson<string[]>(row.errors_json, []),
+    }));
+    if (abandoned.length === 0) return 0;
+
+    const completedAt = new Date().toISOString();
+    const update = this.db.prepare(`
+      UPDATE runtime_runs
+      SET status = 'failed', errors_json = ?, completed_at = ?
+      WHERE run_id = ? AND status = 'running'
+    `);
+    this.transaction(() => {
+      for (const run of abandoned) {
+        const message = 'Runtime process exited before this run completed.';
+        const errors = run.errors.includes(message) ? run.errors : [...run.errors, message];
+        update.run(json(errors), completedAt, run.runId);
+      }
+    });
+    return abandoned.length;
   }
 
   getMetaValue(key: string): string | undefined {

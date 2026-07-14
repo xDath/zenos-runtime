@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as crypto from 'node:crypto';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import {
   choosePipeline,
   runRuntimeEval,
@@ -14,7 +17,7 @@ import {
   runQualityGate,
 } from '../app/lib/zenos-runtime-three-agent';
 import { authorizeRequest, issueScopedToken } from '../app/lib/auth';
-import { getRuntimeStore, resetRuntimeStoreForTests } from '../app/lib/zenos-runtime-store';
+import { getRuntimeStore, resetRuntimeStoreForTests, RuntimeStore } from '../app/lib/zenos-runtime-store';
 import { runZenosPipeline } from '../app/lib/zenos-runtime-executor';
 import { OutcomePassportSchema } from '../app/lib/outcome-ledger';
 
@@ -130,6 +133,31 @@ test('SQLite store persists session, workers, events, and quality-gate state tra
   });
   assert.equal(gate.needsBoss, true);
   assert.equal(gate.verdict, 'escalate');
+});
+
+test('Runtime store marks runs abandoned by a process restart as failed', () => {
+  const directory = mkdtempSync(path.join(tmpdir(), 'zenos-runtime-recovery-'));
+  const databasePath = path.join(directory, 'runtime.db');
+  try {
+    const firstProcess = new RuntimeStore(databasePath);
+    firstProcess.saveRun({
+      runId: 'run_abandoned_test',
+      requestHash: 'request-hash',
+      status: 'running',
+      errors: [],
+      startedAt: new Date(Date.now() - 60_000).toISOString(),
+    });
+    firstProcess.close();
+
+    const restartedProcess = new RuntimeStore(databasePath);
+    const recovered = restartedProcess.getRun('run_abandoned_test');
+    assert.equal(recovered?.status, 'failed');
+    assert.ok(recovered?.completedAt);
+    assert.match(recovered?.errors.join(' ') || '', /process exited/i);
+    restartedProcess.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test('idempotency claims replay exact responses and reject conflicting bodies', () => {

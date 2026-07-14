@@ -1,0 +1,48 @@
+[Unit]
+Description=Hermes Agent Gateway - Zenos Profile
+After=network-online.target zenos-runtime.service zenos-memory.service
+Wants=network-online.target zenos-runtime.service zenos-memory.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=hermes
+Group=hermes
+WorkingDirectory=/usr/local/lib/hermes-agent
+Environment=HOME=/var/lib/hermes
+Environment=USER=hermes
+Environment=LOGNAME=hermes
+Environment=PATH=/usr/local/lib/hermes-agent/venv/bin:/usr/local/lib/hermes-agent/node_modules/.bin:/usr/local/bin:/usr/bin:/bin
+Environment=VIRTUAL_ENV=/usr/local/lib/hermes-agent/venv
+Environment=HERMES_HOME=/var/lib/hermes/.hermes/profiles/zenos
+LoadCredentialEncrypted=hermes-zenos.env:/etc/credstore.encrypted/hermes-zenos.env.cred
+ExecStart=/usr/local/lib/hermes-agent/venv/bin/python /usr/local/lib/hermes-agent/scripts/run_gateway_with_credential.py
+Restart=always
+RestartSec=5
+RestartForceExitStatus=75
+KillMode=mixed
+KillSignal=SIGTERM
+ExecReload=/bin/kill -USR1 $MAINPID
+ExecStopPost=-/usr/local/lib/hermes-agent/venv/bin/python -m gateway.cgroup_cleanup
+TimeoutStopSec=210
+UMask=0077
+StateDirectory=hermes
+StateDirectoryMode=0700
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHostname=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

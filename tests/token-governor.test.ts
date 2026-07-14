@@ -81,6 +81,52 @@ test('optional calls preserve final-answer reserve while mandatory calls may con
   completeTokenBudget(budget.budgetId);
 });
 
+test('Boss-requested Host revision may consume the final-answer reserve', () => {
+  const budget = plan('budget-boss-revision-reserve');
+  const optionalCeiling = budget.totalTokens - budget.reserveTokens;
+  const prior = authorizeTokenSpend({
+    plan: budget,
+    requestId: 'prior-required-calls',
+    role: 'host',
+    estimatedTokens: optionalCeiling - 4_820,
+    mandatory: true,
+  });
+  assert.equal(prior.allowed, true);
+  settleTokenSpend({
+    plan: budget,
+    requestId: 'prior-required-calls',
+    role: 'host',
+    actualTokens: optionalCeiling - 4_820,
+    attempted: true,
+  });
+
+  const optionalRevision = authorizeTokenSpend({
+    plan: budget,
+    requestId: 'boss-revision-optional',
+    role: 'host',
+    estimatedTokens: 4_884,
+  });
+  assert.equal(optionalRevision.allowed, false);
+  assert.equal(optionalRevision.remainingTokens, 4_820);
+
+  const requiredRevision = authorizeTokenSpend({
+    plan: budget,
+    requestId: 'boss-revision-required',
+    role: 'host',
+    estimatedTokens: 4_884,
+    mandatory: true,
+  });
+  assert.equal(requiredRevision.allowed, true);
+  settleTokenSpend({
+    plan: budget,
+    requestId: 'boss-revision-required',
+    role: 'host',
+    actualTokens: 4_000,
+    attempted: true,
+  });
+  completeTokenBudget(budget.budgetId);
+});
+
 test('governor reservations and spend survive a process-cache reset', () => {
   resetRuntimeStoreForTests(':memory:');
   const budget = plan('budget-durable-process-restart');

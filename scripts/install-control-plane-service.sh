@@ -73,19 +73,26 @@ ln -sfn "${RELEASE_ROOT}" /opt/zenos-runtime/current
 
 install -d -o root -g root -m 0700 /etc/credstore.encrypted
 CREDENTIAL_TMP="$(mktemp)"
+HERMES_CREDENTIAL_TMP="$(mktemp)"
 SANITIZED_CONFIG_TMP="$(mktemp)"
 SANITIZED_MODELS_TMP="$(mktemp)"
 SANITIZED_HERMES_CONFIG_TMP="$(mktemp)"
 EXISTING_CREDENTIAL_TMP="$(mktemp)"
+EXISTING_HERMES_CREDENTIAL_TMP="$(mktemp)"
 cleanup() {
-  rm -f "${CREDENTIAL_TMP}" "${SANITIZED_CONFIG_TMP}" "${SANITIZED_MODELS_TMP}" \
-    "${SANITIZED_HERMES_CONFIG_TMP}" "${EXISTING_CREDENTIAL_TMP}"
+  rm -f "${CREDENTIAL_TMP}" "${HERMES_CREDENTIAL_TMP}" "${SANITIZED_CONFIG_TMP}" \
+    "${SANITIZED_MODELS_TMP}" "${SANITIZED_HERMES_CONFIG_TMP}" \
+    "${EXISTING_CREDENTIAL_TMP}" "${EXISTING_HERMES_CREDENTIAL_TMP}"
 }
 trap cleanup EXIT
 
 if [[ -s /etc/credstore.encrypted/zenos-runtime.env.cred ]]; then
   systemd-creds decrypt --name=zenos-runtime.env \
     /etc/credstore.encrypted/zenos-runtime.env.cred "${EXISTING_CREDENTIAL_TMP}" >/dev/null
+fi
+if [[ -s /etc/credstore.encrypted/hermes-zenos.env.cred ]]; then
+  systemd-creds decrypt --name=hermes-zenos.env \
+    /etc/credstore.encrypted/hermes-zenos.env.cred "${EXISTING_HERMES_CREDENTIAL_TMP}" >/dev/null
 fi
 
 python3 "${SOURCE_ROOT}/scripts/prepare-runtime-service-files.py" \
@@ -95,15 +102,21 @@ python3 "${SOURCE_ROOT}/scripts/prepare-runtime-service-files.py" \
   "${SANITIZED_MODELS_TMP}" \
   "${HERMES_PROFILE_ROOT}/zenos-runtime.json" \
   "${SANITIZED_HERMES_CONFIG_TMP}" \
+  "${HERMES_CREDENTIAL_TMP}" \
   "${SOURCE_ROOT}/.env.local" \
   "${HERMES_PROFILE_ROOT}/.env" \
   /root/.hermes/.env \
-  "${EXISTING_CREDENTIAL_TMP}"
+  "${EXISTING_CREDENTIAL_TMP}" \
+  "${EXISTING_HERMES_CREDENTIAL_TMP}"
 
 rm -f /etc/credstore.encrypted/zenos-runtime.env.cred
 systemd-creds encrypt --with-key=host --name=zenos-runtime.env \
   "${CREDENTIAL_TMP}" /etc/credstore.encrypted/zenos-runtime.env.cred >/dev/null
 chmod 0600 /etc/credstore.encrypted/zenos-runtime.env.cred
+rm -f /etc/credstore.encrypted/hermes-zenos.env.cred
+systemd-creds encrypt --with-key=host --name=hermes-zenos.env \
+  "${HERMES_CREDENTIAL_TMP}" /etc/credstore.encrypted/hermes-zenos.env.cred >/dev/null
+chmod 0600 /etc/credstore.encrypted/hermes-zenos.env.cred
 rm -f /etc/zenos-runtime/runtime.env /etc/zenos-runtime/profile.env /etc/zenos-runtime/global.env
 install -o root -g "${SERVICE_GROUP}" -m 0640 \
   "${SANITIZED_CONFIG_TMP}" /etc/zenos-runtime/hermes-config.yaml
@@ -124,7 +137,7 @@ install -o root -g root -m 0644 "${SOURCE_ROOT}/zenos-memory-secondary-backup.se
 install -o root -g root -m 0644 "${SOURCE_ROOT}/zenos-memory-secondary-backup.timer" /etc/systemd/system/zenos-memory-secondary-backup.timer
 install -o root -g root -m 0644 "${SOURCE_ROOT}/zenos-runtime-backup.service" /etc/systemd/system/zenos-runtime-backup.service
 install -o root -g root -m 0644 "${SOURCE_ROOT}/zenos-runtime-backup.timer" /etc/systemd/system/zenos-runtime-backup.timer
-HERMES_ZENOS_UNIT=/usr/local/lib/hermes-agent/deploy/hermes-gateway-zenos.service
+HERMES_ZENOS_UNIT="${SOURCE_ROOT}/hermes-gateway-zenos.service"
 if [[ -f "${HERMES_ZENOS_UNIT}" ]]; then
   install -o root -g root -m 0644 "${HERMES_ZENOS_UNIT}" /etc/systemd/system/hermes-gateway.service
 fi
