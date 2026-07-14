@@ -10,7 +10,6 @@ import {
   publicModelSlots,
   readRuntimeModelSlots,
   readSessionModelSlots,
-  RuntimeModelSlot,
   RuntimeModelSlots,
   RuntimeModelSlotsSchema,
 } from './zenos-runtime-model-config';

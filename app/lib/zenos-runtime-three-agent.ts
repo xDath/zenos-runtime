@@ -4,7 +4,6 @@ import { choosePipeline, RuntimeContextSchema, WorkerFinding, WorkerFindingSchem
 import { RuntimeModelSlotsSchema } from './zenos-runtime-model-config';
 import { getRuntimeStore } from './zenos-runtime-store';
 import {
-  BossDecision,
   BossDecisionSchema,
   EscalationPacket,
   EscalationPacketSchema,
