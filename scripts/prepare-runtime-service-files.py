@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
 import sys
+import urllib.error
+import urllib.request
 from copy import deepcopy
+from functools import lru_cache
 from pathlib import Path
 
 import yaml
@@ -89,6 +93,69 @@ def runtime_provider(source: Path) -> tuple[str, dict]:
     return provider_name, provider
 
 
+ETLA_ROUTER_LOOPBACK_BASE_URL = "http://127.0.0.1:20128/v1"
+
+
+def normalized_base_url(value: str) -> str:
+    return str(value or "").strip().rstrip("/")
+
+
+def model_ids_from_payload(payload) -> list[str]:
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for entry in payload["data"]:
+        model_id = str(entry.get("id") if isinstance(entry, dict) else "").strip()
+        if model_id and model_id not in seen:
+            result.append(model_id)
+            seen.add(model_id)
+    return result
+
+
+@lru_cache(maxsize=8)
+def discover_etla_router_catalog(configured_base_url: str) -> tuple[str, tuple[str, ...]]:
+    override_base_url = normalized_base_url(os.environ.get("ZENOS_ROUTER_BASE_URL", ""))
+    configured = normalized_base_url(configured_base_url)
+    candidates: list[tuple[str, str]] = []
+    models_override = str(os.environ.get("ZENOS_ROUTER_MODELS_URL", "")).strip()
+    if models_override:
+        candidates.append((override_base_url or configured or ETLA_ROUTER_LOOPBACK_BASE_URL, models_override))
+    if override_base_url:
+        candidates.append((override_base_url, f"{override_base_url}/models"))
+    candidates.append((ETLA_ROUTER_LOOPBACK_BASE_URL, f"{ETLA_ROUTER_LOOPBACK_BASE_URL}/models"))
+    if configured and configured != ETLA_ROUTER_LOOPBACK_BASE_URL:
+        candidates.append((configured, f"{configured}/models"))
+
+    seen_urls: set[str] = set()
+    for base_url, models_url in candidates:
+        if not models_url or models_url in seen_urls:
+            continue
+        seen_urls.add(models_url)
+        try:
+            request = urllib.request.Request(
+                models_url,
+                headers={"Accept": "application/json", "User-Agent": "zenos-runtime-deployer/0.6"},
+            )
+            with urllib.request.urlopen(request, timeout=5) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            model_ids = model_ids_from_payload(payload)
+            if model_ids:
+                return normalized_base_url(base_url), tuple(model_ids)
+        except (OSError, TimeoutError, urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError):
+            continue
+    return configured or ETLA_ROUTER_LOOPBACK_BASE_URL, ()
+
+
+def runtime_provider_catalog(source: Path) -> tuple[str, dict, str, list[str]]:
+    provider_name, provider = runtime_provider(source)
+    configured_base_url = normalized_base_url(provider.get("base_url") or provider.get("url") or "")
+    if provider_name != "etla-router":
+        return provider_name, provider, configured_base_url, []
+    base_url, model_ids = discover_etla_router_catalog(configured_base_url)
+    return provider_name, provider, base_url, list(model_ids)
+
+
 RUNTIME_EXACT_ENVIRONMENT_KEYS = {
     "ETLA_CACHE_MAX_BYTES",
     "ETLA_CACHE_MAX_ENTRIES",
@@ -129,7 +196,7 @@ def prepare_runtime_environment(destination: Path, values: dict[str, str], confi
         for key, value in values.items()
         if key.startswith("ZENOS_") or key in RUNTIME_EXACT_ENVIRONMENT_KEYS
     }
-    _, provider = runtime_provider(config_source)
+    provider_name, provider, discovered_base_url, _ = runtime_provider_catalog(config_source)
     provider_credential = str(provider.get("api_key") or "").strip()
     if env_reference(provider_credential):
         provider_credential = resolved_environment_value(values, provider_credential[2:-1])
@@ -142,7 +209,7 @@ def prepare_runtime_environment(destination: Path, values: dict[str, str], confi
     if provider_credential and not resolved_environment_value(runtime_values, "ZENOS_LLM_API_KEY"):
         runtime_values["ZENOS_LLM_API_KEY"] = shlex.quote(provider_credential)
 
-    provider_base_url = str(provider.get("base_url") or provider.get("url") or "").strip()
+    provider_base_url = discovered_base_url or str(provider.get("base_url") or provider.get("url") or "").strip()
     if not resolved_environment_value(runtime_values, "ZENOS_LLM_BASE_URL"):
         fallback_base_url = (
             provider_base_url
@@ -174,7 +241,7 @@ def prepare_config(source: Path, destination: Path) -> None:
         return
     data = yaml.safe_load(source.read_text(encoding="utf-8")) or {}
     model = data.get("model") if isinstance(data.get("model"), dict) else {}
-    provider_name, provider = runtime_provider(source)
+    provider_name, provider, discovered_base_url, _ = runtime_provider_catalog(source)
     sanitized = {
         "model": {
             "default": model.get("default") or "grok",
@@ -183,7 +250,7 @@ def prepare_config(source: Path, destination: Path) -> None:
         },
         "providers": {
             provider_name: {
-                "base_url": provider.get("base_url") or provider.get("url") or "https://router.etla.me/v1",
+                "base_url": discovered_base_url or provider.get("base_url") or provider.get("url") or "https://router.etla.me/v1",
                 "default_model": provider.get("default_model") or model.get("default") or "grok",
             },
         },
@@ -198,6 +265,20 @@ def prepare_hermes_config(source: Path, destination: Path) -> None:
         destination.chmod(0o600)
         return
     data = yaml.safe_load(source.read_text(encoding="utf-8")) or {}
+    provider_name, _provider, discovered_base_url, discovered_models = runtime_provider_catalog(source)
+    providers = data.get("providers") if isinstance(data.get("providers"), dict) else {}
+    provider = providers.get(provider_name) if isinstance(providers.get(provider_name), dict) else None
+    if provider_name == "etla-router" and provider is not None:
+        provider["base_url"] = discovered_base_url or ETLA_ROUTER_LOOPBACK_BASE_URL
+        provider["discover_models"] = True
+        existing_models = provider.get("models") if isinstance(provider.get("models"), dict) else {}
+        if discovered_models:
+            provider["models"] = {
+                model_id: deepcopy(existing_models.get(model_id))
+                if isinstance(existing_models.get(model_id), dict)
+                else {"description": f"{model_id} - Etla Router"}
+                for model_id in discovered_models
+            }
     sanitized = replace_secret_literals(deepcopy(data))
     destination.write_text(yaml.safe_dump(sanitized, sort_keys=False, allow_unicode=True), encoding="utf-8")
     destination.chmod(0o600)

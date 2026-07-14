@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 
@@ -32,6 +33,7 @@ test('deployment prepares separate least-privilege Runtime and full Hermes crede
     const hermesConfig = path.join(directory, 'hermes-config.yaml');
     const hermesEnvironment = path.join(directory, 'hermes-zenos.env');
     const sourceEnvironment = path.join(directory, 'source.env');
+    const modelCatalog = path.join(directory, 'models.json');
 
     writeFileSync(sourceConfig, [
       'model:',
@@ -39,7 +41,7 @@ test('deployment prepares separate least-privilege Runtime and full Hermes crede
       '  provider: etla-router',
       'providers:',
       '  etla-router:',
-      '    base_url: http://127.0.0.1:20128/model',
+      '    base_url: https://router.etla.me/v1',
       '    default_model: grok',
       '    api_key: ${HERMES_CONFIG_PROVIDERS_ETLA_ROUTER_API_KEY}',
       'telegram:',
@@ -48,6 +50,14 @@ test('deployment prepares separate least-privilege Runtime and full Hermes crede
       '  private_key: ${PRIVATE_KEY}',
       '',
     ].join('\n'));
+    writeFileSync(modelCatalog, JSON.stringify({
+      object: 'list',
+      data: [
+        { id: 'deepseek', object: 'model', owned_by: 'combo' },
+        { id: 'dsw/deepseek-v4-pro', object: 'model', owned_by: 'dsw' },
+        { id: 'grok', object: 'model', owned_by: 'combo' },
+      ],
+    }));
     writeFileSync(modelInput, JSON.stringify({
       hostModel: 'grok',
       workerModel: 'build',
@@ -76,17 +86,27 @@ test('deployment prepares separate least-privilege Runtime and full Hermes crede
       hermesConfig,
       hermesEnvironment,
       sourceEnvironment,
-    ], { cwd: path.resolve('.'), encoding: 'utf8' });
+    ], {
+      cwd: path.resolve('.'),
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        ZENOS_ROUTER_BASE_URL: 'http://127.0.0.1:20128/v1',
+        ZENOS_ROUTER_MODELS_URL: pathToFileURL(modelCatalog).href,
+      },
+    });
 
     assert.equal(result.status, 0, result.stderr || result.stdout);
     const runtime = parseEnvironment(runtimeEnvironment);
     const hermes = parseEnvironment(hermesEnvironment);
+    const preparedRuntimeConfig = readFileSync(runtimeConfig, 'utf8');
+    const preparedHermesConfig = readFileSync(hermesConfig, 'utf8');
 
     assert.equal(runtime.ETLA_MASTER_SECRET, 'runtime-auth-secret');
     assert.equal(runtime.ZENOS_RUNTIME_API_KEY, 'runtime-api-secret');
     assert.equal(runtime.ZENOS_MEMORY_API_KEY, 'memory-api-secret');
     assert.equal(runtime.ZENOS_LLM_API_KEY, 'router-api-secret');
-    assert.equal(runtime.ZENOS_LLM_BASE_URL, 'http://127.0.0.1:20128/model');
+    assert.equal(runtime.ZENOS_LLM_BASE_URL, 'http://127.0.0.1:20128/v1');
     assert.equal(runtime.ZENOS_MEMORY_URL, 'http://127.0.0.1:3091');
 
     for (const forbidden of ['TELEGRAM_BOT_TOKEN', 'PRIVATE_KEY', 'MNEMONIC', 'X_PASSWORD']) {
@@ -94,6 +114,12 @@ test('deployment prepares separate least-privilege Runtime and full Hermes crede
       assert.ok(hermes[forbidden], `${forbidden} must remain available to Hermes`);
     }
     assert.equal(hermes.HERMES_CONFIG_PROVIDERS_ETLA_ROUTER_API_KEY, 'router-api-secret');
+    assert.match(preparedRuntimeConfig, /base_url: http:\/\/127\.0\.0\.1:20128\/v1/);
+    assert.match(preparedHermesConfig, /base_url: http:\/\/127\.0\.0\.1:20128\/v1/);
+    assert.match(preparedHermesConfig, /discover_models: true/);
+    assert.match(preparedHermesConfig, /\n\s+deepseek:\n/);
+    assert.match(preparedHermesConfig, /\n\s+dsw\/deepseek-v4-pro:\n/);
+    assert.doesNotMatch(preparedHermesConfig, /ag\/claude-opus-4-6-thinking/);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
