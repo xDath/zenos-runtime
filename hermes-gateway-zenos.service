@@ -15,8 +15,9 @@ Environment=LOGNAME=hermes
 Environment=PATH=/usr/local/lib/hermes-agent/venv/bin:/usr/local/lib/hermes-agent/node_modules/.bin:/usr/local/bin:/usr/bin:/bin
 Environment=VIRTUAL_ENV=/usr/local/lib/hermes-agent/venv
 Environment=HERMES_HOME=/var/lib/hermes/.hermes/profiles/zenos
+Environment=HERMES_CREDENTIAL_NAME=hermes-zenos.env
 LoadCredentialEncrypted=hermes-zenos.env:/etc/credstore.encrypted/hermes-zenos.env.cred
-ExecStart=/usr/local/lib/hermes-agent/venv/bin/python /usr/local/lib/hermes-agent/scripts/run_gateway_with_credential.py
+ExecStart=/usr/local/lib/hermes-agent/venv/bin/python /opt/zenos-runtime/current/scripts/run-hermes-gateway-with-credential.py
 Restart=always
 RestartSec=5
 RestartForceExitStatus=75

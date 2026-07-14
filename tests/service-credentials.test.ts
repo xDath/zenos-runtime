@@ -98,3 +98,13 @@ test('deployment prepares separate least-privilege Runtime and full Hermes crede
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test('Hermes gateway consumes only its dedicated credential bundle', () => {
+  const unit = readFileSync('hermes-gateway-zenos.service', 'utf8');
+  const launcher = readFileSync('scripts/run-hermes-gateway-with-credential.py', 'utf8');
+  assert.match(unit, /LoadCredentialEncrypted=hermes-zenos\.env:/);
+  assert.match(unit, /HERMES_CREDENTIAL_NAME=hermes-zenos\.env/);
+  assert.match(unit, /run-hermes-gateway-with-credential\.py/);
+  assert.match(launcher, /HERMES_CREDENTIAL_NAME/);
+  assert.doesNotMatch(unit, /LoadCredentialEncrypted=zenos-runtime\.env:/);
+});
