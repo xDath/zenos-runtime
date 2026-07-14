@@ -23,6 +23,14 @@ STAGING="${RELEASE_ROOT}.staging"
 PREVIOUS_RELEASE="$(readlink -f /opt/zenos-runtime/current 2>/dev/null || true)"
 SERVICE_USER="zenos-runtime"
 SERVICE_GROUP="zenos-runtime"
+HERMES_SERVICE_USER="hermes"
+HERMES_SERVICE_GROUP="hermes"
+HERMES_PROFILE_ROOT="${ZENOS_HERMES_PROFILE_ROOT:-/var/lib/hermes/.hermes/profiles/zenos}"
+LEGACY_HERMES_PROFILE_ROOT="/root/.hermes/profiles/zenos"
+
+if [[ ! -f "${HERMES_PROFILE_ROOT}/config.yaml" && -f "${LEGACY_HERMES_PROFILE_ROOT}/config.yaml" ]]; then
+  HERMES_PROFILE_ROOT="${LEGACY_HERMES_PROFILE_ROOT}"
+fi
 
 if ! getent group "${SERVICE_GROUP}" >/dev/null; then
   groupadd --system "${SERVICE_GROUP}"
@@ -83,12 +91,12 @@ fi
 python3 "${SOURCE_ROOT}/scripts/prepare-runtime-service-files.py" \
   "${CREDENTIAL_TMP}" \
   "${SANITIZED_CONFIG_TMP}" \
-  /root/.hermes/profiles/zenos/config.yaml \
+  "${HERMES_PROFILE_ROOT}/config.yaml" \
   "${SANITIZED_MODELS_TMP}" \
-  /root/.hermes/profiles/zenos/zenos-runtime.json \
+  "${HERMES_PROFILE_ROOT}/zenos-runtime.json" \
   "${SANITIZED_HERMES_CONFIG_TMP}" \
   "${SOURCE_ROOT}/.env.local" \
-  /root/.hermes/profiles/zenos/.env \
+  "${HERMES_PROFILE_ROOT}/.env" \
   /root/.hermes/.env \
   "${EXISTING_CREDENTIAL_TMP}"
 
@@ -102,8 +110,14 @@ install -o root -g "${SERVICE_GROUP}" -m 0640 \
 
 install -o root -g "${SERVICE_GROUP}" -m 0640 \
   "${SANITIZED_MODELS_TMP}" /etc/zenos-runtime/models.json
-install -o root -g root -m 0600 \
-  "${SANITIZED_HERMES_CONFIG_TMP}" /root/.hermes/profiles/zenos/config.yaml
+HERMES_CONFIG_OWNER="root"
+HERMES_CONFIG_GROUP="root"
+if [[ "${HERMES_PROFILE_ROOT}" == /var/lib/hermes/* ]] && id -u "${HERMES_SERVICE_USER}" >/dev/null 2>&1; then
+  HERMES_CONFIG_OWNER="${HERMES_SERVICE_USER}"
+  HERMES_CONFIG_GROUP="${HERMES_SERVICE_GROUP}"
+fi
+install -o "${HERMES_CONFIG_OWNER}" -g "${HERMES_CONFIG_GROUP}" -m 0600 \
+  "${SANITIZED_HERMES_CONFIG_TMP}" "${HERMES_PROFILE_ROOT}/config.yaml"
 
 install -o root -g root -m 0644 "${SOURCE_ROOT}/zenos-runtime.service" /etc/systemd/system/zenos-runtime.service
 install -o root -g root -m 0644 "${SOURCE_ROOT}/zenos-memory-secondary-backup.service" /etc/systemd/system/zenos-memory-secondary-backup.service
@@ -157,6 +171,7 @@ fi
 # restarted successfully.
 rm -f \
   "${SOURCE_ROOT}/.env.local" \
+  "${HERMES_PROFILE_ROOT}/.env" \
   /root/.hermes/profiles/zenos/.env \
   /root/.hermes/.env
 

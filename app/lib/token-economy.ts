@@ -169,6 +169,26 @@ function bounded(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, Math.round(value)));
 }
 
+function hostCallLimit(decision: RouteDecision): number {
+  // This is an autonomy ceiling, not a prediction that every call will be
+  // consumed. Tool-using Host turns need multiple model/tool round trips to
+  // inspect, mutate, verify, and recover. A one-call ceiling makes Hermes stop
+  // immediately after its first batch of parallel reads.
+  const byTask: Record<RouteDecision['taskType'], number> = {
+    simple_chat: 4,
+    memory_question: 6,
+    repo_question: 10,
+    coding_change: 20,
+    debugging: 20,
+    summarization: 8,
+    planning_or_architecture: 10,
+    security_or_secret: 12,
+    deploy_or_destructive_action: 16,
+    eval_or_benchmark: 12,
+  };
+  return Math.min(32, byTask[decision.taskType] + Math.min(2, decision.maxRevisionAttempts));
+}
+
 export function createTokenBudgetPlan(
   decision: RouteDecision,
   input: z.input<typeof RuntimeContextSchema>,
@@ -254,7 +274,7 @@ export function createTokenBudgetPlan(
       2_400,
       decision.useWorker ? 1_600 : 64,
     ),
-    host: roleBudget(hostShare, 0.35, 1 + Math.min(1, decision.maxRevisionAttempts), 0, 120_000, 10_000, 3_200, 1_600),
+    host: roleBudget(hostShare, 0.35, hostCallLimit(decision), 0, 120_000, 10_000, 3_200, 1_600),
     verifier: roleBudget(verifierShare, 0.45, decision.useVerifier ? 1 + Math.min(1, decision.maxRevisionAttempts) : 0, 0, 90_000, 5_000, 2_600, decision.useVerifier ? 2_200 : 64),
     boss: roleBudget(bossShare, 0.45, bossEnabled ? 1 : 0, 0, 120_000, 2_500, 1_400, bossEnabled ? 900 : 64, bossEnabled ? 1_500 : 128),
     reserveTokens: bounded(totalTokens * reserveShare, 0, 12_000),
@@ -266,6 +286,7 @@ export function createTokenBudgetPlan(
       `worker:${decision.useWorker}`,
       `verifier:${decision.useVerifier}`,
       `boss:${decision.useBoss}`,
+      `host_calls:${hostCallLimit(decision)}`,
     ],
   });
 

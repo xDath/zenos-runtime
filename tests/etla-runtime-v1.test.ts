@@ -31,7 +31,29 @@ test('token economy keeps Boss bounded and allocates cheap work first', () => {
   assert.ok(budget.worker.outputTokens >= 1_600);
   assert.ok(budget.verifier.outputTokens >= 1_200);
   assert.ok(budget.host.outputTokens >= 1_600);
+  assert.ok(budget.host.maxCalls >= 12);
   assert.ok(budget.worker.inputTokens > budget.boss.inputTokens);
+});
+
+test('host autonomy ceiling follows task complexity without forcing extra calls', () => {
+  const chatContext = RuntimeContextSchema.parse({
+    request: 'jelasin singkat status service',
+    intent: 'explain',
+  });
+  const codingContext = RuntimeContextSchema.parse({
+    request: 'fix the TypeScript auth bug and run tests',
+    intent: 'execute',
+    hasCodeChangeIntent: true,
+    estimatedContextTokens: 8_000,
+  });
+
+  const chat = createTokenBudgetPlan(choosePipeline(chatContext), chatContext);
+  const coding = createTokenBudgetPlan(choosePipeline(codingContext), codingContext);
+
+  assert.ok(chat.host.maxCalls >= 2);
+  assert.ok(coding.host.maxCalls >= 12);
+  assert.ok(coding.host.maxCalls > chat.host.maxCalls);
+  assert.ok(coding.host.maxCalls <= 32);
 });
 
 test('token estimator calibrates from provider usage without changing the public budget contract', () => {
