@@ -69,7 +69,6 @@ find "${STAGING}" -xdev -type d -exec chmod go-w {} +
 find "${STAGING}" -xdev -type f -exec chmod go-w {} +
 chown -R root:root "${STAGING}"
 mv "${STAGING}" "${RELEASE_ROOT}"
-ln -sfn "${RELEASE_ROOT}" /opt/zenos-runtime/current
 
 install -d -o root -g root -m 0700 /etc/credstore.encrypted
 CREDENTIAL_TMP="$(mktemp)"
@@ -149,6 +148,7 @@ rollback_runtime() {
     systemctl restart zenos-runtime.service || true
   fi
 }
+ln -sfn "${RELEASE_ROOT}" /opt/zenos-runtime/current
 if ! systemctl restart zenos-runtime.service; then
   rollback_runtime
   echo "Zenos Runtime deployment failed; restored the previous release." >&2

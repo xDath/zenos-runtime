@@ -108,3 +108,18 @@ test('Hermes gateway consumes only its dedicated credential bundle', () => {
   assert.match(launcher, /HERMES_CREDENTIAL_NAME/);
   assert.doesNotMatch(unit, /LoadCredentialEncrypted=zenos-runtime\.env:/);
 });
+
+test('Runtime deployment activates the release only after preparation completes', () => {
+  const installer = readFileSync('scripts/install-control-plane-service.sh', 'utf8');
+  const releaseCreated = installer.indexOf('mv "${STAGING}" "${RELEASE_ROOT}"');
+  const credentialPrepared = installer.indexOf('prepare-runtime-service-files.py');
+  const unitInstalled = installer.indexOf('hermes-gateway.service');
+  const releaseActivated = installer.indexOf('ln -sfn "${RELEASE_ROOT}" /opt/zenos-runtime/current');
+  const serviceRestarted = installer.indexOf('systemctl restart zenos-runtime.service', releaseActivated);
+
+  assert.ok(releaseCreated >= 0);
+  assert.ok(credentialPrepared > releaseCreated);
+  assert.ok(unitInstalled > credentialPrepared);
+  assert.ok(releaseActivated > unitInstalled);
+  assert.ok(serviceRestarted > releaseActivated);
+});
