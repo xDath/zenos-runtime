@@ -6,12 +6,12 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-User=hermes
-Group=hermes
+User=root
+Group=root
 WorkingDirectory=/usr/local/lib/hermes-agent
 Environment=HOME=/var/lib/hermes
-Environment=USER=hermes
-Environment=LOGNAME=hermes
+Environment=USER=root
+Environment=LOGNAME=root
 Environment=PATH=/usr/local/lib/hermes-agent/venv/bin:/usr/local/lib/hermes-agent/node_modules/.bin:/usr/local/bin:/usr/bin:/bin
 Environment=VIRTUAL_ENV=/usr/local/lib/hermes-agent/venv
 Environment=HERMES_HOME=/var/lib/hermes/.hermes/profiles/zenos
@@ -27,9 +27,7 @@ ExecReload=/bin/kill -USR1 $MAINPID
 ExecStopPost=-/usr/local/lib/hermes-agent/venv/bin/python -m gateway.cgroup_cleanup
 TimeoutStopSec=210
 UMask=0077
-StateDirectory=hermes
-StateDirectoryMode=0700
-NoNewPrivileges=true
+NoNewPrivileges=false
 PrivateTmp=true
 ProtectSystem=full
 ProtectHostname=true

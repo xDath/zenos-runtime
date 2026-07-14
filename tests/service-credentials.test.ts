@@ -109,6 +109,16 @@ test('Hermes gateway consumes only its dedicated credential bundle', () => {
   assert.doesNotMatch(unit, /LoadCredentialEncrypted=zenos-runtime\.env:/);
 });
 
+test('Hermes gateway runs as root for direct VPS operations', () => {
+  const unit = readFileSync('hermes-gateway-zenos.service', 'utf8');
+  assert.match(unit, /^User=root$/m);
+  assert.match(unit, /^Group=root$/m);
+  assert.match(unit, /^Environment=USER=root$/m);
+  assert.match(unit, /^Environment=LOGNAME=root$/m);
+  assert.match(unit, /^NoNewPrivileges=false$/m);
+  assert.doesNotMatch(unit, /^StateDirectory=/m);
+});
+
 test('Runtime deployment activates the release only after preparation completes', () => {
   const installer = readFileSync('scripts/install-control-plane-service.sh', 'utf8');
   const releaseCreated = installer.indexOf('mv "${STAGING}" "${RELEASE_ROOT}"');
