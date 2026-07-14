@@ -38,7 +38,10 @@ export function pipelineForHostPlan(
   const safetyBoss = request.userRequestedBoss
     || decision.requiresApproval
     || decision.risk === 'critical';
-  const useWorker = plan.useWorker;
+  const unfinishedCodingWorker = decision.useWorker
+    && request.hasCodeChangeIntent
+    && request.userRequestedVerification;
+  const useWorker = unfinishedCodingWorker || plan.useWorker;
   const useVerifier = safetyVerifier || plan.useVerifier;
   const useBoss = safetyBoss || plan.useBoss;
   const pipelineMode: RouteDecision['pipelineMode'] = useBoss
@@ -65,7 +68,11 @@ export function pipelineForHostPlan(
     reasons: [
       ...decision.reasons,
       `host-plan:${plan.rationale}`,
-      useWorker ? 'Host delegated bounded work to Worker' : 'Host retained the task without Worker delegation',
+      useWorker
+        ? unfinishedCodingWorker
+          ? 'Unfinished verified coding work requires bounded Worker support'
+          : 'Host delegated bounded work to Worker'
+        : 'Host retained the task without Worker delegation',
       useBoss ? 'Boss authority requested by Host or mandatory safety policy' : 'Boss not required by Host or safety policy',
     ],
   });

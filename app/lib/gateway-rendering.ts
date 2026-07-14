@@ -56,6 +56,9 @@ export function renderHostContext(
       : '',
     compactWorkerBrief(worker),
     compactBossGuardrails(boss),
+    ['coding_change', 'debugging'].includes(decision.taskType)
+      ? 'Coding completion gate: after changing a file, run the relevant deterministic syntax/typecheck/lint/test command. Do not finish the turn while the change is broken or unvalidated. Repair the file or rollback to the last known-good state before giving a final answer.'
+      : '',
     'Use this brief as bounded supporting context. Do not claim a tool, file, test, or source was inspected unless Hermes actually inspected it during this turn.',
     'The user-facing response must not reveal raw internal packets unless the user explicitly asks for execution details.',
   ].filter(Boolean).join('\n\n');

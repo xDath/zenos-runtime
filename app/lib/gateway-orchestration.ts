@@ -31,6 +31,7 @@ import {
   GatewayTurnPostflightInput,
   GatewayTurnPostflightRequestSchema,
   GatewayTurnPreflightInput,
+  GatewayTurnPreflightRequest,
   GatewayTurnPreflightRequestSchema,
   GatewayTurnReceipt,
   StoredGatewayPreflight,
@@ -130,16 +131,101 @@ function memoryCoverageScore(memory: GatewayMemoryBrief): number | undefined {
 function deterministicValidationState(toolSummary: string): 'passed' | 'failed' | 'unknown' {
   const text = String(toolSummary || '').toLowerCase();
   if (!text.trim()) return 'unknown';
-  const hasValidation = /\b(test|tests|lint|typecheck|build|compile|validation|pytest|vitest|jest)\b/.test(text);
+  const hasValidation = /\b(test|tests|lint|typecheck|build|compile|validation|pytest|vitest|jest|py_compile)\b/.test(text);
   if (!hasValidation) return 'unknown';
-  if (/\b(fail(?:ed|ure)?|error|errors|non[- ]?zero|exit\s+[1-9]|timed out|timeout)\b/.test(text)) return 'failed';
-  if (/\b(pass(?:ed)?|success(?:ful)?|completed|green|exit\s+0|0\s+errors?)\b/.test(text)) return 'passed';
+  if (/\b(fail(?:ed|ure)?|error|errors|non[- ]?zero|exit\s+(?:code\s*)?[1-9]|timed out|timeout)\b/.test(text)) return 'failed';
+  if (/\b(pass(?:ed)?|success(?:ful)?|completed|green|exit\s+(?:code\s*)?0|0\s+errors?)\b/.test(text)) return 'passed';
   return 'unknown';
+}
+
+const CODE_ARTIFACT_PATTERN = /(?:\/[A-Za-z0-9._/-]+|\b[A-Za-z0-9._-]+)\.(?:py|pyi|ts|tsx|js|jsx|mjs|cjs|go|rs|java|kt|kts|cs|cpp|cc|c|h|hpp|rb|php|swift|vue|svelte|sql|sh)\b/i;
+const CODING_ACTIVITY_PATTERN = /\b(?:read(?:ing)?|edit(?:ing|ed)?|patch(?:ing|ed)?|write|wrote|modified|changed|implement(?:ing|ed)?|refactor(?:ing|ed)?|test(?:ing|ed)?|lint(?:ing|ed)?|build(?:ing|ed)?|compil(?:e|ing|ed)|traceback)\b/i;
+const CODING_MUTATION_PATTERN = /\b(?:edit(?:ing|ed)?|patch(?:ing|ed)?|write|wrote|modified|changed|implement(?:ing|ed)?|refactor(?:ing|ed)?|repair(?:ing|ed)?|fix(?:ing|ed)?)\b/i;
+const CODING_UNFINISHED_PATTERN = /\b(?:indentationerror|syntaxerror|compile\s+error|typecheck\s+error|test(?:s)?\s+failed|lint\s+failed|build\s+failed|patch\s+failed|mid[- ]patch|belum\s+(?:selesai|beres|ke-?apply|di-?apply)|unfinished|pending|blocker|next\s+turn|remaining\s+work|rollback|rusak|broken|partial)\b/i;
+const CODING_COMPLETED_PATTERN = /\b(?:all\s+tests?\s+passed|tests?\s+passed|validation\s+passed|typecheck\s+passed|lint\s+passed|build\s+passed|compile\s+passed|working\s+tree\s+clean|completed\s+successfully|selesai\s+dan\s+tervalidasi)\b/i;
+const CODING_FOLLOW_UP_PATTERN = /^\s*(?:tapi|dan|terus|juga|sekalian|lanjut(?:kan)?|nah|yang\s+tadi|itu|ini|gas+|soalnya)\b/i;
+const MUTATING_TOOL_PATTERN = /\b(?:apply_patch|patch|edit_file|write_file|replace_in_file|str_replace|create_file|delete_file|editing|updated|modified|wrote|applied\s+patch)\b/i;
+const BROKEN_CODE_PATTERN = /\b(?:indentationerror|syntaxerror|compileerror|compile\s+error|typecheck\s+error|traceback|test(?:s)?\s+failed|lint\s+failed|build\s+failed|patch\s+failed|exit\s+(?:code\s*)?[1-9])\b/i;
+
+function lastPatternIndex(text: string, pattern: RegExp): number {
+  const flags = pattern.flags.includes('g') ? pattern.flags : `${pattern.flags}g`;
+  let index = -1;
+  for (const match of text.matchAll(new RegExp(pattern.source, flags))) {
+    index = match.index ?? index;
+  }
+  return index;
+}
+
+function preserveUnfinishedCodingContinuity(request: GatewayTurnPreflightRequest): GatewayTurnPreflightRequest {
+  if (request.hasCodeChangeIntent || !CODING_FOLLOW_UP_PATTERN.test(request.request)) return request;
+  const previous = getRuntimeSession(request.sessionId);
+  const continuity = [
+    request.context,
+    ...request.handoffMessages.slice(-24).map((message) => message.content),
+    previous?.finalAnswer || '',
+    previous?.lastError || '',
+  ].filter(Boolean).join('\n').slice(-40_000);
+  const hasRepositoryEvidence = Boolean(request.workspaceRoot) || CODE_ARTIFACT_PATTERN.test(continuity);
+  const hasCodingActivity = CODE_ARTIFACT_PATTERN.test(continuity)
+    && CODING_ACTIVITY_PATTERN.test(continuity)
+    && CODING_MUTATION_PATTERN.test(continuity);
+  const lastUnfinished = lastPatternIndex(continuity, CODING_UNFINISHED_PATTERN);
+  const lastCompleted = lastPatternIndex(continuity, CODING_COMPLETED_PATTERN);
+  if (!hasRepositoryEvidence || !hasCodingActivity || lastUnfinished < 0 || lastUnfinished < lastCompleted) return request;
+
+  return GatewayTurnPreflightRequestSchema.parse({
+    ...request,
+    hasFiles: true,
+    hasCodeChangeIntent: true,
+    userRequestedVerification: true,
+    intent: request.intent === 'execute' ? 'execute' : 'mutate',
+    confidence: Math.max(request.confidence, 0.9),
+  });
+}
+
+function observedCodingState(toolSummary: string): { mutated: boolean; broken: boolean } {
+  const text = String(toolSummary || '');
+  const hasCodeArtifact = CODE_ARTIFACT_PATTERN.test(text);
+  const mutated = MUTATING_TOOL_PATTERN.test(text)
+    || (hasCodeArtifact && CODING_MUTATION_PATTERN.test(text));
+  return {
+    mutated,
+    broken: mutated && BROKEN_CODE_PATTERN.test(text),
+  };
+}
+
+function postflightDecisionForObservedMutation(
+  current: RouteDecision,
+  input: z.infer<typeof RuntimeRunRequestSchema>,
+): RouteDecision {
+  const upgraded = choosePipeline(input);
+  const useWorker = current.useWorker;
+  const useVerifier = upgraded.useVerifier;
+  const useBoss = upgraded.useBoss;
+  return RouteDecisionSchema.parse({
+    ...upgraded,
+    useWorker,
+    workerTier: useWorker ? current.workerTier : 'none',
+    maxWorkerCalls: useWorker ? current.maxWorkerCalls : 0,
+    useVerifier,
+    useBoss,
+    pipelineMode: useBoss
+      ? 'escalated_deep_path'
+      : useVerifier
+        ? 'verified_path'
+        : upgraded.useTools || upgraded.useMemory
+          ? 'grounded_path'
+          : 'direct_fast_path',
+    reasons: [
+      ...upgraded.reasons,
+      'postflight observed an actual code mutation from Hermes tool evidence',
+    ],
+  });
 }
 
 export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
   const turnStartedAtMs = Date.now();
-  const request = GatewayTurnPreflightRequestSchema.parse(raw);
+  const request = preserveUnfinishedCodingContinuity(GatewayTurnPreflightRequestSchema.parse(raw));
   reconcileStaleRuntimeSessions({ excludeSessionId: request.sessionId });
   const runId = `gateway_${crypto.randomUUID()}`;
   const baselineDecision = choosePipeline(request);
@@ -472,11 +558,14 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
   const store = getRuntimeStore();
   const run = store.getRun(request.runId);
   if (!run || run.sessionId !== request.sessionId) throw new Error('Gateway Runtime run was not found for this session');
-  const decision = RouteDecisionSchema.parse(run.decision);
+  const storedDecision = RouteDecisionSchema.parse(run.decision);
   const stored = StoredGatewayPreflightSchema.parse(run.result);
-  const latencyPlan = stored.latencyPlan || createLatencyBudgetPlan(decision);
   const turnStartedAtMs = stored.turnStartedAtMs || Date.parse(run.startedAt) || Date.now();
-  const input = RuntimeRunRequestSchema.parse({
+  const deterministicValidation = deterministicValidationState(request.toolSummary);
+  const observedCoding = observedCodingState(request.toolSummary);
+  const unresolvedCodingMutation = observedCoding.mutated
+    && (observedCoding.broken || deterministicValidation !== 'passed');
+  const baseInput = RuntimeRunRequestSchema.parse({
     ...stored.input,
     sessionId: request.sessionId,
     toolContext: [
@@ -485,6 +574,22 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
       request.toolSummary,
     ].filter(Boolean).join('\n\n'),
   });
+  const input = observedCoding.mutated
+    ? RuntimeRunRequestSchema.parse({
+        ...baseInput,
+        hasFiles: true,
+        hasCodeChangeIntent: true,
+        userRequestedVerification: baseInput.userRequestedVerification || unresolvedCodingMutation,
+        intent: baseInput.intent === 'execute' ? 'execute' : 'mutate',
+        confidence: Math.max(baseInput.confidence, 0.9),
+      })
+    : baseInput;
+  const decision = observedCoding.mutated
+    ? postflightDecisionForObservedMutation(storedDecision, input)
+    : storedDecision;
+  const latencyPlan = decision.pipelineMode === storedDecision.pipelineMode
+    ? stored.latencyPlan || createLatencyBudgetPlan(decision)
+    : createLatencyBudgetPlan(decision);
   const baseBudget = createTokenBudgetPlan(decision, input, {
     userPriority: input.tokenPriority,
     budgetId: request.runId,
@@ -613,10 +718,10 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
   );
   const hostOverBudget = hostInputTokens > hostInputBudget;
   const verifierMandatory = input.userRequestedVerification
+    || unresolvedCodingMutation
     || decision.risk === 'high'
     || decision.risk === 'critical';
   const verifierMayRewriteHost = verifierMandatory || decision.requiresApproval || request.failed;
-  const deterministicValidation = deterministicValidationState(request.toolSummary);
   const deterministicPassReplacesOptionalVerifier = deterministicValidation === 'passed'
     && ['coding_change', 'debugging', 'repo_question'].includes(decision.taskType)
     && !verifierMandatory;
@@ -852,6 +957,32 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
     }
   }
 
+  const terminalCodingFailure = unresolvedCodingMutation;
+  if (terminalCodingFailure) {
+    finalAnswer = blockedAnswer(
+      observedCoding.broken
+        ? 'Hermes mengubah source code, tetapi bukti tool menunjukkan file berada dalam kondisi rusak atau validasi gagal.'
+        : 'Hermes mengubah source code, tetapi tidak ada bukti deterministic validation yang lulus.',
+      [
+        'Perbaiki atau rollback perubahan sampai syntax, typecheck, lint, atau targeted test yang relevan lulus.',
+        'Jangan restart, deploy, atau menandai pekerjaan selesai saat working tree masih broken atau belum tervalidasi.',
+      ],
+    );
+    transformed = true;
+    recordActivity(
+      request.sessionId,
+      'verifier',
+      'Runtime failed closed because a code mutation did not pass deterministic validation.',
+      {
+        runId: request.runId,
+        turnId: request.turnId,
+        deterministicValidation,
+        brokenCodeEvidence: observedCoding.broken,
+      },
+      'failed',
+    );
+  }
+
   const receipt: GatewayTurnReceipt = {
     pipeline: decision.pipelineMode,
     host: {
@@ -875,7 +1006,12 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
   const finalTokenBudget = tokenGovernorSnapshot(budget);
   store.saveRun({
     ...run,
-    status: bossDecision?.verdict === 'block' || verifierResult?.verdict === 'block' ? 'blocked' : 'done',
+    decision,
+    status: terminalCodingFailure
+      ? 'failed'
+      : bossDecision?.verdict === 'block' || verifierResult?.verdict === 'block'
+        ? 'blocked'
+        : 'done',
     result: {
       preflight: stored,
       finalAnswer,
@@ -884,16 +1020,23 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
       receipt,
       modelCalls: calls,
       tokenBudget: finalTokenBudget,
+      codingValidation: observedCoding.mutated
+        ? { deterministic: deterministicValidation, broken: observedCoding.broken }
+        : undefined,
     },
-    errors: [],
+    errors: terminalCodingFailure
+      ? ['Code mutation did not pass deterministic validation']
+      : [],
     completedAt: now(),
   });
   accountGatewayModelUsage(request.sessionId, calls, request.hostUsage);
-  const outcomeVerdict = bossDecision?.verdict === 'block' || verifierResult?.verdict === 'block'
-    ? 'blocked'
-    : transformed || verifierResult?.verdict === 'revise' || bossDecision?.verdict === 'revise'
-      ? 'revised'
-      : 'success';
+  const outcomeVerdict = terminalCodingFailure
+    ? 'failed'
+    : bossDecision?.verdict === 'block' || verifierResult?.verdict === 'block'
+      ? 'blocked'
+      : transformed || verifierResult?.verdict === 'revise' || bossDecision?.verdict === 'revise'
+        ? 'revised'
+        : 'success';
   recordOutcomePassport({
     runId: request.runId,
     sessionId: request.sessionId,
@@ -914,11 +1057,21 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
     evidenceCoverage: stored.memoryCoverage,
     memorySource: stored.memorySource,
   });
-  completeRuntimeSession(request.sessionId, finalAnswer);
+  if (terminalCodingFailure) {
+    updateRuntimeSession(request.sessionId, {
+      status: 'failed',
+      finalAnswer,
+      lastError: 'Code mutation did not pass deterministic validation',
+      activeRunId: undefined,
+    });
+  } else {
+    completeRuntimeSession(request.sessionId, finalAnswer);
+  }
   completeTokenBudget(request.runId);
 
   return {
-    ok: true,
+    ok: !terminalCodingFailure,
+    failed: terminalCodingFailure,
     finalAnswer,
     transformed,
     receipt,

@@ -226,6 +226,132 @@ test('clear coding work keeps Host as orchestrator before bounded Worker delegat
   }
 });
 
+test('unfinished coding context survives a natural follow-up after compression', async () => {
+  const originalFetch = globalThis.fetch;
+  const calledModels: string[] = [];
+  globalThis.fetch = async (_input: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body || '{}')) as { model: string };
+    calledModels.push(body.model);
+    if (body.model === 'runtime-host') {
+      return modelResponse(hostPlan({
+        useWorker: false,
+        useVerifier: false,
+        rationale: 'The current sentence looks small in isolation.',
+      }));
+    }
+    if (body.model === 'runtime-worker') {
+      return modelResponse({
+        task: 'inspect unfinished sell-card implementation',
+        summary: ['The previous patch is incomplete and must be repaired before finalization.'],
+        findings: [{
+          claim: 'bot.py was left mid-patch with an IndentationError.',
+          evidence: ['/root/openclaw-projects/rh-copybot/bot.py'],
+          confidence: 0.99,
+          risk: 'high',
+        }],
+        contradictions: [],
+        unknowns: [],
+        suggestedNextStep: 'Repair or rollback, then run deterministic validation.',
+        needsHostAttention: ['Do not finish while bot.py is broken.'],
+        rawContextNeeded: [],
+        sourceCoverage: 0.95,
+      });
+    }
+    throw new Error(`Unexpected model ${body.model}`);
+  };
+
+  try {
+    const preflight = await preflightGatewayTurn({
+      request: 'tapi lihat juga sellnya kan, sellnya juga pasti ga langsung sell pasti sellnya berurutan',
+      sessionId: 'hermes_coding_continuity_test',
+      turnId: 'turn-coding-continuity-1',
+      platform: 'telegram',
+      host: { model: 'grok', provider: 'etla-router' },
+      context: [
+        'Reading /root/openclaw-projects/rh-copybot/bot.py',
+        'Editing /root/openclaw-projects/rh-copybot/bot.py',
+        'Status jujur: file sempat rusak mid-patch dan belum selesai.',
+        'Blocker sekarang: bot.py IndentationError. Next turn repair lalu jalankan test.',
+      ].join('\n'),
+      intent: 'analyze',
+      modelOverrides: modelOverrides(),
+    });
+
+    assert.equal(preflight.decision.taskType, 'coding_change');
+    assert.equal(preflight.decision.pipelineMode, 'verified_path');
+    assert.equal(preflight.decision.useWorker, true);
+    assert.equal(preflight.decision.useVerifier, true);
+    assert.equal(preflight.holdFinalDelivery, true);
+    assert.equal(preflight.receipt.worker.invoked, true);
+    assert.match(preflight.hostContext, /Do not finish the turn while the change is broken or unvalidated/i);
+    assert.deepEqual(calledModels, ['runtime-host', 'runtime-worker']);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('postflight fails closed when Hermes mutates code but leaves deterministic validation broken', async () => {
+  const originalFetch = globalThis.fetch;
+  const calledModels: string[] = [];
+  globalThis.fetch = async (_input: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body || '{}')) as { model: string };
+    calledModels.push(body.model);
+    if (body.model !== 'runtime-verifier') throw new Error(`Unexpected model ${body.model}`);
+    return modelResponse({
+      verdict: 'pass',
+      confidence: 0.9,
+      issues: [],
+      checks: {
+        followsUserRequest: 'pass',
+        sourceGrounded: 'pass',
+        secretSafe: 'pass',
+        actionSafe: 'pass',
+        testsOrValidation: 'fail',
+      },
+      nextAction: 'answer',
+    });
+  };
+
+  try {
+    const preflight = await preflightGatewayTurn({
+      request: 'cek sell card ini',
+      sessionId: 'hermes_broken_patch_test',
+      turnId: 'turn-broken-patch-1',
+      platform: 'telegram',
+      host: { model: 'grok', provider: 'etla-router' },
+      intent: 'analyze',
+      modelOverrides: modelOverrides(),
+    });
+    assert.equal(preflight.decision.pipelineMode, 'direct_fast_path');
+
+    const postflight = await postflightGatewayTurn({
+      sessionId: 'hermes_broken_patch_test',
+      runId: preflight.runId,
+      turnId: 'turn-broken-patch-1',
+      draft: 'Status jujur: file sempat rusak mid-patch, lanjut next turn.',
+      host: { model: 'grok', provider: 'etla-router' },
+      toolSummary: [
+        'edit_file: completed — Updated /root/openclaw-projects/rh-copybot/bot.py',
+        'terminal: failed — python -m py_compile bot.py exited code 1: IndentationError',
+      ].join('\n'),
+      hostUsage: { inputTokens: 500, outputTokens: 90, calls: 2 },
+    });
+
+    assert.equal(postflight.ok, false);
+    assert.equal(postflight.failed, true);
+    assert.equal(postflight.receipt.pipeline, 'verified_path');
+    assert.equal(postflight.receipt.verifier.invoked, true);
+    assert.match(postflight.finalAnswer, /Runtime memblokirnya/i);
+    assert.match(postflight.finalAnswer, /repair|rollback/i);
+    assert.deepEqual(calledModels, ['runtime-verifier']);
+    const session = getRuntimeSession('hermes_broken_patch_test');
+    assert.equal(session?.status, 'failed');
+    assert.match(session?.lastError || '', /deterministic validation/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('Host planner can retain a serious task and prevent Worker from becoming the lead agent', async () => {
   const originalFetch = globalThis.fetch;
   const calledModels: string[] = [];
