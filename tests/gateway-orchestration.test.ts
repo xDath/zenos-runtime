@@ -347,6 +347,24 @@ test('unfinished coding validation schedules bounded automatic continuation unde
         rationale: 'Host owns the bounded coding change and requires final validation.',
       }));
     }
+    if (body.model === 'runtime-worker') {
+      return modelResponse({
+        task: 'continue the same durable coding task',
+        summary: ['The existing task remains active and needs deterministic validation.'],
+        findings: [{
+          claim: 'The continuation belongs to the existing coding task.',
+          evidence: ['active-coding-task'],
+          confidence: 0.99,
+          risk: 'high',
+        }],
+        contradictions: [],
+        unknowns: [],
+        suggestedNextStep: 'Repair the bounded defect and rerun targeted validation.',
+        needsHostAttention: ['Do not reclassify the internal continuation as deployment.'],
+        rawContextNeeded: [],
+        sourceCoverage: 0.95,
+      });
+    }
     if (body.model === 'runtime-verifier') {
       return modelResponse({
         verdict: 'pass',
@@ -418,7 +436,31 @@ test('unfinished coding validation schedules bounded automatic continuation unde
     assert.match(postflight.continuation?.prompt || '', /Do not ask the user to send another command/i);
     const session = getRuntimeSession('hermes_internal_continuation_test');
     assert.equal(session?.status, 'working');
-    assert.deepEqual(calledModels, ['runtime-host', 'runtime-verifier']);
+
+    const continuedPreflight = await preflightGatewayTurn({
+      request: postflight.continuation?.prompt || '',
+      sessionId: 'hermes_internal_continuation_test',
+      turnId: 'turn-internal-continuation-2',
+      platform: 'telegram',
+      host: { model: 'grok', provider: 'etla-router' },
+      workspaceRoot: root,
+      workspaceState: {
+        ...beforeState,
+        dirtyDiffSha256: 'b'.repeat(64),
+        clean: false,
+        capturedAt: new Date().toISOString(),
+      },
+      modelOverrides: modelOverrides(),
+    });
+    assert.notEqual(continuedPreflight.runId, preflight.runId);
+    assert.equal(continuedPreflight.codingTaskId, preflight.codingTaskId);
+    assert.equal(continuedPreflight.decision.taskType, 'coding_change');
+    assert.notEqual(continuedPreflight.decision.taskType, 'deploy_or_destructive_action');
+    assert.match(
+      continuedPreflight.decision.reasons.join(' '),
+      /active durable coding task overrides lexical classification/i,
+    );
+    assert.deepEqual(calledModels, ['runtime-host', 'runtime-verifier', 'runtime-host', 'runtime-worker']);
   } finally {
     globalThis.fetch = originalFetch;
     fs.rmSync(root, { recursive: true, force: true });

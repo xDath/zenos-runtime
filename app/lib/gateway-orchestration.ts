@@ -178,6 +178,41 @@ function lastPatternIndex(text: string, pattern: RegExp): number {
   return index;
 }
 
+function activeCodingContinuationDecision(
+  decision: RouteDecision,
+  request: GatewayTurnPreflightRequest,
+): RouteDecision {
+  const bossRequested = request.userRequestedBoss;
+  return RouteDecisionSchema.parse({
+    ...decision,
+    taskType: 'coding_change',
+    pipelineMode: bossRequested ? 'escalated_deep_path' : 'verified_path',
+    risk: 'high',
+    hostTier: 'premium',
+    workerTier: decision.workerTier === 'premium' ? 'standard' : decision.workerTier,
+    verifierTier: 'cheap',
+    useMemory: true,
+    useTools: true,
+    useWorker: true,
+    useVerifier: true,
+    useBoss: bossRequested,
+    allowEscalation: true,
+    requiresApproval: false,
+    requiresSourceContext: true,
+    maxMemoryItems: Math.max(decision.maxMemoryItems, 4),
+    maxWorkerCalls: Math.max(decision.maxWorkerCalls, 1),
+    maxContextTokens: Math.max(decision.maxContextTokens, 12_000),
+    maxRevisionAttempts: Math.max(decision.maxRevisionAttempts, 1),
+    reasons: [
+      ...decision.reasons.filter((reason) => !/^task:|^risk:|deploy_or_destructive_action/i.test(reason)),
+      'task:coding_change',
+      'risk:high',
+      'active durable coding task overrides lexical classification of the internal continuation prompt',
+      'unfinished coding validation requires bounded Worker support and independent verification',
+    ],
+  });
+}
+
 function preserveUnfinishedCodingContinuity(request: GatewayTurnPreflightRequest): GatewayTurnPreflightRequest {
   if (request.hasCodeChangeIntent || !CODING_FOLLOW_UP_PATTERN.test(request.request)) return request;
   const previous = getRuntimeSession(request.sessionId);
@@ -274,7 +309,10 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
   reconcileStaleRuntimeSessions({ excludeSessionId: request.sessionId });
   store.reconcileExpiredRuns(now());
   const runId = `gateway_${crypto.randomUUID()}`;
-  const baselineDecision = choosePipeline(request);
+  let baselineDecision = choosePipeline(request);
+  if (activeCodingRecord && request.workspaceRoot) {
+    baselineDecision = activeCodingContinuationDecision(baselineDecision, request);
+  }
   const latencyPlan = createLatencyBudgetPlan(baselineDecision);
   let decision = baselineDecision;
   const existingSession = Boolean(getRuntimeSession(request.sessionId));
