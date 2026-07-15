@@ -47,6 +47,7 @@ export type ToolDefinition<TInput = unknown> = {
   cacheable: boolean;
   producesEvidence: boolean;
   remotePreferred?: boolean;
+  brokeredProduction?: boolean;
   requiresApproval?: boolean;
   timeoutMs?: number;
   execute(input: TInput, context: ToolContext): Promise<ToolEvidence>;
@@ -61,7 +62,7 @@ export class ToolBroker {
   }
 
   list(): Array<Pick<ToolDefinition,
-    'name' | 'description' | 'risk' | 'cacheable' | 'producesEvidence' | 'remotePreferred' | 'requiresApproval' | 'timeoutMs'>> {
+    'name' | 'description' | 'risk' | 'cacheable' | 'producesEvidence' | 'remotePreferred' | 'brokeredProduction' | 'requiresApproval' | 'timeoutMs'>> {
     return [...this.tools.values()].map(({
       name,
       description,
@@ -69,6 +70,7 @@ export class ToolBroker {
       cacheable,
       producesEvidence,
       remotePreferred,
+      brokeredProduction,
       requiresApproval,
       timeoutMs,
     }) => ({
@@ -78,6 +80,7 @@ export class ToolBroker {
       cacheable,
       producesEvidence,
       remotePreferred,
+      brokeredProduction,
       requiresApproval: requiresApproval ?? (risk === 'destructive' || risk === 'production'),
       timeoutMs,
     }));
@@ -115,7 +118,7 @@ export class ToolBroker {
         assertExecutionBoundary({ action: 'local_mutation', workspaceRoot: context.cwd, approvalGranted: context.approvalGranted });
       } else if (definition.risk === 'destructive') {
         assertExecutionBoundary({ action: 'rollback', workspaceRoot: context.cwd, approvalGranted: context.approvalGranted });
-      } else if (definition.risk === 'production') {
+      } else if (definition.risk === 'production' && !definition.brokeredProduction) {
         assertExecutionBoundary({ action: 'production_action', workspaceRoot: context.cwd, approvalGranted: context.approvalGranted });
       }
     } catch (error) {
@@ -206,8 +209,16 @@ const TestRunInputSchema = PackageScriptInputSchema.extend({
   script: z.string().regex(/^[A-Za-z0-9:_-]+$/).optional().default('test'),
 });
 
+const GovernedServiceSchema = z.enum([
+  '9router.service',
+  'hermes-gateway.service',
+  'nginx.service',
+  'rh-copybot.service',
+  'zenos-runtime.service',
+]);
+
 const ServiceInputSchema = z.object({
-  service: z.string().regex(/^[A-Za-z0-9@_.:-]+$/).max(200),
+  service: GovernedServiceSchema,
 });
 
 const ServiceLogsInputSchema = ServiceInputSchema.extend({
@@ -726,12 +737,13 @@ export function createDefaultToolBroker(): ToolBroker {
     producesEvidence: true,
     timeoutMs: 20_000,
     async execute(input, context) {
-      const result = await runGovernedCommand('systemctl', [
-        'show', input.service,
-        '--no-pager',
-        '--property=Id,LoadState,ActiveState,SubState,MainPID,ExecMainStatus,MemoryCurrent,TasksCurrent',
-      ], { cwd: context.cwd, timeoutMs: 20_000, signal: context.signal });
-      return governedCommandEvidence('service.status', result, { successSummary: `Service status captured for ${input.service}.` });
+      const result = await runGovernedCommand('etla-ops', ['status', input.service], {
+        cwd: context.cwd,
+        timeoutMs: 20_000,
+        maxOutputBytes: 512_000,
+        signal: context.signal,
+      });
+      return governedCommandEvidence('service.status', result, { successSummary: `Service status captured through the narrow operations broker for ${input.service}.` });
     },
   });
 
@@ -744,15 +756,15 @@ export function createDefaultToolBroker(): ToolBroker {
     producesEvidence: true,
     timeoutMs: 30_000,
     async execute(input, context) {
-      const args = ['-u', input.service, '-n', String(input.lines), '--no-pager', '--output=short-iso'];
+      const args = ['logs', input.service, '--lines', String(input.lines)];
       if (input.since) args.push('--since', input.since);
-      const result = await runGovernedCommand('journalctl', args, {
+      const result = await runGovernedCommand('etla-ops', args, {
         cwd: context.cwd,
         timeoutMs: 30_000,
         maxOutputBytes: 2_000_000,
         signal: context.signal,
       });
-      return governedCommandEvidence('service.logs', result, { successSummary: `Captured ${input.lines} bounded log lines for ${input.service}.` });
+      return governedCommandEvidence('service.logs', result, { successSummary: `Captured ${input.lines} bounded log lines through the narrow operations broker for ${input.service}.` });
     },
   });
 
@@ -763,15 +775,17 @@ export function createDefaultToolBroker(): ToolBroker {
     inputSchema: ServiceInputSchema,
     cacheable: false,
     producesEvidence: true,
+    brokeredProduction: true,
     requiresApproval: true,
-    timeoutMs: 60_000,
+    timeoutMs: 180_000,
     async execute(input, context) {
-      const result = await runGovernedCommand('systemctl', ['restart', input.service], {
+      const result = await runGovernedCommand('etla-ops', ['restart', input.service], {
         cwd: context.cwd,
-        timeoutMs: 60_000,
+        timeoutMs: 180_000,
+        maxOutputBytes: 512_000,
         signal: context.signal,
       });
-      return governedCommandEvidence('service.restart', result, { successSummary: `Service ${input.service} restarted.` });
+      return governedCommandEvidence('service.restart', result, { successSummary: `Service ${input.service} restarted through the narrow operations broker.` });
     },
   });
 

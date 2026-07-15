@@ -4,6 +4,10 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import {
+  GatewayTurnPostflightRequestSchema,
+  GatewayTurnPreflightRequestSchema,
+} from '../app/lib/gateway-contracts';
+import {
   postflightGatewayTurn,
   preflightGatewayTurn,
 } from '../app/lib/gateway-orchestration';
@@ -61,6 +65,30 @@ test.beforeEach(() => {
   resetRuntimeStoreForTests(':memory:');
   process.env.ZENOS_RUNTIME_DISABLE_MEMORY = 'true';
   process.env.ZENOS_RUNTIME_DISABLE_MEMORY_AUTO_RECALL = 'true';
+});
+
+test('Hermes postflight contract accepts a null workspace state without losing strict validation', () => {
+  const parsed = GatewayTurnPostflightRequestSchema.parse({
+    sessionId: 'hermes-null-workspace',
+    runId: 'gateway-null-workspace',
+    turnId: 'turn-null-workspace',
+    draft: 'done',
+    host: { model: 'grok', provider: 'etla-router' },
+    workspaceState: null,
+  });
+  assert.equal(parsed.workspaceState, undefined);
+});
+
+test('gateway canonicalizes legacy root workspace aliases before Host tool execution', () => {
+  const parsed = GatewayTurnPreflightRequestSchema.parse({
+    request: 'inspect the repository only',
+    sessionId: 'hermes-canonical-workspace',
+    turnId: 'turn-canonical-workspace',
+    platform: 'telegram',
+    host: { model: 'grok', provider: 'etla-router' },
+    workspaceRoot: '/root/openclaw-projects/zenos-runtime',
+  });
+  assert.equal(parsed.workspaceRoot, '/srv/etla/workspaces/zenos-runtime');
 });
 
 test('native gateway direct path persists a real Runtime turn while skipping unnecessary roles', async () => {
@@ -302,6 +330,101 @@ test('unfinished coding context survives a natural follow-up after compression',
   }
 });
 
+test('unfinished coding validation schedules bounded automatic continuation under the same durable task', async () => {
+  const originalFetch = globalThis.fetch;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'etla-gateway-continuation-'));
+  fs.mkdirSync(path.join(root, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({ name: 'continuation-fixture', scripts: { test: 'node --test' } }));
+  fs.writeFileSync(path.join(root, 'src', 'parser.ts'), 'export const parse = (value: string) => value.trim();\n');
+  const calledModels: string[] = [];
+  globalThis.fetch = async (_input: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body || '{}')) as { model: string };
+    calledModels.push(body.model);
+    if (body.model === 'runtime-host') {
+      return modelResponse(hostPlan({
+        useWorker: false,
+        useVerifier: true,
+        rationale: 'Host owns the bounded coding change and requires final validation.',
+      }));
+    }
+    if (body.model === 'runtime-verifier') {
+      return modelResponse({
+        verdict: 'pass',
+        confidence: 0.9,
+        issues: [],
+        checks: {
+          followsUserRequest: 'pass',
+          sourceGrounded: 'pass',
+          secretSafe: 'pass',
+          actionSafe: 'pass',
+          testsOrValidation: 'fail',
+        },
+        nextAction: 'answer',
+      });
+    }
+    throw new Error(`Unexpected model ${body.model}`);
+  };
+
+  const beforeState = {
+    workspaceRoot: root,
+    gitHead: '',
+    dirtyDiffSha256: 'a'.repeat(64),
+    changedFiles: [],
+    clean: true,
+    capturedAt: new Date().toISOString(),
+  };
+
+  try {
+    const preflight = await preflightGatewayTurn({
+      request: 'fix parser ini sampai targeted test lulus',
+      sessionId: 'hermes_internal_continuation_test',
+      turnId: 'turn-internal-continuation-1',
+      platform: 'telegram',
+      host: { model: 'grok', provider: 'etla-router' },
+      workspaceRoot: root,
+      workspaceState: beforeState,
+      hasFiles: true,
+      hasCodeChangeIntent: true,
+      intent: 'mutate',
+      modelOverrides: modelOverrides(),
+    });
+    assert.ok(preflight.codingTaskId);
+
+    const postflight = await postflightGatewayTurn({
+      sessionId: 'hermes_internal_continuation_test',
+      runId: preflight.runId,
+      turnId: 'turn-internal-continuation-1',
+      draft: 'Patch applied but test still fails; continue next turn.',
+      host: { model: 'grok', provider: 'etla-router' },
+      toolSummary: [
+        'edit_file: completed — Updated src/parser.ts',
+        'test.run: failed — targeted parser test exited code 1',
+      ].join('\n'),
+      workspaceState: {
+        ...beforeState,
+        dirtyDiffSha256: 'b'.repeat(64),
+        clean: false,
+        capturedAt: new Date().toISOString(),
+      },
+      hostUsage: { inputTokens: 600, outputTokens: 100, calls: 2 },
+    });
+
+    assert.equal(postflight.ok, true);
+    assert.equal(postflight.failed, false);
+    assert.equal(postflight.continuation?.required, true);
+    assert.equal(postflight.continuation?.taskId, preflight.codingTaskId);
+    assert.equal(postflight.continuation?.attempt, 1);
+    assert.match(postflight.continuation?.prompt || '', /same Zenos Runtime coding task/i);
+    assert.match(postflight.continuation?.prompt || '', /Do not ask the user to send another command/i);
+    const session = getRuntimeSession('hermes_internal_continuation_test');
+    assert.equal(session?.status, 'working');
+    assert.deepEqual(calledModels, ['runtime-host', 'runtime-verifier']);
+  } finally {
+    globalThis.fetch = originalFetch;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('postflight fails closed when Hermes mutates code but leaves deterministic validation broken', async () => {
   const originalFetch = globalThis.fetch;
   const calledModels: string[] = [];
@@ -394,6 +517,42 @@ test('Host planner can retain a serious task and prevent Worker from becoming th
     assert.equal(preflight.receipt.worker.invoked, false);
     assert.deepEqual(calledModels, ['runtime-host']);
     assert.match(preflight.decision.reasons.join(' '), /Host retained the task/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('optional Host planning cannot exhaust the mandatory Hermes Host reservation', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_input: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body || '{}')) as { model: string };
+    assert.equal(body.model, 'runtime-host');
+    return Response.json({
+      choices: [{ message: { content: JSON.stringify(hostPlan({
+        useWorker: false,
+        rationale: 'Host retains the task after a deliberately expensive planning call.',
+      })) }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 2_100, completion_tokens: 180, total_tokens: 2_280 },
+    });
+  };
+
+  try {
+    const preflight = await preflightGatewayTurn({
+      request: 'ringkas konteks panjang ini dan tentukan keputusan yang paling aman',
+      sessionId: 'hermes_planner_budget_isolation',
+      turnId: 'turn-planner-budget-isolation',
+      platform: 'telegram',
+      host: { model: 'grok', provider: 'etla-router' },
+      context: 'bounded context '.repeat(300),
+      estimatedContextTokens: 12_000,
+      intent: 'analyze',
+      modelOverrides: modelOverrides(),
+    });
+
+    assert.equal(preflight.receipt.host.plannerInvoked, true);
+    assert.ok(preflight.hostBudget.reservedTokens > 0);
+    assert.equal(preflight.hostBudget.budgetId.startsWith('gateway_'), true);
+    assert.equal(preflight.hostBudget.budgetId.endsWith(':planning'), false);
   } finally {
     globalThis.fetch = originalFetch;
   }

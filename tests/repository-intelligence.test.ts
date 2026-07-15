@@ -135,6 +135,8 @@ test('default tool broker exposes real repository and validation tools', async (
     'schema.validate',
     'secret.scan',
   ]) assert.ok(names.includes(expected), `missing tool ${expected}`);
+  const restartTool = broker.list().find((tool) => tool.name === 'service.restart');
+  assert.equal(restartTool?.brokeredProduction, true);
 
   const toolContext = { cwd: root, approvalGranted: false, allowProduction: false };
   const symbol = await broker.execute('repo.symbol', { name: 'alpha' }, toolContext);

@@ -17,7 +17,7 @@ Deterministic intent + risk policy
 SQLite WAL state + route telemetry + optional Zenos Memory
 ```
 
-## What v0.5 guarantees
+## What v0.7 guarantees
 
 - **Real four-role execution.** Host, Worker, Verifier, and Boss use distinct configurable model slots.
 - **Real revision semantics.** A `revise` verdict produces a new Host draft and another verification pass.
@@ -35,7 +35,10 @@ SQLite WAL state + route telemetry + optional Zenos Memory
 - **No-Regret Routing Board.** Shadow routing aggregates outcomes and surfaces cheaper or stronger candidates, but cannot promote a route automatically without sufficient evidence and explicit human approval.
 - **Modular orchestration.** Gateway contracts, continuity, planning, rendering, accounting, latency, and outcome intelligence live in bounded modules instead of one orchestration god-file.
 - **Verified HTTP execution plane.** Health, routing, durable sessions, scoped auth, dry-run orchestration, idempotent replay, and conflict responses are exercised through the actual Next.js Route Handlers.
-- **Canonical filesystem boundaries.** Read, mutation, and remote-validation roots resolve real paths and reject symlink escapes before tools or Git operations run.
+- **Canonical filesystem boundaries.** Read, mutation, and remote-validation roots resolve real paths, normalize the legacy `/root/openclaw-projects` alias to `/srv/etla/workspaces`, and reject symlink escapes before tools or Git operations run.
+- **Invisible bounded continuation.** Unfinished coding turns retain one durable task and automatically continue for a bounded number of backend turns; the user sees one terminal result rather than needing to repeat the command after compaction or failed validation.
+- **Isolated mandatory authority.** Optional Host planning has a separate token governor, while unavailable mandatory Verifier/Boss roles deterministically escalate or block instead of consuming the final Host reserve or silently degrading.
+- **Narrow production operations.** Approved service status, logs, and restarts flow through the allowlisted Unix-socket operations broker rather than raw `systemctl` from non-root Runtime or Hermes processes.
 
 ## Current default role models
 

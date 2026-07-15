@@ -1,8 +1,8 @@
 [Unit]
-Description=Zenos Runtime v0.6 - Durable Token-Governed Control Plane
+Description=Zenos Runtime v0.7 - Durable Continuation Control Plane
 Documentation=file:/opt/zenos-runtime/current/README.md
-After=network-online.target 9router.service srv-etla-workspaces.mount
-Wants=network-online.target 9router.service srv-etla-workspaces.mount
+After=network-online.target 9router.service srv-etla-workspaces.mount etla-ops-broker.service
+Wants=network-online.target 9router.service srv-etla-workspaces.mount etla-ops-broker.service
 StartLimitIntervalSec=60
 StartLimitBurst=8
 
@@ -10,6 +10,7 @@ StartLimitBurst=8
 Type=simple
 User=zenos-runtime
 Group=zenos-runtime
+SupplementaryGroups=etla-ops
 WorkingDirectory=/opt/zenos-runtime/current
 LoadCredentialEncrypted=zenos-runtime.env:/etc/credstore.encrypted/zenos-runtime.env.cred
 Environment=HOME=/var/lib/zenos-runtime

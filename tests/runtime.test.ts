@@ -20,7 +20,11 @@ import {
 import { authorizeRequest, issueScopedToken } from '../app/lib/auth';
 import { createCodingTask } from '../app/lib/codex-execution-core';
 import { getRuntimeStore, resetRuntimeStoreForTests, RuntimeStore } from '../app/lib/zenos-runtime-store';
-import { runZenosPipeline } from '../app/lib/zenos-runtime-executor';
+import {
+  RuntimeRunRequestSchema,
+  runVerifier,
+  runZenosPipeline,
+} from '../app/lib/zenos-runtime-executor';
 import { OutcomePassportSchema } from '../app/lib/outcome-ledger';
 
 function signedRequest(options: {
@@ -73,6 +77,31 @@ test.beforeEach(() => {
   process.env.ZENOS_RUNTIME_DISABLE_MEMORY = 'true';
   process.env.ZENOS_RUNTIME_DISABLE_MEMORY_AUTO_RECALL = 'true';
   process.env.ZENOS_ALLOW_LEGACY_HMAC = 'false';
+});
+
+test('mandatory verifier failures escalate deterministically instead of silently releasing a draft', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => modelResponse('not valid verifier json');
+  try {
+    const input = RuntimeRunRequestSchema.parse({
+      request: 'verify this high-risk answer',
+      sessionId: 'mandatory-verifier-fallback',
+      userRequestedVerification: true,
+      modelOverrides: {
+        baseUrl: 'http://models.test/v1',
+        apiKey: 'test-key',
+        verifierModel: 'runtime-verifier',
+        verifierProvider: 'etla-router',
+      },
+    });
+    const verifier = await runVerifier(input, 'candidate answer', undefined, { mandatory: true });
+    assert.equal(verifier.call.ok, false);
+    assert.equal(verifier.result?.verdict, 'escalate');
+    assert.equal(verifier.result?.nextAction, 'escalate');
+    assert.match(verifier.result?.issues[0]?.requiredFix || '', /fail closed/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test('routing policy passes its full regression suite and avoids deploy false positives', () => {

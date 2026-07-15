@@ -26,7 +26,7 @@ fi
 if [[ -d /root/.npm/_npx ]]; then
   find /root/.npm/_npx -mindepth 1 -maxdepth 1 -mtime +7 -exec rm -rf -- {} +
 fi
-for cache in /root/openclaw-projects/*/.next/cache; do
+for cache in /srv/etla/workspaces/*/.next/cache; do
   [[ -d "${cache}" ]] || continue
   find "${cache}" -xdev -type f -mtime +14 -delete
   find "${cache}" -xdev -depth -type d -empty -delete || true

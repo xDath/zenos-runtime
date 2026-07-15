@@ -16,7 +16,7 @@ Etla Runtime has four independently configurable model slots:
 Run the interactive setup wizard:
 
 ```bash
-cd /root/openclaw-projects/zenos-runtime
+cd /srv/etla/workspaces/zenos-runtime
 npm run runtime:setup
 ```
 

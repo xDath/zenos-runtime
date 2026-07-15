@@ -8,6 +8,7 @@ StartLimitIntervalSec=0
 Type=simple
 User=hermes
 Group=hermes
+SupplementaryGroups=etla-ops
 WorkingDirectory=/usr/local/lib/hermes-agent
 Environment=HOME=/var/lib/hermes
 Environment=USER=hermes

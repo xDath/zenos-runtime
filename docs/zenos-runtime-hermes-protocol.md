@@ -51,31 +51,31 @@ http://127.0.0.1:3090
 Health check:
 
 ```bash
-node /root/openclaw-projects/zenos-runtime/scripts/zenos-runtime-local-client.mjs health
+node /srv/etla/workspaces/zenos-runtime/scripts/zenos-runtime-local-client.mjs health
 ```
 
 Create session:
 
 ```bash
-node /root/openclaw-projects/zenos-runtime/scripts/zenos-runtime-local-client.mjs session '{"request":"...","hasFiles":true,"hasCodeChangeIntent":true}'
+node /srv/etla/workspaces/zenos-runtime/scripts/zenos-runtime-local-client.mjs session '{"request":"...","hasFiles":true,"hasCodeChangeIntent":true}'
 ```
 
 Dispatch worker lease:
 
 ```bash
-node /root/openclaw-projects/zenos-runtime/scripts/zenos-runtime-local-client.mjs dispatch <sessionId> coding_brief "inspect affected files and emit evidence"
+node /srv/etla/workspaces/zenos-runtime/scripts/zenos-runtime-local-client.mjs dispatch <sessionId> coding_brief "inspect affected files and emit evidence"
 ```
 
 Record event:
 
 ```bash
-node /root/openclaw-projects/zenos-runtime/scripts/zenos-runtime-local-client.mjs event '{"sessionId":"...","workerId":"...","type":"finding","summary":"...","evidence":["file.ts:1"],"severity":"low","confidence":0.9,"needsBoss":false}'
+node /srv/etla/workspaces/zenos-runtime/scripts/zenos-runtime-local-client.mjs event '{"sessionId":"...","workerId":"...","type":"finding","summary":"...","evidence":["file.ts:1"],"severity":"low","confidence":0.9,"needsBoss":false}'
 ```
 
 Escalate:
 
 ```bash
-node /root/openclaw-projects/zenos-runtime/scripts/zenos-runtime-local-client.mjs escalate <sessionId> "Host detected risky or ambiguous event"
+node /srv/etla/workspaces/zenos-runtime/scripts/zenos-runtime-local-client.mjs escalate <sessionId> "Host detected risky or ambiguous event"
 ```
 
 ## Host Responsibilities
@@ -124,6 +124,6 @@ The Host should receive compressed briefs and evidence pointers, not raw context
 
 If Runtime is down:
 
-1. Try to restart with `npm run start:local` in `/root/openclaw-projects/zenos-runtime`.
+1. Try to restart with `npm run start:local` in `/srv/etla/workspaces/zenos-runtime`.
 2. If still down, continue only if task is safe and low-risk.
 3. For serious work, tell user Runtime is unavailable before proceeding.

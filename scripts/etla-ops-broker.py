@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 SOCKET_PATH = Path("/run/etla-ops/broker.sock")
+OPS_GROUP = "etla-ops"
 MAX_REQUEST_BYTES = 32_000
 MAX_RESPONSE_BYTES = 128_000
 ALLOWED_UNITS = frozenset(
@@ -29,6 +30,7 @@ ALLOWED_UNITS = frozenset(
         "9router.service",
         "hermes-gateway.service",
         "nginx.service",
+        "rh-copybot.service",
         "zenos-runtime.service",
     }
 )
@@ -70,10 +72,13 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
         return _run(["/usr/bin/systemctl", "reload", _unit(request.get("unit"))], timeout=90)
     if action == "logs":
         lines = max(20, min(int(request.get("lines") or 120), 500))
-        return _run(
-            ["/usr/bin/journalctl", "--no-pager", "-u", _unit(request.get("unit")), "-n", str(lines), "--output=short-iso"],
-            timeout=30,
-        )
+        argv = ["/usr/bin/journalctl", "--no-pager", "-u", _unit(request.get("unit")), "-n", str(lines), "--output=short-iso"]
+        since = str(request.get("since") or "").strip()
+        if since:
+            if len(since) > 100 or any(char in since for char in ("\n", "\r", "\x00")):
+                raise ValueError("invalid journal since value")
+            argv.extend(["--since", since])
+        return _run(argv, timeout=30)
     if action == "nginx-reload":
         tested = _run(["/usr/sbin/nginx", "-t"], timeout=30)
         if not tested["ok"]:
@@ -114,15 +119,16 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
 
 def _allowed_uids() -> set[int]:
     uids = {0}
-    try:
-        uids.add(pwd.getpwnam("hermes").pw_uid)
-    except KeyError:
-        pass
+    for name in ("hermes", "zenos-runtime"):
+        try:
+            uids.add(pwd.getpwnam(name).pw_uid)
+        except KeyError:
+            pass
     return uids
 
 
 def serve() -> None:
-    group = grp.getgrnam("hermes")
+    group = grp.getgrnam(OPS_GROUP)
     SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
     os.chown(SOCKET_PATH.parent, 0, group.gr_gid)
     os.chmod(SOCKET_PATH.parent, 0o750)

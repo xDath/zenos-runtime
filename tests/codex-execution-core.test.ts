@@ -102,6 +102,7 @@ test('Codex preparation creates repository-aware inspect state and checkpoint', 
 
   const prepared = await prepareCodexExecution({
     taskId: 'prepared-task',
+    runId: 'run-initial',
     request: 'fix src/value.ts and run the related test',
     workspaceRoot: root,
     acceptanceCriteria: ['value behavior is corrected', 'related tests pass'],
@@ -113,6 +114,16 @@ test('Codex preparation creates repository-aware inspect state and checkpoint', 
   assert.ok(prepared.impact.relatedTests.includes('tests/value.test.ts'));
   assert.match(prepared.context, /Repository revision:/);
   assert.match(prepared.context, /Validation plan:/);
+
+  const continued = await prepareCodexExecution({
+    taskId: prepared.state.taskId,
+    runId: 'run-continuation',
+    request: 'internal bounded continuation',
+    workspaceRoot: root,
+  }, store);
+  assert.equal(continued.state.taskId, prepared.state.taskId);
+  assert.equal(continued.state.runId, 'run-continuation');
+  assert.equal(continued.state.request, 'fix src/value.ts and run the related test');
 });
 
 test('production coding checkpoints persist outside the read-only checkout', async (context) => {

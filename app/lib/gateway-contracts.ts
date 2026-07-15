@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { normalizeWorkspacePath } from './execution-boundary';
 import { LatencyBudgetPlanSchema, LatencyObservationSchema } from './latency-budget';
 import { RouteDecision, RuntimeContextSchema, WorkerResultSchema } from './zenos-runtime';
 import { RuntimeRunRequestSchema } from './zenos-runtime-executor';
@@ -17,6 +18,8 @@ export const GatewayContextMessageSchema = z.object({
   tool_call_id: z.string().trim().max(500).optional(),
 });
 
+const GatewayWorkspaceRootSchema = z.string().trim().min(1).max(4_096).transform(normalizeWorkspacePath);
+
 export const GatewayWorkspaceFileSchema = z.object({
   path: z.string().trim().min(1).max(4_096),
   sha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
@@ -24,7 +27,7 @@ export const GatewayWorkspaceFileSchema = z.object({
 });
 
 export const GatewayWorkspaceStateSchema = z.object({
-  workspaceRoot: z.string().trim().min(1).max(4_096),
+  workspaceRoot: GatewayWorkspaceRootSchema,
   gitHead: z.string().trim().max(200).default(''),
   dirtyDiffSha256: z.string().regex(/^[a-f0-9]{64}$/),
   changedFiles: z.array(GatewayWorkspaceFileSchema).max(200).default([]),
@@ -39,8 +42,8 @@ export const GatewayTurnPreflightRequestSchema = RuntimeContextSchema.extend({
   host: GatewayModelIdentitySchema,
   context: z.string().max(120_000).optional().default(''),
   handoffMessages: z.array(GatewayContextMessageSchema).max(400).optional().default([]),
-  workspaceRoot: z.string().trim().min(1).max(4_096).optional(),
-  workspaceState: GatewayWorkspaceStateSchema.optional(),
+  workspaceRoot: GatewayWorkspaceRootSchema.optional(),
+  workspaceState: GatewayWorkspaceStateSchema.nullish().transform((value) => value ?? undefined),
   approvalGranted: z.boolean().optional().default(false),
   modelOverrides: z.object({
     baseUrl: z.string().trim().min(1).optional(),
@@ -63,7 +66,7 @@ export const GatewayTurnPostflightRequestSchema = z.object({
   draft: z.string().max(200_000),
   host: GatewayModelIdentitySchema,
   toolSummary: z.string().max(80_000).optional().default(''),
-  workspaceState: GatewayWorkspaceStateSchema.optional(),
+  workspaceState: GatewayWorkspaceStateSchema.nullish().transform((value) => value ?? undefined),
   failed: z.boolean().optional().default(false),
   hostUsage: z.object({
     inputTokens: z.number().int().nonnegative().default(0),
@@ -132,7 +135,7 @@ export const StoredGatewayPreflightSchema = z.object({
   holdFinalDelivery: z.boolean(),
   codingTaskId: z.string().optional(),
   codingPhase: z.string().optional(),
-  workspaceState: GatewayWorkspaceStateSchema.optional(),
+  workspaceState: GatewayWorkspaceStateSchema.nullish().transform((value) => value ?? undefined),
 });
 
 export type GatewayTurnPreflightRequest = z.output<typeof GatewayTurnPreflightRequestSchema>;

@@ -102,6 +102,8 @@ export const CodingTaskStateSchema = z.object({
   unresolvedRisks: z.array(z.string().max(8_000)),
   acceptanceCriteria: z.array(z.string().max(8_000)),
   forbiddenActions: z.array(z.string().max(8_000)),
+  continuationAttempts: z.number().int().nonnegative().max(10).default(0),
+  lastContinuationAt: z.string().datetime().optional(),
   tokenUsage: z.object({
     input: z.number().int().nonnegative(),
     output: z.number().int().nonnegative(),
@@ -270,6 +272,7 @@ export function createCodingTask(input: {
           'Do not introduce dependencies without explicit evidence and approval.',
           'Do not change public APIs without explicit approval.',
         ],
+    continuationAttempts: 0,
     tokenUsage: { input: 0, output: 0, estimatedCost: 0 },
     createdAt,
     updatedAt: createdAt,
@@ -318,7 +321,7 @@ export function transitionCodingTask(
 export function updateCodingTask(
   taskId: string,
   patch: Partial<Pick<CodingTaskState,
-    'filesInspected' | 'filesChanged' | 'assumptions' | 'toolCalls' | 'validations' | 'failures' | 'checkpoints' | 'unresolvedRisks' | 'acceptanceCriteria' | 'forbiddenActions' | 'tokenUsage' | 'workspaceRevision' | 'status'>>,
+    'runId' | 'filesInspected' | 'filesChanged' | 'assumptions' | 'toolCalls' | 'validations' | 'failures' | 'checkpoints' | 'unresolvedRisks' | 'acceptanceCriteria' | 'forbiddenActions' | 'continuationAttempts' | 'lastContinuationAt' | 'tokenUsage' | 'workspaceRevision' | 'status'>>,
   store: RuntimeStore = getRuntimeStore(),
 ): CodingTaskState {
   const state = loadCodingTask(taskId, store);
@@ -625,6 +628,12 @@ export async function prepareCodexExecution(input: {
       forbiddenActions: input.forbiddenActions,
       assumptions: changedFiles.length ? [] : ['No explicit target file was identified; repository evidence must narrow the scope before patching.'],
     }, store);
+  } else if (input.runId && state.runId !== input.runId) {
+    // A bounded automatic continuation creates a fresh Runtime run while
+    // retaining the same durable coding task. Rebind the task to the current
+    // run so abort/lease reconciliation targets the active execution rather
+    // than the original pre-compaction run.
+    state = updateCodingTask(state.taskId, { runId: input.runId }, store);
   }
   const validationPlan = createValidationPlan(repository, impact);
   if (state.currentPhase === 'understand') {

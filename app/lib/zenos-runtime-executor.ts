@@ -52,6 +52,7 @@ import {
   ChangeImpact,
   renderRepositoryContext,
 } from './repository-intelligence';
+import { normalizeWorkspacePath } from './execution-boundary';
 import { createDefaultSkillRegistry } from './skill-registry';
 import {
   buildDeltaRevisionContext,
@@ -80,7 +81,7 @@ export const RuntimeRunRequestSchema = RuntimeContextSchema.extend({
   dryRun: z.boolean().optional().default(false),
   modelOverrides: RuntimeModelSlotsSchema.optional().default({}),
   maxRevisionAttempts: z.number().int().min(0).max(1).optional(),
-  workspaceRoot: z.string().trim().min(1).max(4_096).optional(),
+  workspaceRoot: z.string().trim().min(1).max(4_096).transform(normalizeWorkspacePath).optional(),
   enableRepositoryIntelligence: z.boolean().optional().default(true),
   codingTaskId: z.string().trim().min(1).max(220).optional(),
   autonomousCoding: z.boolean().optional().default(true),
@@ -1115,6 +1116,27 @@ Apply every required change that is supported. Remove unsupported claims. Do not
   });
 }
 
+function mandatoryVerifierFallback(reason: string): VerifierResult {
+  return validateVerifierResult({
+    verdict: 'escalate',
+    confidence: 0.35,
+    issues: [{
+      severity: 'high',
+      issue: 'The mandatory model verifier was unavailable or returned an invalid structured verdict.',
+      evidence: redactText(reason).slice(0, 2_000),
+      requiredFix: 'Escalate to the Boss authority or fail closed; do not silently release the unverified draft.',
+    }],
+    checks: {
+      followsUserRequest: 'unknown',
+      sourceGrounded: 'fail',
+      secretSafe: 'unknown',
+      actionSafe: 'fail',
+      testsOrValidation: 'fail',
+    },
+    nextAction: 'escalate',
+  });
+}
+
 export async function runVerifier(
   input: z.infer<typeof RuntimeRunRequestSchema>,
   draft: string,
@@ -1145,11 +1167,25 @@ Return ONLY JSON:
     tokenBudgetPlan: options.budget,
     mandatory: options.mandatory,
   });
-  if (!call.ok || !call.parsed) return { call };
+  if (!call.ok || !call.parsed) {
+    const failedCall = call.ok
+      ? { ...call, ok: false, error: 'Verifier returned no parseable structured content' }
+      : call;
+    return options.mandatory
+      ? { call: failedCall, result: mandatoryVerifierFallback(failedCall.error || 'Verifier returned no structured content') }
+      : { call: failedCall };
+  }
   try {
     return { call, result: validateVerifierResult(call.parsed) };
   } catch (error) {
-    return { call: { ...call, ok: false, error: error instanceof Error ? error.message : 'Verifier output failed validation' } };
+    const failedCall = {
+      ...call,
+      ok: false,
+      error: error instanceof Error ? error.message : 'Verifier output failed validation',
+    };
+    return options.mandatory
+      ? { call: failedCall, result: mandatoryVerifierFallback(failedCall.error) }
+      : { call: failedCall };
   }
 }
 
@@ -1772,7 +1808,14 @@ export async function runZenosPipeline(request: RuntimeRunRequest): Promise<Runt
         });
         modelCalls.push(verifier.call);
         if (!verifier.result) {
-          throw new Error(`Verifier unavailable: ${verifier.call.error || 'invalid verifier output'}`);
+          recordPipelineActivity(sessionId, 'verifier', 'Optional verifier was unavailable; Host draft retained without claiming independent verification.', {
+            runId,
+            model: verifier.call.model,
+            provider: verifier.call.provider,
+            error: verifier.call.error,
+            mandatory: false,
+          }, 'error');
+          break;
         }
         verifierResult = verifier.result;
         verifierResults.push(verifier.result);

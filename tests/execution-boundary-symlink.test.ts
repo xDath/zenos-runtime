@@ -3,8 +3,17 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import test from 'node:test';
-import { evaluateExecutionBoundary } from '../app/lib/execution-boundary';
+import { evaluateExecutionBoundary, normalizeWorkspacePath } from '../app/lib/execution-boundary';
 import { resolveRepositoryPath } from '../app/lib/repository-intelligence';
+
+test('legacy root workspace paths normalize to the hardened bind mount', () => {
+  assert.equal(normalizeWorkspacePath('/root/openclaw-projects'), '/srv/etla/workspaces');
+  assert.equal(
+    normalizeWorkspacePath('/root/openclaw-projects/zenos-runtime/app/lib'),
+    '/srv/etla/workspaces/zenos-runtime/app/lib',
+  );
+  assert.equal(normalizeWorkspacePath('/var/lib/zenos-runtime'), '/var/lib/zenos-runtime');
+});
 
 test('execution and repository boundaries resolve symlinks before allowlist checks', (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zenos-boundary-'));

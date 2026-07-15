@@ -40,8 +40,20 @@ function configuredRoots(name: string, fallback: string[]): string[] {
   return [...new Set(roots)];
 }
 
+const LEGACY_WORKSPACE_ROOT = '/root/openclaw-projects';
+const CANONICAL_WORKSPACE_ROOT = '/srv/etla/workspaces';
+
+export function normalizeWorkspacePath(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed === LEGACY_WORKSPACE_ROOT) return CANONICAL_WORKSPACE_ROOT;
+  if (trimmed.startsWith(`${LEGACY_WORKSPACE_ROOT}/`)) {
+    return `${CANONICAL_WORKSPACE_ROOT}${trimmed.slice(LEGACY_WORKSPACE_ROOT.length)}`;
+  }
+  return trimmed;
+}
+
 function canonicalPath(value: string): string {
-  const resolved = path.resolve(value);
+  const resolved = path.resolve(normalizeWorkspacePath(value));
   try {
     return fs.realpathSync.native(resolved);
   } catch {

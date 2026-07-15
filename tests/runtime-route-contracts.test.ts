@@ -51,7 +51,7 @@ test('public health is live while routing fails closed and validates real HTTP c
   const healthBody = await health.json() as { ok: boolean; version: string };
   assert.equal(health.status, 200);
   assert.equal(healthBody.ok, true);
-  assert.equal(healthBody.version, '0.6.0');
+  assert.equal(healthBody.version, '0.7.0');
   assert.equal(health.headers.get('cache-control'), 'no-store');
 
   const missingAuth = await routePost(request('/api/runtime/route', {

@@ -6,6 +6,15 @@ if [[ ${EUID} -ne 0 ]]; then
   exit 1
 fi
 
+# Remove the exact malformed legacy proxy placeholder that breaks login shells
+# with `=: not found`. Administrator-managed proxy configuration is preserved.
+if [[ -f /etc/profile.d/9proxy.sh ]]; then
+  compact_proxy_fragment="$(tr -d '[:space:]' </etc/profile.d/9proxy.sh)"
+  if [[ "${compact_proxy_fragment}" == '=""' ]]; then
+    rm -f /etc/profile.d/9proxy.sh
+  fi
+fi
+
 SOURCE_ROOT="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 cd "${SOURCE_ROOT}"
 
@@ -40,6 +49,7 @@ HERMES_SERVICE_USER="hermes"
 HERMES_SERVICE_GROUP="hermes"
 ROUTER_SERVICE_USER="etla-router"
 ROUTER_SERVICE_GROUP="etla-router"
+OPS_SERVICE_GROUP="etla-ops"
 HERMES_PROFILE_ROOT="/var/lib/hermes/.hermes/profiles/zenos"
 LEGACY_HERMES_PROFILE_ROOT="/root/.hermes/profiles/zenos"
 WORKSPACE_SOURCE="$(cd "${SOURCE_ROOT}/.." && pwd)"
@@ -63,6 +73,11 @@ fi
 if ! id -u "${ROUTER_SERVICE_USER}" >/dev/null 2>&1; then
   useradd --system --gid "${ROUTER_SERVICE_GROUP}" --home-dir /var/lib/9router --shell /usr/sbin/nologin "${ROUTER_SERVICE_USER}"
 fi
+if ! getent group "${OPS_SERVICE_GROUP}" >/dev/null; then
+  groupadd --system "${OPS_SERVICE_GROUP}"
+fi
+usermod -a -G "${OPS_SERVICE_GROUP}" "${HERMES_SERVICE_USER}"
+usermod -a -G "${OPS_SERVICE_GROUP}" "${SERVICE_USER}"
 command -v setfacl >/dev/null 2>&1 || {
   echo "The acl package is required for least-privilege workspace access." >&2
   exit 1

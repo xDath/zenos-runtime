@@ -44,6 +44,7 @@ def main() -> int:
     logs = sub.add_parser("logs")
     logs.add_argument("unit")
     logs.add_argument("--lines", type=int, default=120)
+    logs.add_argument("--since")
     sub.add_parser("nginx-reload")
     sub.add_parser("deploy-runtime")
     sub.add_parser("maintenance")
@@ -53,6 +54,8 @@ def main() -> int:
         payload["unit"] = args.unit
     if hasattr(args, "lines"):
         payload["lines"] = args.lines
+    if hasattr(args, "since") and args.since:
+        payload["since"] = args.since
     try:
         result = request(payload)
     except Exception as error:

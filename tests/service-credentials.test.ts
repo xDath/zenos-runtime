@@ -142,6 +142,7 @@ test('Hermes gateway runs non-root and delegates only narrow privileged operatio
   const broker = readFileSync('scripts/etla-ops-broker.py', 'utf8');
   assert.match(unit, /^User=hermes$/m);
   assert.match(unit, /^Group=hermes$/m);
+  assert.match(unit, /^SupplementaryGroups=etla-ops$/m);
   assert.match(unit, /^Environment=USER=hermes$/m);
   assert.match(unit, /^Environment=LOGNAME=hermes$/m);
   assert.match(unit, /^NoNewPrivileges=true$/m);
@@ -156,9 +157,12 @@ test('Hermes gateway runs non-root and delegates only narrow privileged operatio
 test('privileged broker keeps cloud deployment outside its AF_UNIX-only sandbox', () => {
   const broker = readFileSync('scripts/etla-ops-broker.py', 'utf8');
   const unit = readFileSync('etla-ops-broker.service', 'utf8');
-  assert.match(unit, /^Group=hermes$/m);
+  assert.match(unit, /^Group=etla-ops$/m);
   assert.match(unit, /^RuntimeDirectoryMode=0750$/m);
   assert.match(unit, /^RestrictAddressFamilies=AF_UNIX$/m);
+  assert.match(broker, /OPS_GROUP = "etla-ops"/);
+  assert.match(broker, /for name in \("hermes", "zenos-runtime"\)/);
+  assert.match(broker, /"rh-copybot\.service"/);
   assert.match(broker, /os\.chown\(SOCKET_PATH\.parent, 0, group\.gr_gid\)/);
   assert.match(broker, /os\.chmod\(SOCKET_PATH\.parent, 0o750\)/);
   assert.match(broker, /os\.chmod\(SOCKET_PATH, 0o660\)/);
@@ -222,6 +226,7 @@ test('Runtime deployment is idempotent before any gateway interruption', () => {
 
 test('Runtime stores mutable intelligence and checkpoints outside the read-only checkout', () => {
   const unit = readFileSync('zenos-runtime.service', 'utf8');
+  assert.match(unit, /^SupplementaryGroups=etla-ops$/m);
   assert.match(unit, /^Environment=ZENOS_RUNTIME_REPOSITORY_INDEX_DIR=\/var\/cache\/zenos-runtime\/repository-index$/m);
   assert.match(unit, /^Environment=ZENOS_RUNTIME_CODING_CHECKPOINT_DIR=\/var\/lib\/zenos-runtime\/coding-checkpoints$/m);
   assert.match(unit, /^ReadOnlyPaths=.*\/srv\/etla\/workspaces$/m);

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   compactMemoryHandoff,
   continuityFingerprint,
+  recallMemoryContext,
   resetMemoryClientForTests,
 } from '../app/lib/zenos-memory-client';
 import {
@@ -60,18 +61,20 @@ test('Memory handoff sends a bounded DAG compaction contract and returns coverag
   };
 
   try {
+    const handoffMessages = Array.from({ length: 120 }, (_, index) => ({
+      role: index % 2 === 0 ? 'user' : 'assistant',
+      content: `Routine continuity message ${index}`,
+    }));
+    handoffMessages[0] = { role: 'user', content: 'Build a safe Host context handoff.' };
+    handoffMessages[61] = { role: 'assistant', content: 'Important middle decision: preserve the active task ledger through compaction.' };
+    handoffMessages[119] = { role: 'user', content: 'Apply it now.' };
     const result = await compactMemoryHandoff({
       sessionId: 'continuity-test-session',
       conversationId: 'turn-1',
       approxTokens: 190_000,
       inputMaxChars: 240_000,
       maxChars: 10_000,
-      messages: [
-        { role: 'user', content: 'Build a safe Host context handoff.' },
-        { role: 'assistant', content: 'We will preserve goals and decisions.' },
-        { role: 'tool', content: 'Tests passed.', name: 'terminal' },
-        { role: 'user', content: 'Apply it now.' },
-      ],
+      messages: handoffMessages,
     });
 
     assert.equal(result.ok, true);
@@ -80,6 +83,8 @@ test('Memory handoff sends a bounded DAG compaction contract and returns coverag
     assert.equal(observedBody?.mode, 'dag');
     assert.equal(observedBody?.input_max_chars, 240_000);
     assert.equal(observedBody?.max_chars, 10_000);
+    assert.equal((observedBody?.messages as unknown[]).length, 120);
+    assert.match(JSON.stringify(observedBody?.messages), /Important middle decision/);
     assert.match(observedIdempotencyKey, /^continuity-compact:[a-f0-9]{64}$/);
   } finally {
     globalThis.fetch = originalFetch;
@@ -91,6 +96,74 @@ test('Memory handoff sends a bounded DAG compaction contract and returns coverag
     else process.env.ZENOS_RUNTIME_DISABLE_MEMORY = previous.disabled;
     if (previous.handoffDisabled === undefined) delete process.env.ZENOS_RUNTIME_DISABLE_MEMORY_HANDOFF;
     else process.env.ZENOS_RUNTIME_DISABLE_MEMORY_HANDOFF = previous.handoffDisabled;
+  }
+});
+
+test('Memory recall compiles ranked records into a bounded cognitive brief', async () => {
+  const originalFetch = globalThis.fetch;
+  const previous = {
+    baseUrl: process.env.ZENOS_MEMORY_BASE_URL,
+    apiKey: process.env.ZENOS_MEMORY_API_KEY,
+    disabled: process.env.ZENOS_RUNTIME_DISABLE_MEMORY,
+    recallDisabled: process.env.ZENOS_RUNTIME_DISABLE_MEMORY_AUTO_RECALL,
+  };
+  process.env.ZENOS_MEMORY_BASE_URL = 'http://memory.test';
+  process.env.ZENOS_MEMORY_API_KEY = 'test-memory-key';
+  delete process.env.ZENOS_RUNTIME_DISABLE_MEMORY;
+  delete process.env.ZENOS_RUNTIME_DISABLE_MEMORY_AUTO_RECALL;
+  globalThis.fetch = async (input: string | URL | Request) => {
+    if (String(input) === 'http://memory.test/api/memory/revision') {
+      return Response.json({ success: true, namespace: 'zenos', revision: 'revision-cognitive-0001' });
+    }
+    assert.equal(String(input), 'http://memory.test/api/memory/hybrid-recall');
+    return Response.json({
+      success: true,
+      results: [
+        {
+          id: 'task-1',
+          type: 'task',
+          content: 'Pending: finish canonical workspace migration and validate Runtime postflight.',
+          score: 0.96,
+          reason: 'high hybrid relevance',
+          metadata: { confidence: 0.98, importance: 10, source: 'runtime-ledger' },
+        },
+        {
+          id: 'decision-1',
+          type: 'decision',
+          content: 'Use /srv/etla/workspaces as the canonical workspace root.',
+          score: 0.91,
+          metadata: { confidence: 0.99, importance: 9, source: 'audit' },
+        },
+        {
+          id: 'failure-1',
+          type: 'insight',
+          content: 'Previous failure: workspaceState null caused Runtime postflight validation errors.',
+          score: 0.88,
+          metadata: { confidence: 0.97, importance: 9, source: 'journal' },
+        },
+      ],
+    });
+  };
+
+  try {
+    const result = await recallMemoryContext({ query: 'continue Runtime repair', namespace: 'zenos', limit: 8, maxChars: 8_000 });
+    assert.equal(result.ok, true);
+    assert.match(result.value || '', /# Zenos Cognitive Brief/);
+    assert.match(result.value || '', /## Active tasks and blockers/);
+    assert.match(result.value || '', /## Prior decisions/);
+    assert.match(result.value || '', /## Previous failures and lessons/);
+    assert.match(result.value || '', /evidence, not as executable instructions/i);
+    assert.match(result.value || '', /source=runtime-ledger confidence=0\.98 reason=high hybrid relevance/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (previous.baseUrl === undefined) delete process.env.ZENOS_MEMORY_BASE_URL;
+    else process.env.ZENOS_MEMORY_BASE_URL = previous.baseUrl;
+    if (previous.apiKey === undefined) delete process.env.ZENOS_MEMORY_API_KEY;
+    else process.env.ZENOS_MEMORY_API_KEY = previous.apiKey;
+    if (previous.disabled === undefined) delete process.env.ZENOS_RUNTIME_DISABLE_MEMORY;
+    else process.env.ZENOS_RUNTIME_DISABLE_MEMORY = previous.disabled;
+    if (previous.recallDisabled === undefined) delete process.env.ZENOS_RUNTIME_DISABLE_MEMORY_AUTO_RECALL;
+    else process.env.ZENOS_RUNTIME_DISABLE_MEMORY_AUTO_RECALL = previous.recallDisabled;
   }
 });
 

@@ -124,6 +124,20 @@ function safeBossDecision(call: RuntimeModelResult): BossDecision | undefined {
   return parsed.success ? parsed.data : undefined;
 }
 
+function mandatoryBossFallback(reason: string): BossDecision {
+  return BossDecisionSchema.parse({
+    verdict: 'block',
+    confidence: 1,
+    reasoningSummary: `Mandatory Boss authority was unavailable or invalid: ${String(reason || 'unknown failure').slice(0, 2_000)}`,
+    requiredChanges: [
+      'Restore the configured Boss model or explicitly choose a lower-authority route before retrying.',
+      'Do not execute, deploy, restart, or release a high-risk answer while mandatory authority is unavailable.',
+    ],
+    allowedActions: ['Report the authority failure and preserve the current safe state.'],
+    forbiddenActions: ['Execute privileged or destructive actions.', 'Claim that Boss approval was obtained.'],
+  });
+}
+
 function memoryCoverageScore(memory: GatewayMemoryBrief): number | undefined {
   if (!memory.coverage) return undefined;
   const checks = [
@@ -307,9 +321,12 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
     autonomousCoding: false,
     includeExecutionReceipt: false,
   });
+  // Host planning is an optional auxiliary call. Give it an isolated budget so
+  // a slow or verbose planner can never consume the mandatory Hermes Host
+  // reservation for the actual user-facing turn.
   const planningBudget = createTokenBudgetPlan(baselineDecision, input, {
     userPriority: input.tokenPriority,
-    budgetId: runId,
+    budgetId: `${runId}:planning`,
   });
 
   ensureGatewaySession(input, baselineDecision, runId, {
@@ -378,6 +395,7 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
   }
   const hostPlan = hostPlanning.plan;
   const hostPlanCall = hostPlanning.call;
+  completeTokenBudget(planningBudget.budgetId);
   decision = hostPlanning.decision;
   ensureGatewaySession(input, decision, runId, {
     turnId: request.turnId,
@@ -493,6 +511,9 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
       mandatory: request.userRequestedBoss || decision.requiresApproval,
     });
     bossPreflight = safeBossDecision(bossCall);
+    if (!bossPreflight && (request.userRequestedBoss || decision.requiresApproval)) {
+      bossPreflight = mandatoryBossFallback(bossCall.error || 'Boss preflight returned no valid decision');
+    }
     preflightLatency.push(observeLatency('boss', bossCall.latencyMs, latencyPlan.bossMs));
     recordActivity(
       request.sessionId,
@@ -584,6 +605,9 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
     codingPhase: codingTask?.currentPhase,
     hostContext: [
       renderHostContext(decision, hostPlan, workerResult, bossPreflight, memoryBrief, runId),
+      request.workspaceRoot
+        ? `Canonical workspace root: ${request.workspaceRoot}\n- Use this path for every repository and terminal operation.\n- Treat /root/openclaw-projects as a legacy alias only; never send it to Hermes tools inside the hardened service sandbox.`
+        : '',
       codingTask
         ? `Transactional coding state:\n- task_id: ${codingTask.taskId}\n- phase: ${codingTask.currentPhase}\n- checkpoint: ${codingTask.checkpoints.at(-1)?.checkpointId || 'pending'}\n- workspace_revision: ${codingTask.workspaceRevision}\n- Rule: before any new mutation after compaction or interruption, reconcile Git HEAD, dirty diff hash, and changed-file hashes. Never deploy or restart before deterministic validation passes.`
         : '',
@@ -654,6 +678,7 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
     ? postflightDecisionForObservedMutation(storedDecision, input)
     : storedDecision;
 
+  let codingTaskState: CodingTaskState | undefined;
   if (stored.codingTaskId) {
     let codingTask = store.getCodingTask(stored.codingTaskId)?.state as CodingTaskState | undefined;
     if (codingTask && observedCoding.mutated && !request.workspaceState) {
@@ -700,6 +725,7 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
         }, store);
       }
     }
+    codingTaskState = codingTask;
   }
   const latencyPlan = decision.pipelineMode === storedDecision.pipelineMode
     ? stored.latencyPlan || createLatencyBudgetPlan(decision)
@@ -953,6 +979,7 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
     || verifierResult?.verdict === 'escalate'
     || (decision.useBoss && decision.risk === 'critical' && !input.userRequestedBoss);
   if (shouldRunBoss) {
+    const bossMandatory = decision.requiresApproval || verifierResult?.verdict === 'escalate';
     const finalBossCall = await runBossReviewModel({
       stage: 'postflight',
       runId: request.runId,
@@ -975,11 +1002,12 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
       timeoutMs: roleLatencyTimeout(latencyPlan, 'boss'),
       trigger: verifierResult?.verdict === 'escalate' ? 'verifier_escalation' : 'critical_postflight_authority',
       tokenBudgetPlan: budget,
-      mandatory: decision.requiresApproval || verifierResult?.verdict === 'escalate',
+      mandatory: bossMandatory,
     });
     calls.push(finalBossCall);
     postflightLatency.push(observeLatency('boss', finalBossCall.latencyMs, latencyPlan.bossMs));
-    const parsedBoss = safeBossDecision(finalBossCall);
+    const parsedBoss = safeBossDecision(finalBossCall)
+      || (bossMandatory ? mandatoryBossFallback(finalBossCall.error || 'Boss postflight returned no valid decision') : undefined);
     if (parsedBoss) {
       bossDecision = parsedBoss;
       bossCall = finalBossCall;
@@ -1079,14 +1107,78 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
     }
   }
 
-  const terminalCodingFailure = unresolvedCodingMutation;
+  const configuredContinuationLimit = Number(process.env.ZENOS_GATEWAY_MAX_AUTO_CONTINUATIONS || 3);
+  const maxAutoContinuations = Math.max(1, Math.min(Number.isFinite(configuredContinuationLimit) ? configuredContinuationLimit : 3, 5));
+  const continuationEligible = unresolvedCodingMutation
+    && Boolean(codingTaskState)
+    && codingTaskState?.status === 'active'
+    && Boolean(request.workspaceState)
+    && !request.failed
+    && (codingTaskState?.continuationAttempts || 0) < maxAutoContinuations;
+  let continuation: {
+    required: true;
+    reason: 'coding_validation_pending';
+    taskId: string;
+    attempt: number;
+    maxAttempts: number;
+    prompt: string;
+  } | undefined;
+
+  if (continuationEligible && codingTaskState) {
+    const nextAttempt = codingTaskState.continuationAttempts + 1;
+    codingTaskState = updateCodingTask(codingTaskState.taskId, {
+      continuationAttempts: nextAttempt,
+      lastContinuationAt: now(),
+      unresolvedRisks: [
+        ...codingTaskState.unresolvedRisks.filter((risk) => !/pending deterministic validation|did not pass deterministic validation/i.test(risk)),
+        `Automatic continuation ${nextAttempt}/${maxAutoContinuations}: deterministic validation is ${deterministicValidation}.`,
+      ],
+    }, store);
+    continuation = {
+      required: true,
+      reason: 'coding_validation_pending',
+      taskId: codingTaskState.taskId,
+      attempt: nextAttempt,
+      maxAttempts: maxAutoContinuations,
+      prompt: [
+        `Continue the same Zenos Runtime coding task ${codingTaskState.taskId}; this is an internal continuation of the user's original command, not a new request.`,
+        `Canonical workspace: ${codingTaskState.workspaceRoot}`,
+        `Current phase: ${codingTaskState.currentPhase}`,
+        `Deterministic validation state: ${deterministicValidation}${observedCoding.broken ? ' (broken evidence observed)' : ''}.`,
+        `Changed files: ${codingTaskState.filesChanged.join(', ') || 'reconcile from current Git diff'}.`,
+        `Acceptance criteria: ${codingTaskState.acceptanceCriteria.join('; ')}`,
+        'Inspect the current workspace state, fix only the relevant defects, and rerun the smallest deterministic validation that proves the change.',
+        'Do not ask the user to send another command. Do not restart or deploy until validation passes. Stop only after validation passes or a genuine non-recoverable blocker requires user input.',
+      ].join('\n'),
+    };
+    finalAnswer = request.draft;
+    transformed = false;
+    recordActivity(
+      request.sessionId,
+      'host',
+      `Runtime scheduled automatic coding continuation ${nextAttempt}/${maxAutoContinuations} instead of exposing an incomplete turn to the user.`,
+      {
+        runId: request.runId,
+        turnId: request.turnId,
+        taskId: codingTaskState.taskId,
+        deterministicValidation,
+        brokenCodeEvidence: observedCoding.broken,
+        continuationAttempt: nextAttempt,
+      },
+      'success',
+    );
+  }
+
+  const terminalCodingFailure = unresolvedCodingMutation && !continuation;
   if (terminalCodingFailure) {
     finalAnswer = blockedAnswer(
       observedCoding.broken
         ? 'Hermes mengubah source code, tetapi bukti tool menunjukkan file berada dalam kondisi rusak atau validasi gagal.'
         : 'Hermes mengubah source code, tetapi tidak ada bukti deterministic validation yang lulus.',
       [
-        'Perbaiki atau rollback perubahan sampai syntax, typecheck, lint, atau targeted test yang relevan lulus.',
+        continuationEligible
+          ? 'Automatic continuation could not be scheduled safely; reconcile the durable task state before retrying.'
+          : `Perbaiki atau rollback perubahan sampai syntax, typecheck, lint, atau targeted test yang relevan lulus. Automatic continuation limit: ${maxAutoContinuations}.`,
         'Jangan restart, deploy, atau menandai pekerjaan selesai saat working tree masih broken atau belum tervalidasi.',
       ],
     );
@@ -1094,12 +1186,14 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
     recordActivity(
       request.sessionId,
       'verifier',
-      'Runtime failed closed because a code mutation did not pass deterministic validation.',
+      'Runtime failed closed because a code mutation did not pass deterministic validation and no safe automatic continuation remained.',
       {
         runId: request.runId,
         turnId: request.turnId,
         deterministicValidation,
         brokenCodeEvidence: observedCoding.broken,
+        continuationAttempts: codingTaskState?.continuationAttempts || 0,
+        maxAutoContinuations,
       },
       'failed',
     );
@@ -1145,6 +1239,7 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
       codingValidation: observedCoding.mutated
         ? { deterministic: deterministicValidation, broken: observedCoding.broken }
         : undefined,
+      continuation,
     },
     errors: terminalCodingFailure
       ? ['Code mutation did not pass deterministic validation']
@@ -1156,7 +1251,7 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
     ? 'failed'
     : bossDecision?.verdict === 'block' || verifierResult?.verdict === 'block'
       ? 'blocked'
-      : transformed || verifierResult?.verdict === 'revise' || bossDecision?.verdict === 'revise'
+      : continuation || transformed || verifierResult?.verdict === 'revise' || bossDecision?.verdict === 'revise'
         ? 'revised'
         : 'success';
   recordOutcomePassport({
@@ -1188,6 +1283,19 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
       lastError: 'Code mutation did not pass deterministic validation',
       activeRunId: undefined,
     });
+  } else if (continuation) {
+    updateRuntimeSession(request.sessionId, {
+      status: 'working',
+      finalAnswer: undefined,
+      lastError: undefined,
+      activeRunId: undefined,
+      metadata: {
+        continuationRequired: true,
+        continuationTaskId: continuation.taskId,
+        continuationAttempt: continuation.attempt,
+        continuationMaxAttempts: continuation.maxAttempts,
+      },
+    });
   } else {
     completeRuntimeSession(request.sessionId, finalAnswer);
   }
@@ -1202,5 +1310,6 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
     verifier: verifierResult,
     boss: bossDecision,
     tokenBudget: finalTokenBudget,
+    continuation,
   };
 }
