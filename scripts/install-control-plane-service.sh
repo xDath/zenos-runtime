@@ -219,12 +219,16 @@ fi
 python3 "${SOURCE_ROOT}/scripts/prepare-9router-environment.py" \
   "${ROUTER_ENV_SOURCE_TMP}" "${ROUTER_ENV_TMP}"
 
+RUNTIME_MODELS_SOURCE="${HERMES_PROFILE_ROOT}/zenos-runtime.json"
+if [[ -s /var/lib/zenos-runtime/models.json ]]; then
+  RUNTIME_MODELS_SOURCE=/var/lib/zenos-runtime/models.json
+fi
 python3 "${SOURCE_ROOT}/scripts/prepare-runtime-service-files.py" \
   "${CREDENTIAL_TMP}" \
   "${SANITIZED_CONFIG_TMP}" \
   "${HERMES_PROFILE_ROOT}/config.yaml" \
   "${SANITIZED_MODELS_TMP}" \
-  "${HERMES_PROFILE_ROOT}/zenos-runtime.json" \
+  "${RUNTIME_MODELS_SOURCE}" \
   "${SANITIZED_HERMES_CONFIG_TMP}" \
   "${HERMES_CREDENTIAL_TMP}" \
   "${SOURCE_ROOT}/.env.local" \
@@ -249,8 +253,8 @@ rm -f /etc/zenos-runtime/runtime.env /etc/zenos-runtime/profile.env /etc/zenos-r
 install -o root -g "${SERVICE_GROUP}" -m 0640 \
   "${SANITIZED_CONFIG_TMP}" /etc/zenos-runtime/hermes-config.yaml
 
-install -o root -g "${SERVICE_GROUP}" -m 0640 \
-  "${SANITIZED_MODELS_TMP}" /etc/zenos-runtime/models.json
+install -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" -m 0600 \
+  "${SANITIZED_MODELS_TMP}" /var/lib/zenos-runtime/models.json
 HERMES_CONFIG_OWNER="root"
 HERMES_CONFIG_GROUP="root"
 if [[ "${HERMES_PROFILE_ROOT}" == /var/lib/hermes/* ]] && id -u "${HERMES_SERVICE_USER}" >/dev/null 2>&1; then

@@ -21,7 +21,7 @@ Environment=ZENOS_BIND_HOST=127.0.0.1
 Environment=ZENOS_RUNTIME_DB_PATH=/var/lib/zenos-runtime/runtime.db
 Environment=ZENOS_MEMORY_BASE_URL=https://zenos-memory.vercel.app
 Environment=ZENOS_RUNTIME_LEGACY_STORE_PATH=/var/lib/zenos-runtime/legacy-sessions.json
-Environment=ZENOS_RUNTIME_CONFIG_PATH=/etc/zenos-runtime/models.json
+Environment=ZENOS_RUNTIME_CONFIG_PATH=/var/lib/zenos-runtime/models.json
 Environment=ZENOS_VERIFIER_MODEL=ag/gemini-3.5-flash-low
 Environment=ZENOS_VERIFIER_PROVIDER=etla-router
 Environment=ZENOS_RUNTIME_SESSION_MODEL_DIR=/var/lib/zenos-runtime/session-models

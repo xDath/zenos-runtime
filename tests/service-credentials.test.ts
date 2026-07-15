@@ -229,8 +229,12 @@ test('Runtime stores mutable intelligence and checkpoints outside the read-only 
   assert.match(unit, /^SupplementaryGroups=etla-ops$/m);
   assert.match(unit, /^Environment=ZENOS_RUNTIME_REPOSITORY_INDEX_DIR=\/var\/cache\/zenos-runtime\/repository-index$/m);
   assert.match(unit, /^Environment=ZENOS_RUNTIME_CODING_CHECKPOINT_DIR=\/var\/lib\/zenos-runtime\/coding-checkpoints$/m);
+  assert.match(unit, /^Environment=ZENOS_RUNTIME_CONFIG_PATH=\/var\/lib\/zenos-runtime\/models\.json$/m);
   assert.match(unit, /^ReadOnlyPaths=.*\/srv\/etla\/workspaces$/m);
   assert.match(unit, /^ReadWritePaths=\/var\/lib\/zenos-runtime \/var\/cache\/zenos-runtime$/m);
+  const installer = readFileSync('scripts/install-control-plane-service.sh', 'utf8');
+  assert.match(installer, /RUNTIME_MODELS_SOURCE=\/var\/lib\/zenos-runtime\/models\.json/);
+  assert.match(installer, /"\$\{SANITIZED_MODELS_TMP\}" \/var\/lib\/zenos-runtime\/models\.json/);
 });
 
 test('Runtime deployment retries transient backup gates before rollback', () => {
