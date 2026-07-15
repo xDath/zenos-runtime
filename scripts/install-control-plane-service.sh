@@ -21,6 +21,19 @@ BUILD_ID="$(tr -cd 'A-Za-z0-9._-' < .next/BUILD_ID | cut -c1-32)"
 RELEASE_ROOT="/opt/zenos-runtime/releases/${VERSION}-${COMMIT}-${BUILD_ID}"
 STAGING="${RELEASE_ROOT}.staging"
 PREVIOUS_RELEASE="$(readlink -f /opt/zenos-runtime/current 2>/dev/null || true)"
+CURRENT_TARGET="${PREVIOUS_RELEASE}"
+ROLLBACK_TARGET="$(readlink -f /opt/zenos-runtime/previous 2>/dev/null || true)"
+if [[ -e "${RELEASE_ROOT}" ]]; then
+  RESOLVED_RELEASE="$(readlink -f "${RELEASE_ROOT}")"
+  if [[ "${RESOLVED_RELEASE}" == "${CURRENT_TARGET}" ]]; then
+    echo "Runtime release is already active: ${RELEASE_ROOT}"
+    exit 0
+  fi
+  if [[ "${RESOLVED_RELEASE}" == "${ROLLBACK_TARGET}" ]]; then
+    echo "Refusing to replace the rollback Runtime release: ${RELEASE_ROOT}" >&2
+    exit 1
+  fi
+fi
 SERVICE_USER="zenos-runtime"
 SERVICE_GROUP="zenos-runtime"
 HERMES_SERVICE_USER="hermes"
@@ -78,8 +91,11 @@ install -d -o "${HERMES_SERVICE_USER}" -g "${HERMES_SERVICE_GROUP}" -m 0700 \
 
 # Migrate the live profile before preparing credentials/config. Keep the legacy
 # path as a compatibility symlink, but the service identity owns the canonical
-# profile from this point onward.
-systemctl stop hermes-gateway.service 2>/dev/null || true
+# profile from this point onward. Broker-triggered deployments deliberately
+# leave the calling gateway online and defer its unit/credential reload.
+if [[ "${ZENOS_DEPLOY_RESTART_HERMES:-true}" == "true" ]]; then
+  systemctl stop hermes-gateway.service 2>/dev/null || true
+fi
 if [[ -L "${LEGACY_HERMES_PROFILE_ROOT}" ]]; then
   [[ "$(readlink -f "${LEGACY_HERMES_PROFILE_ROOT}")" == "${HERMES_PROFILE_ROOT}" ]] || {
     echo "Legacy Hermes profile symlink points to an unexpected target." >&2
@@ -132,12 +148,6 @@ runuser -u "${SERVICE_USER}" -- env HOME=/var/lib/zenos-runtime \
 
 rm -rf "${STAGING}"
 if [[ -e "${RELEASE_ROOT}" ]]; then
-  CURRENT_TARGET="$(readlink -f /opt/zenos-runtime/current 2>/dev/null || true)"
-  PREVIOUS_TARGET="$(readlink -f /opt/zenos-runtime/previous 2>/dev/null || true)"
-  if [[ "$(readlink -f "${RELEASE_ROOT}")" == "${CURRENT_TARGET}" || "$(readlink -f "${RELEASE_ROOT}")" == "${PREVIOUS_TARGET}" ]]; then
-    echo "Refusing to replace the active or rollback Runtime release: ${RELEASE_ROOT}" >&2
-    exit 1
-  fi
   rm -rf -- "${RELEASE_ROOT}"
 fi
 install -d -o root -g root -m 0755 "${STAGING}"

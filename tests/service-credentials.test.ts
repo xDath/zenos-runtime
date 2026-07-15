@@ -169,6 +169,16 @@ test('privileged broker keeps cloud deployment outside its AF_UNIX-only sandbox'
   assert.doesNotMatch(broker, /"zenos-memory\.service"/);
 });
 
+test('Runtime deployment is idempotent before any gateway interruption', () => {
+  const installer = readFileSync('scripts/install-control-plane-service.sh', 'utf8');
+  const activeReleaseGuard = installer.indexOf('Runtime release is already active:');
+  const gatewayStop = installer.indexOf('systemctl stop hermes-gateway.service');
+  assert.ok(activeReleaseGuard >= 0);
+  assert.ok(gatewayStop > activeReleaseGuard);
+  assert.match(installer, /if \[\[ "\$\{ZENOS_DEPLOY_RESTART_HERMES:-true\}" == "true" \]\]; then\n  systemctl stop hermes-gateway\.service/);
+  assert.equal((installer.match(/systemctl stop hermes-gateway\.service/g) || []).length, 1);
+});
+
 test('Runtime stores mutable intelligence and checkpoints outside the read-only checkout', () => {
   const unit = readFileSync('zenos-runtime.service', 'utf8');
   assert.match(unit, /^Environment=ZENOS_RUNTIME_REPOSITORY_INDEX_DIR=\/var\/cache\/zenos-runtime\/repository-index$/m);
