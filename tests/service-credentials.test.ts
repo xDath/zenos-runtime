@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -167,6 +167,45 @@ test('privileged broker keeps cloud deployment outside its AF_UNIX-only sandbox'
   assert.match(broker, /--collect/);
   assert.match(broker, /ZENOS_DEPLOY_RESTART_BROKER=false/);
   assert.doesNotMatch(broker, /"zenos-memory\.service"/);
+});
+
+test('Hermes runtime path migration rewrites only active cron metadata and scripts', () => {
+  const directory = mkdtempSync(path.join(tmpdir(), 'zenos-hermes-path-migration-'));
+  try {
+    const cronDirectory = path.join(directory, 'cron');
+    const scriptsDirectory = path.join(directory, 'scripts');
+    mkdirSync(cronDirectory, { recursive: true });
+    mkdirSync(scriptsDirectory, { recursive: true });
+    const jobsPath = path.join(cronDirectory, 'jobs.json');
+    const scriptPath = path.join(scriptsDirectory, 'batang_hunt.sh');
+    writeFileSync(jobsPath, JSON.stringify({
+      jobs: [{
+        id: 'job-1',
+        workdir: '/root/openclaw-projects/karir-vpn',
+        prompt: 'Use /root/.hermes/scripts/batang_hunt.sh from /root/openclaw-projects/karir-vpn.',
+      }],
+    }));
+    writeFileSync(scriptPath, '#!/bin/sh\nexec /root/openclaw-projects/karir-vpn/run_hunt.sh\n');
+
+    const first = spawnSync('python3', ['scripts/migrate-hermes-runtime-paths.py', directory], { encoding: 'utf8' });
+    assert.equal(first.status, 0, first.stderr);
+    const firstResult = JSON.parse(first.stdout) as { changedFileCount: number; replacementCount: number };
+    assert.equal(firstResult.changedFileCount, 2);
+    assert.ok(firstResult.replacementCount >= 3);
+    const jobs = readFileSync(jobsPath, 'utf8');
+    const script = readFileSync(scriptPath, 'utf8');
+    assert.match(jobs, /\/srv\/etla\/workspaces\/karir-vpn/);
+    assert.match(jobs, new RegExp(`${directory.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/scripts/batang_hunt\\.sh`));
+    assert.doesNotMatch(jobs, /\/root\/openclaw-projects|\/root\/\.hermes\/scripts/);
+    assert.match(script, /\/srv\/etla\/workspaces\/karir-vpn\/run_hunt\.sh/);
+
+    const second = spawnSync('python3', ['scripts/migrate-hermes-runtime-paths.py', directory], { encoding: 'utf8' });
+    assert.equal(second.status, 0, second.stderr);
+    const secondResult = JSON.parse(second.stdout) as { changedFileCount: number };
+    assert.equal(secondResult.changedFileCount, 0);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test('Runtime deployment is idempotent before any gateway interruption', () => {

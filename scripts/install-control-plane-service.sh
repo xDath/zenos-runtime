@@ -113,6 +113,7 @@ fi
 chown -R "${HERMES_SERVICE_USER}:${HERMES_SERVICE_GROUP}" "${HERMES_PROFILE_ROOT}"
 find "${HERMES_PROFILE_ROOT}" -xdev -type d -exec chmod u+rwx,go-rwx {} +
 find "${HERMES_PROFILE_ROOT}" -xdev -type f -exec chmod u+rw,go-rwx {} +
+python3 "${SOURCE_ROOT}/scripts/migrate-hermes-runtime-paths.py" "${HERMES_PROFILE_ROOT}"
 install -d -o root -g "${SERVICE_GROUP}" -m 0750 /etc/zenos-runtime
 install -d -o "${ROUTER_SERVICE_USER}" -g "${ROUTER_SERVICE_GROUP}" -m 0700 /var/lib/9router /var/cache/9router
 if [[ -d /opt/9router/data ]]; then
