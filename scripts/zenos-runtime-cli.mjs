@@ -15,10 +15,10 @@ const roles = ['host', 'worker', 'verifier', 'boss'];
 const builtIns = {
   baseUrl: '',
   provider: 'etla-router',
-  hostModel: 'grok',
-  workerModel: 'build',
-  verifierModel: 'grok',
-  bossModel: 'codex',
+  hostModel: 'deepseek',
+  workerModel: 'deepseek',
+  verifierModel: 'ag/gemini-3.5-flash-low',
+  bossModel: 'ag/gemini-pro-agent',
 };
 
 function readConfig() {

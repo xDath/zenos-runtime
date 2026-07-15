@@ -313,7 +313,7 @@ export function choosePipeline(input: RuntimeContext): RouteDecision {
   const summaryNeedsWorker = taskType === 'summarization' && context.estimatedContextTokens >= 4_000;
   if (
     summaryNeedsWorker
-    || largeContext
+    || (largeContext && taskType !== 'simple_chat')
     || (
       (taskType === 'coding_change' || taskType === 'debugging')
       && (context.hasFiles || mediumContext || context.intent === 'mutate' || context.intent === 'execute')
@@ -382,7 +382,13 @@ export function choosePipeline(input: RuntimeContext): RouteDecision {
     reasons.push('user explicitly requested Boss review');
   }
 
-  if (taskType === 'simple_chat' && !context.userRequestedBoss) reasons.push('low-risk request stays on direct host path');
+  if (taskType === 'simple_chat' && !context.userRequestedBoss) {
+    reasons.push(
+      largeContext
+        ? 'simple chat stays on the direct Host path; deterministic context compaction is cheaper than an extra planner or Worker call'
+        : 'low-risk request stays on direct host path',
+    );
+  }
   if (context.requiresFreshData) {
     useTools = true;
     requiresSourceContext = true;

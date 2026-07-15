@@ -92,7 +92,7 @@ test('latency budget is task-aware and reports soft and hard breaches', () => {
   assert.equal(hard.status, 'hard_breach');
 });
 
-test('four-role latency budgets follow the actual pipeline instead of a simple-chat label', () => {
+test('long simple chat latency budgets do not invent a Worker call', () => {
   const decision = choosePipeline({
     request: 'Analyze this synthetic, non-mutating production-readiness evidence and return a concise verdict.',
     intent: 'analyze',
@@ -106,7 +106,8 @@ test('four-role latency budgets follow the actual pipeline instead of a simple-c
   assert.equal(decision.pipelineMode, 'escalated_deep_path');
   assert.ok(plan.totalMs >= 100_000);
   assert.ok(plan.hostMs >= 25_000);
-  assert.ok(plan.workerMs >= 25_000);
+  assert.equal(decision.useWorker, false);
+  assert.ok(plan.workerMs <= 5_000);
   assert.ok(plan.verifierMs >= 20_000);
   assert.ok(plan.bossMs >= 20_000);
 });

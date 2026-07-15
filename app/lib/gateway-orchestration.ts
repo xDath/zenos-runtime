@@ -48,6 +48,7 @@ import {
   roleLatencyTimeout,
 } from './latency-budget';
 import { recordOutcomePassport } from './outcome-ledger';
+import { normalizeWorkspacePath } from './execution-boundary';
 import {
   CodingTaskState,
   prepareCodexExecution,
@@ -163,9 +164,13 @@ function deterministicValidationState(toolSummary: string): 'passed' | 'failed' 
 const CODE_ARTIFACT_PATTERN = /(?:\/[A-Za-z0-9._/-]+|\b[A-Za-z0-9._-]+)\.(?:py|pyi|ts|tsx|js|jsx|mjs|cjs|go|rs|java|kt|kts|cs|cpp|cc|c|h|hpp|rb|php|swift|vue|svelte|sql|sh)\b/i;
 const CODING_ACTIVITY_PATTERN = /\b(?:read(?:ing)?|edit(?:ing|ed)?|patch(?:ing|ed)?|write|wrote|modified|changed|implement(?:ing|ed)?|refactor(?:ing|ed)?|test(?:ing|ed)?|lint(?:ing|ed)?|build(?:ing|ed)?|compil(?:e|ing|ed)|traceback)\b/i;
 const CODING_MUTATION_PATTERN = /\b(?:edit(?:ing|ed)?|patch(?:ing|ed)?|write|wrote|modified|changed|implement(?:ing|ed)?|refactor(?:ing|ed)?|repair(?:ing|ed)?|fix(?:ing|ed)?)\b/i;
-const CODING_UNFINISHED_PATTERN = /\b(?:indentationerror|syntaxerror|compile\s+error|typecheck\s+error|test(?:s)?\s+failed|lint\s+failed|build\s+failed|patch\s+failed|mid[- ]patch|belum\s+(?:selesai|beres|ke-?apply|di-?apply)|unfinished|pending|blocker|next\s+turn|remaining\s+work|rollback|rusak|broken|partial)\b/i;
+const CODING_UNFINISHED_PATTERN = /\b(?:indentationerror|syntaxerror|compile\s+error|typecheck\s+error|test(?:s)?\s+failed|lint\s+failed|build\s+failed|patch\s+failed|mid[- ]patch|belum\s+(?:selesai|beres|ke-?apply|di-?apply)|unfinished|pending|blocker|next\s+turn|remaining\s+work|rollback|rusak|broken|partial|sisa\s+\d+|tinggal\s+(?:restart|test|verify|patch|fix)|maximum\s+number\s+of\s+tool|tool[- ]calling\s+iterations?|active\s+task\s+list)\b/i;
 const CODING_COMPLETED_PATTERN = /\b(?:all\s+tests?\s+passed|tests?\s+passed|validation\s+passed|typecheck\s+passed|lint\s+passed|build\s+passed|compile\s+passed|working\s+tree\s+clean|completed\s+successfully|selesai\s+dan\s+tervalidasi)\b/i;
-const CODING_FOLLOW_UP_PATTERN = /^\s*(?:tapi|dan|terus|juga|sekalian|lanjut(?:kan)?|nah|yang\s+tadi|itu|ini|gas+|soalnya)\b/i;
+const CODING_FOLLOW_UP_PATTERN = /^\s*(?:tapi|dan|terus|juga|sekalian|lanjut(?:kan)?|nah|yang\s+tadi|itu|ini|gas+|soalnya|fix(?:in|kan)?|tolong\s+(?:fix|lanjut|terusin|beresin|kerjain)|beresin|kerjain|terusin|continue|resume)\b/i;
+const WORKSPACE_ROOT_PATTERN = /(?:\/srv\/etla\/workspaces|\/root\/openclaw-projects)\/[A-Za-z0-9._-]+/g;
+const HOST_CONFIRMATION_PATTERN = /(?:\b(?:gas|lanjut|continue|proceed)\??\s*$|\b(?:mau|boleh)\s+(?:gue|aku|saya)\s+(?:lanjut|fix|kerjain|restart|test)|\bwant\s+me\s+to\s+(?:continue|proceed)|\bshall\s+i\s+(?:continue|proceed))/i;
+const TOOL_EXHAUSTION_PATTERN = /(?:maximum\s+number\s+of\s+tool[- ]calling\s+iterations|tool[- ]calling\s+limit|context\s+compaction|output\s+length\s+limit|continue\s+exactly\s+where\s+you\s+left\s+off)/i;
+const GENUINE_USER_INPUT_PATTERN = /(?:\b(?:missing|need|requires?)\s+(?:an?\s+)?(?:api\s+key|credential|secret|token|password|wallet\s+key)|\b(?:pilih|choose|which\s+option)\b|\bexplicit\s+approval\b|\bauthori[sz]ation\s+required\b)/i;
 const MUTATING_TOOL_PATTERN = /\b(?:apply_patch|patch|edit_file|write_file|replace_in_file|str_replace|create_file|delete_file|editing|updated|modified|wrote|applied\s+patch)\b/i;
 const BROKEN_CODE_PATTERN = /\b(?:indentationerror|syntaxerror|compileerror|compile\s+error|typecheck\s+error|traceback|test(?:s)?\s+failed|lint\s+failed|build\s+failed|patch\s+failed|exit\s+(?:code\s*)?[1-9])\b/i;
 
@@ -213,31 +218,48 @@ function activeCodingContinuationDecision(
   });
 }
 
-function preserveUnfinishedCodingContinuity(request: GatewayTurnPreflightRequest): GatewayTurnPreflightRequest {
-  if (request.hasCodeChangeIntent || !CODING_FOLLOW_UP_PATTERN.test(request.request)) return request;
+function inferWorkspaceRootFromContinuity(continuity: string): string | undefined {
+  const matches = [...continuity.matchAll(WORKSPACE_ROOT_PATTERN)];
+  const latest = matches.at(-1)?.[0];
+  return latest ? normalizeWorkspacePath(latest) : undefined;
+}
+
+function preserveUnfinishedCodingContinuity(
+  request: GatewayTurnPreflightRequest,
+): { request: GatewayTurnPreflightRequest; recovered: boolean } {
+  if (request.hasCodeChangeIntent || !CODING_FOLLOW_UP_PATTERN.test(request.request)) {
+    return { request, recovered: false };
+  }
   const previous = getRuntimeSession(request.sessionId);
   const continuity = [
     request.context,
-    ...request.handoffMessages.slice(-24).map((message) => message.content),
+    ...request.handoffMessages.map((message) => message.content),
     previous?.finalAnswer || '',
     previous?.lastError || '',
-  ].filter(Boolean).join('\n').slice(-40_000);
-  const hasRepositoryEvidence = Boolean(request.workspaceRoot) || CODE_ARTIFACT_PATTERN.test(continuity);
+  ].filter(Boolean).join('\n');
+  const inferredWorkspaceRoot = request.workspaceRoot || inferWorkspaceRootFromContinuity(continuity);
+  const hasRepositoryEvidence = Boolean(inferredWorkspaceRoot) || CODE_ARTIFACT_PATTERN.test(continuity);
   const hasCodingActivity = CODE_ARTIFACT_PATTERN.test(continuity)
     && CODING_ACTIVITY_PATTERN.test(continuity)
     && CODING_MUTATION_PATTERN.test(continuity);
   const lastUnfinished = lastPatternIndex(continuity, CODING_UNFINISHED_PATTERN);
   const lastCompleted = lastPatternIndex(continuity, CODING_COMPLETED_PATTERN);
-  if (!hasRepositoryEvidence || !hasCodingActivity || lastUnfinished < 0 || lastUnfinished < lastCompleted) return request;
+  if (!hasRepositoryEvidence || !hasCodingActivity || lastUnfinished < 0 || lastUnfinished < lastCompleted) {
+    return { request, recovered: false };
+  }
 
-  return GatewayTurnPreflightRequestSchema.parse({
-    ...request,
-    hasFiles: true,
-    hasCodeChangeIntent: true,
-    userRequestedVerification: true,
-    intent: request.intent === 'execute' ? 'execute' : 'mutate',
-    confidence: Math.max(request.confidence, 0.9),
-  });
+  return {
+    recovered: true,
+    request: GatewayTurnPreflightRequestSchema.parse({
+      ...request,
+      workspaceRoot: inferredWorkspaceRoot,
+      hasFiles: true,
+      hasCodeChangeIntent: true,
+      userRequestedVerification: true,
+      intent: request.intent === 'execute' ? 'execute' : 'mutate',
+      confidence: Math.max(request.confidence, 0.9),
+    }),
+  };
 }
 
 function workspaceMutationObserved(
@@ -260,6 +282,12 @@ function observedCodingState(toolSummary: string): { mutated: boolean; broken: b
     mutated,
     broken: mutated && BROKEN_CODE_PATTERN.test(text),
   };
+}
+
+function hostStoppedBeforeTerminalWork(draft: string, toolSummary: string): boolean {
+  const evidence = `${String(draft || '')}\n${String(toolSummary || '')}`;
+  if (GENUINE_USER_INPUT_PATTERN.test(evidence)) return false;
+  return TOOL_EXHAUSTION_PATTERN.test(evidence) || HOST_CONFIRMATION_PATTERN.test(String(draft || ''));
 }
 
 function postflightDecisionForObservedMutation(
@@ -294,7 +322,8 @@ function postflightDecisionForObservedMutation(
 export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
   const turnStartedAtMs = Date.now();
   const store = getRuntimeStore();
-  let request = preserveUnfinishedCodingContinuity(GatewayTurnPreflightRequestSchema.parse(raw));
+  const continuity = preserveUnfinishedCodingContinuity(GatewayTurnPreflightRequestSchema.parse(raw));
+  let request = continuity.request;
   const activeCodingRecord = store.findActiveCodingTaskBySession(request.sessionId);
   if (activeCodingRecord && request.workspaceRoot) {
     request = GatewayTurnPreflightRequestSchema.parse({
@@ -310,8 +339,19 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
   store.reconcileExpiredRuns(now());
   const runId = `gateway_${crypto.randomUUID()}`;
   let baselineDecision = choosePipeline(request);
-  if (activeCodingRecord && request.workspaceRoot) {
+  const deterministicContinuation = Boolean(request.workspaceRoot && (activeCodingRecord || continuity.recovered));
+  if (deterministicContinuation) {
     baselineDecision = activeCodingContinuationDecision(baselineDecision, request);
+    if (continuity.recovered && !activeCodingRecord) {
+      baselineDecision = RouteDecisionSchema.parse({
+        ...baselineDecision,
+        reasons: [
+          ...baselineDecision.reasons,
+          'unfinished coding context recovered from compacted session evidence',
+          'terse continuation request is executed autonomously without another confirmation turn',
+        ],
+      });
+    }
   }
   const latencyPlan = createLatencyBudgetPlan(baselineDecision);
   let decision = baselineDecision;
@@ -418,16 +458,18 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
     'queued',
   );
 
-  const hostPlanning = await runGatewayHostPlanning(
-    request,
-    input,
-    baselineDecision,
-    repositoryContext,
-    memoryBrief,
-    runId,
-    latencyPlan,
-    planningBudget,
-  );
+  const hostPlanning = deterministicContinuation
+    ? { decision: baselineDecision }
+    : await runGatewayHostPlanning(
+        request,
+        input,
+        baselineDecision,
+        repositoryContext,
+        memoryBrief,
+        runId,
+        latencyPlan,
+        planningBudget,
+      );
   if (hostPlanning.call) {
     preflightLatency.push(observeLatency('host', hostPlanning.call.latencyMs, latencyPlan.hostMs));
   }
@@ -440,7 +482,11 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
     platform: request.platform,
     hostModel: request.host.model,
     hostProvider: request.host.provider,
-    orchestration: hostPlan ? 'host-led' : 'deterministic-fallback',
+    orchestration: deterministicContinuation
+      ? 'deterministic-continuation'
+      : hostPlan
+        ? 'host-led'
+        : 'deterministic-fallback',
     hostPlanConfidence: hostPlan?.confidence,
   });
   store.saveRun({
@@ -647,7 +693,7 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
         ? `Canonical workspace root: ${request.workspaceRoot}\n- Use this path for every repository and terminal operation.\n- Treat /root/openclaw-projects as a legacy alias only; never send it to Hermes tools inside the hardened service sandbox.`
         : '',
       codingTask
-        ? `Transactional coding state:\n- task_id: ${codingTask.taskId}\n- phase: ${codingTask.currentPhase}\n- checkpoint: ${codingTask.checkpoints.at(-1)?.checkpointId || 'pending'}\n- workspace_revision: ${codingTask.workspaceRevision}\n- Rule: before any new mutation after compaction or interruption, reconcile Git HEAD, dirty diff hash, and changed-file hashes. Never deploy or restart before deterministic validation passes.`
+        ? `Transactional coding state:\n- task_id: ${codingTask.taskId}\n- phase: ${codingTask.currentPhase}\n- checkpoint: ${codingTask.checkpoints.at(-1)?.checkpointId || 'pending'}\n- workspace_revision: ${codingTask.workspaceRevision}\n- Rule: before any new mutation after compaction or interruption, reconcile Git HEAD, dirty diff hash, and changed-file hashes. Never deploy or restart before deterministic validation passes.\n- Autonomy rule: do not ask the user to reply \"gas\", \"lanjut\", or confirm ordinary implementation steps. Continue through inspect, patch, targeted validation, and safe non-privileged recovery in the same visible request. Ask only for genuinely missing user-owned input or explicit approval required by a privileged/destructive boundary.`
         : '',
     ].filter(Boolean).join('\n\n'),
     hostWorkingSetTokens: hostWorkingSetForDecision(decision),
@@ -1145,48 +1191,64 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
     }
   }
 
-  const configuredContinuationLimit = Number(process.env.ZENOS_GATEWAY_MAX_AUTO_CONTINUATIONS || 3);
-  const maxAutoContinuations = Math.max(1, Math.min(Number.isFinite(configuredContinuationLimit) ? configuredContinuationLimit : 3, 5));
-  const continuationEligible = unresolvedCodingMutation
+  const configuredContinuationLimit = Number(process.env.ZENOS_GATEWAY_MAX_AUTO_CONTINUATIONS || 5);
+  const maxAutoContinuations = Math.max(1, Math.min(Number.isFinite(configuredContinuationLimit) ? configuredContinuationLimit : 5, 5));
+  const hostInterrupted = Boolean(codingTaskState)
+    && codingTaskState?.status === 'active'
+    && hostStoppedBeforeTerminalWork(request.draft, request.toolSummary)
+    && !decision.requiresApproval
+    && bossDecision?.verdict !== 'ask_user'
+    && verifierResult?.verdict !== 'block';
+  const continuationReason = unresolvedCodingMutation
+    ? 'coding_validation_pending' as const
+    : hostInterrupted
+      ? 'host_interrupted' as const
+      : undefined;
+  const continuationEligible = Boolean(continuationReason)
     && Boolean(codingTaskState)
     && codingTaskState?.status === 'active'
-    && Boolean(request.workspaceState)
+    && (!unresolvedCodingMutation || Boolean(request.workspaceState))
     && !request.failed
     && (codingTaskState?.continuationAttempts || 0) < maxAutoContinuations;
   let continuation: {
     required: true;
-    reason: 'coding_validation_pending';
+    reason: 'coding_validation_pending' | 'host_interrupted';
     taskId: string;
     attempt: number;
     maxAttempts: number;
     prompt: string;
   } | undefined;
 
-  if (continuationEligible && codingTaskState) {
+  if (continuationEligible && codingTaskState && continuationReason) {
     const nextAttempt = codingTaskState.continuationAttempts + 1;
+    const continuationSummary = continuationReason === 'coding_validation_pending'
+      ? `deterministic validation is ${deterministicValidation}`
+      : 'the Host stopped at a confirmation/tool-limit boundary before terminal work';
     codingTaskState = updateCodingTask(codingTaskState.taskId, {
       continuationAttempts: nextAttempt,
       lastContinuationAt: now(),
       unresolvedRisks: [
-        ...codingTaskState.unresolvedRisks.filter((risk) => !/pending deterministic validation|did not pass deterministic validation/i.test(risk)),
-        `Automatic continuation ${nextAttempt}/${maxAutoContinuations}: deterministic validation is ${deterministicValidation}.`,
+        ...codingTaskState.unresolvedRisks.filter((risk) => !/pending deterministic validation|did not pass deterministic validation|host stopped before terminal work/i.test(risk)),
+        `Automatic continuation ${nextAttempt}/${maxAutoContinuations}: ${continuationSummary}.`,
       ],
     }, store);
     continuation = {
       required: true,
-      reason: 'coding_validation_pending',
+      reason: continuationReason,
       taskId: codingTaskState.taskId,
       attempt: nextAttempt,
       maxAttempts: maxAutoContinuations,
       prompt: [
         `Continue the same Zenos Runtime coding task ${codingTaskState.taskId}; this is an internal continuation of the user's original command, not a new request.`,
+        `Continuation reason: ${continuationSummary}.`,
         `Canonical workspace: ${codingTaskState.workspaceRoot}`,
         `Current phase: ${codingTaskState.currentPhase}`,
         `Deterministic validation state: ${deterministicValidation}${observedCoding.broken ? ' (broken evidence observed)' : ''}.`,
         `Changed files: ${codingTaskState.filesChanged.join(', ') || 'reconcile from current Git diff'}.`,
         `Acceptance criteria: ${codingTaskState.acceptanceCriteria.join('; ')}`,
-        'Inspect the current workspace state, fix only the relevant defects, and rerun the smallest deterministic validation that proves the change.',
-        'Do not ask the user to send another command. Do not restart or deploy until validation passes. Stop only after validation passes or a genuine non-recoverable blocker requires user input.',
+        'Continue autonomously through the next useful inspect, patch, or targeted-validation steps. Keep progress narration internal and do not split ordinary implementation into user confirmations.',
+        'Do not ask the user to reply “gas”, “lanjut”, or approve a routine next step. Ask only for genuinely missing user-owned input or an explicit privileged/destructive approval that cannot be safely inferred.',
+        'Do not restart or deploy until deterministic validation passes. Stop only after acceptance criteria pass or a genuine non-recoverable blocker requires user input.',
       ].join('\n'),
     };
     finalAnswer = request.draft;
@@ -1194,13 +1256,14 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
     recordActivity(
       request.sessionId,
       'host',
-      `Runtime scheduled automatic coding continuation ${nextAttempt}/${maxAutoContinuations} instead of exposing an incomplete turn to the user.`,
+      `Runtime scheduled automatic coding continuation ${nextAttempt}/${maxAutoContinuations} (${continuationReason}) instead of exposing an incomplete turn to the user.`,
       {
         runId: request.runId,
         turnId: request.turnId,
         taskId: codingTaskState.taskId,
         deterministicValidation,
         brokenCodeEvidence: observedCoding.broken,
+        continuationReason,
         continuationAttempt: nextAttempt,
       },
       'success',
@@ -1208,6 +1271,7 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
   }
 
   const terminalCodingFailure = unresolvedCodingMutation && !continuation;
+  const terminalAutonomyFailure = hostInterrupted && !continuation;
   if (terminalCodingFailure) {
     finalAnswer = blockedAnswer(
       observedCoding.broken
@@ -1235,7 +1299,30 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
       },
       'failed',
     );
+  } else if (terminalAutonomyFailure) {
+    finalAnswer = blockedAnswer(
+      'Hermes berhenti pada batas internal sebelum acceptance criteria selesai, dan batas automatic continuation sudah habis.',
+      [
+        'Tidak perlu membalas “gas” atau “lanjut”. Runtime harus membuka run baru hanya setelah state task direkonsiliasi.',
+        `Automatic continuation limit: ${maxAutoContinuations}.`,
+      ],
+    );
+    transformed = true;
+    recordActivity(
+      request.sessionId,
+      'host',
+      'Runtime failed closed after the Host repeatedly stopped at an internal confirmation/tool-limit boundary.',
+      {
+        runId: request.runId,
+        turnId: request.turnId,
+        continuationAttempts: codingTaskState?.continuationAttempts || 0,
+        maxAutoContinuations,
+      },
+      'failed',
+    );
   }
+
+  const terminalFailure = terminalCodingFailure || terminalAutonomyFailure;
 
   const receipt: GatewayTurnReceipt = {
     pipeline: decision.pipelineMode,
@@ -1261,7 +1348,7 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
   store.saveRun({
     ...run,
     decision,
-    status: terminalCodingFailure
+    status: terminalFailure
       ? 'failed'
       : bossDecision?.verdict === 'block' || verifierResult?.verdict === 'block'
         ? 'blocked'
@@ -1281,11 +1368,13 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
     },
     errors: terminalCodingFailure
       ? ['Code mutation did not pass deterministic validation']
-      : [],
+      : terminalAutonomyFailure
+        ? ['Host stopped before terminal work and automatic continuation was exhausted']
+        : [],
     completedAt: now(),
   });
   accountGatewayModelUsage(request.sessionId, calls, request.hostUsage);
-  const outcomeVerdict = terminalCodingFailure
+  const outcomeVerdict = terminalFailure
     ? 'failed'
     : bossDecision?.verdict === 'block' || verifierResult?.verdict === 'block'
       ? 'blocked'
@@ -1314,11 +1403,13 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
     hostModel: stored.host.model,
     hostProvider: stored.host.provider,
   });
-  if (terminalCodingFailure) {
+  if (terminalFailure) {
     updateRuntimeSession(request.sessionId, {
       status: 'failed',
       finalAnswer,
-      lastError: 'Code mutation did not pass deterministic validation',
+      lastError: terminalCodingFailure
+        ? 'Code mutation did not pass deterministic validation'
+        : 'Host stopped before terminal work and automatic continuation was exhausted',
       activeRunId: undefined,
     });
   } else if (continuation) {
@@ -1340,8 +1431,8 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
   completeTokenBudget(request.runId);
 
   return {
-    ok: !terminalCodingFailure,
-    failed: terminalCodingFailure,
+    ok: !terminalFailure,
+    failed: terminalFailure,
     finalAnswer,
     transformed,
     receipt,

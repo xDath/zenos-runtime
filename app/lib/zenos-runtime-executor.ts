@@ -276,10 +276,10 @@ function safeJsonParse(text: string): unknown | null {
 
 function builtInModelSlots(): RuntimeModelSlots {
   return RuntimeModelSlotsSchema.parse({
-    hostModel: 'grok',
-    workerModel: 'build',
-    bossModel: 'codex',
-    verifierModel: 'grok',
+    hostModel: 'deepseek',
+    workerModel: 'deepseek',
+    bossModel: 'ag/gemini-pro-agent',
+    verifierModel: 'ag/gemini-3.5-flash-low',
     hostProvider: 'etla-router',
     workerProvider: 'etla-router',
     bossProvider: 'etla-router',

@@ -141,6 +141,39 @@ test('native gateway direct path persists a real Runtime turn while skipping unn
   }
 });
 
+test('large simple chat stays direct and never burns an auxiliary planner or Worker call', async () => {
+  const originalFetch = globalThis.fetch;
+  let fetchCalls = 0;
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    throw new Error('large simple chat must stay deterministic and Host-only');
+  };
+
+  try {
+    const preflight = await preflightGatewayTurn({
+      request: 'mana kok masih utuh',
+      sessionId: 'hermes_large_direct_test',
+      turnId: 'turn-large-direct-1',
+      platform: 'telegram',
+      host: { model: 'deepseek', provider: 'etla-router' },
+      context: 'historical compacted context '.repeat(2_000),
+      estimatedContextTokens: 31_000,
+      intent: 'analyze',
+      modelOverrides: modelOverrides(),
+    });
+
+    assert.equal(preflight.decision.taskType, 'simple_chat');
+    assert.equal(preflight.decision.pipelineMode, 'direct_fast_path');
+    assert.equal(preflight.decision.useWorker, false);
+    assert.equal(preflight.receipt.host.plannerInvoked, false);
+    assert.equal(preflight.receipt.worker.invoked, false);
+    assert.equal(fetchCalls, 0);
+    assert.match(preflight.decision.reasons.join(' '), /deterministic context compaction is cheaper/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('native gateway worker path calls the configured Worker and injects its bounded brief into Hermes Host context', async () => {
   const originalFetch = globalThis.fetch;
   const calledModels: string[] = [];
@@ -268,6 +301,11 @@ test('clear coding work keeps Host as orchestrator before bounded Worker delegat
 
 test('unfinished coding context survives a natural follow-up after compression', async () => {
   const originalFetch = globalThis.fetch;
+  const root = fs.mkdtempSync('/srv/etla/workspaces/etla-continuity-test-');
+  const projectName = path.basename(root);
+  const legacyRoot = `/root/openclaw-projects/${projectName}`;
+  fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({ name: projectName }));
+  fs.writeFileSync(path.join(root, 'bot.py'), 'print("unfinished")\n');
   const calledModels: string[] = [];
   globalThis.fetch = async (_input: string | URL | Request, init?: RequestInit) => {
     const body = JSON.parse(String(init?.body || '{}')) as { model: string };
@@ -285,7 +323,7 @@ test('unfinished coding context survives a natural follow-up after compression',
         summary: ['The previous patch is incomplete and must be repaired before finalization.'],
         findings: [{
           claim: 'bot.py was left mid-patch with an IndentationError.',
-          evidence: ['/root/openclaw-projects/rh-copybot/bot.py'],
+          evidence: [`${legacyRoot}/bot.py`],
           confidence: 0.99,
           risk: 'high',
         }],
@@ -302,14 +340,14 @@ test('unfinished coding context survives a natural follow-up after compression',
 
   try {
     const preflight = await preflightGatewayTurn({
-      request: 'tapi lihat juga sellnya kan, sellnya juga pasti ga langsung sell pasti sellnya berurutan',
+      request: 'tolong fix dong',
       sessionId: 'hermes_coding_continuity_test',
       turnId: 'turn-coding-continuity-1',
       platform: 'telegram',
       host: { model: 'grok', provider: 'etla-router' },
       context: [
-        'Reading /root/openclaw-projects/rh-copybot/bot.py',
-        'Editing /root/openclaw-projects/rh-copybot/bot.py',
+        `Reading ${legacyRoot}/bot.py`,
+        `Editing ${legacyRoot}/bot.py`,
         'Status jujur: file sempat rusak mid-patch dan belum selesai.',
         'Blocker sekarang: bot.py IndentationError. Next turn repair lalu jalankan test.',
       ].join('\n'),
@@ -322,11 +360,90 @@ test('unfinished coding context survives a natural follow-up after compression',
     assert.equal(preflight.decision.useWorker, true);
     assert.equal(preflight.decision.useVerifier, true);
     assert.equal(preflight.holdFinalDelivery, true);
+    assert.equal(preflight.receipt.host.plannerInvoked, false);
     assert.equal(preflight.receipt.worker.invoked, true);
-    assert.match(preflight.hostContext, /Do not finish the turn while the change is broken or unvalidated/i);
-    assert.deepEqual(calledModels, ['runtime-host', 'runtime-worker']);
+    assert.equal(preflight.codingPhase, 'inspect');
+    assert.match(preflight.hostContext, new RegExp(`Canonical workspace root: ${root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'i'));
+    assert.match(preflight.hostContext, /do not ask the user to reply "gas"/i);
+    assert.match(preflight.decision.reasons.join(' '), /unfinished coding context recovered from compacted session evidence/i);
+    assert.deepEqual(calledModels, ['runtime-worker']);
   } finally {
     globalThis.fetch = originalFetch;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('Host confirmation prompts are swallowed and continued internally without another user reply', async () => {
+  const originalFetch = globalThis.fetch;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'etla-gateway-no-confirm-'));
+  fs.mkdirSync(path.join(root, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({ name: 'no-confirm-fixture' }));
+  fs.writeFileSync(path.join(root, 'src', 'bot.py'), 'print("ok")\n');
+  const calledModels: string[] = [];
+  globalThis.fetch = async (_input: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body || '{}')) as { model: string };
+    calledModels.push(body.model);
+    if (body.model === 'runtime-host') {
+      return modelResponse(hostPlan({
+        useWorker: false,
+        useVerifier: true,
+        rationale: 'Host can execute the bounded implementation without preliminary Worker delegation.',
+      }));
+    }
+    if (body.model === 'runtime-verifier') {
+      return modelResponse({
+        verdict: 'pass',
+        confidence: 0.9,
+        issues: [],
+        checks: {
+          followsUserRequest: 'pass',
+          sourceGrounded: 'pass',
+          secretSafe: 'pass',
+          actionSafe: 'pass',
+          testsOrValidation: 'not_applicable',
+        },
+        nextAction: 'answer',
+      });
+    }
+    throw new Error(`Unexpected model ${body.model}`);
+  };
+
+  try {
+    const preflight = await preflightGatewayTurn({
+      request: 'perbaiki bot ini sampai selesai',
+      sessionId: 'hermes_no_confirmation_test',
+      turnId: 'turn-no-confirmation-1',
+      platform: 'telegram',
+      host: { model: 'deepseek', provider: 'etla-router' },
+      workspaceRoot: root,
+      hasFiles: true,
+      hasCodeChangeIntent: true,
+      intent: 'mutate',
+      modelOverrides: modelOverrides(),
+    });
+    assert.ok(preflight.codingTaskId);
+
+    const postflight = await postflightGatewayTurn({
+      sessionId: 'hermes_no_confirmation_test',
+      runId: preflight.runId,
+      turnId: 'turn-no-confirmation-1',
+      draft: 'Patch 2/6 selesai. Gas lanjut?',
+      host: { model: 'deepseek', provider: 'etla-router' },
+      toolSummary: 'read_file: inspected src/bot.py; more implementation remains',
+      hostUsage: { inputTokens: 400, outputTokens: 70, calls: 2 },
+    });
+
+    assert.equal(postflight.ok, true);
+    assert.equal(postflight.failed, false);
+    assert.equal(postflight.continuation?.required, true);
+    assert.equal(postflight.continuation?.reason, 'host_interrupted');
+    assert.equal(postflight.continuation?.attempt, 1);
+    assert.match(postflight.continuation?.prompt || '', /do not ask the user to reply “gas”/i);
+    assert.equal(getRuntimeSession('hermes_no_confirmation_test')?.status, 'working');
+    assert.deepEqual(calledModels, ['runtime-host', 'runtime-verifier']);
+  } finally {
+    globalThis.fetch = originalFetch;
+    fs.rmSync(root, { recursive: true, force: true });
   }
 });
 
@@ -433,7 +550,7 @@ test('unfinished coding validation schedules bounded automatic continuation unde
     assert.equal(postflight.continuation?.taskId, preflight.codingTaskId);
     assert.equal(postflight.continuation?.attempt, 1);
     assert.match(postflight.continuation?.prompt || '', /same Zenos Runtime coding task/i);
-    assert.match(postflight.continuation?.prompt || '', /Do not ask the user to send another command/i);
+    assert.match(postflight.continuation?.prompt || '', /Do not ask the user to reply/i);
     const session = getRuntimeSession('hermes_internal_continuation_test');
     assert.equal(session?.status, 'working');
 
@@ -460,7 +577,7 @@ test('unfinished coding validation schedules bounded automatic continuation unde
       continuedPreflight.decision.reasons.join(' '),
       /active durable coding task overrides lexical classification/i,
     );
-    assert.deepEqual(calledModels, ['runtime-host', 'runtime-verifier', 'runtime-host', 'runtime-worker']);
+    assert.deepEqual(calledModels, ['runtime-host', 'runtime-verifier', 'runtime-worker']);
   } finally {
     globalThis.fetch = originalFetch;
     fs.rmSync(root, { recursive: true, force: true });
@@ -544,17 +661,18 @@ test('Host planner can retain a serious task and prevent Worker from becoming th
 
   try {
     const preflight = await preflightGatewayTurn({
-      request: 'ringkas konteks panjang ini, tapi fokus hanya pada keputusan utamanya',
+      request: 'rancang arsitektur migrasi ini, tapi fokus hanya pada keputusan utamanya',
       sessionId: 'hermes_host_retains_test',
       turnId: 'turn-host-retains-1',
       platform: 'discord',
       host: { model: 'grok', provider: 'etla-router' },
       context: 'bounded context',
       estimatedContextTokens: 10_000,
-      intent: 'analyze',
+      intent: 'plan',
       modelOverrides: modelOverrides(),
     });
 
+    assert.equal(preflight.decision.taskType, 'planning_or_architecture');
     assert.equal(preflight.decision.useWorker, false);
     assert.equal(preflight.receipt.worker.invoked, false);
     assert.deepEqual(calledModels, ['runtime-host']);
@@ -580,14 +698,14 @@ test('optional Host planning cannot exhaust the mandatory Hermes Host reservatio
 
   try {
     const preflight = await preflightGatewayTurn({
-      request: 'ringkas konteks panjang ini dan tentukan keputusan yang paling aman',
+      request: 'rancang arsitektur perubahan ini dan tentukan keputusan yang paling aman',
       sessionId: 'hermes_planner_budget_isolation',
       turnId: 'turn-planner-budget-isolation',
       platform: 'telegram',
       host: { model: 'grok', provider: 'etla-router' },
       context: 'bounded context '.repeat(300),
       estimatedContextTokens: 12_000,
-      intent: 'analyze',
+      intent: 'plan',
       modelOverrides: modelOverrides(),
     });
 

@@ -113,8 +113,9 @@ test('concise response preferences do not override the actual task classificatio
 
 test('four-role orchestration reserves enough structured output budget to avoid truncated contracts', () => {
   const context = RuntimeContextSchema.parse({
-    request: 'analyze this bounded readiness evidence',
+    request: 'analyze this bounded source-code readiness evidence',
     intent: 'analyze',
+    hasFiles: true,
     estimatedContextTokens: 8_000,
     userRequestedVerification: true,
     userRequestedBoss: true,
