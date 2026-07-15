@@ -15,31 +15,43 @@ from pathlib import Path
 from typing import Any
 
 MAX_SCRIPT_BYTES = 1_000_000
+OPERATIONAL_JOB_FIELDS = ("workdir", "prompt", "script", "context_from")
 
 
-def _replace_strings(value: Any, replacements: tuple[tuple[str, str], ...]) -> tuple[Any, int]:
-    if isinstance(value, str):
-        updated = value
-        for old, new in replacements:
+def _replace_text(value: str, replacements: tuple[tuple[str, str], ...]) -> tuple[str, int]:
+    updated = value
+    replacement_count = 0
+    for old, new in replacements:
+        occurrences = updated.count(old)
+        if occurrences:
             updated = updated.replace(old, new)
-        return updated, int(updated != value)
-    if isinstance(value, list):
-        changed = 0
-        items: list[Any] = []
-        for item in value:
-            updated, item_changed = _replace_strings(item, replacements)
-            items.append(updated)
-            changed += item_changed
-        return items, changed
-    if isinstance(value, dict):
-        changed = 0
-        mapping: dict[str, Any] = {}
-        for key, item in value.items():
-            updated, item_changed = _replace_strings(item, replacements)
-            mapping[key] = updated
-            changed += item_changed
-        return mapping, changed
-    return value, 0
+            replacement_count += occurrences
+    return updated, replacement_count
+
+
+def _migrate_active_jobs(payload: Any, replacements: tuple[tuple[str, str], ...]) -> int:
+    if isinstance(payload, dict):
+        jobs = payload.get("jobs", [])
+    elif isinstance(payload, list):
+        jobs = payload
+    else:
+        jobs = []
+    if not isinstance(jobs, list):
+        return 0
+
+    replacement_count = 0
+    for job in jobs:
+        if not isinstance(job, dict):
+            continue
+        for field in OPERATIONAL_JOB_FIELDS:
+            value = job.get(field)
+            if not isinstance(value, str):
+                continue
+            updated, changed = _replace_text(value, replacements)
+            if changed:
+                job[field] = updated
+                replacement_count += changed
+    return replacement_count
 
 
 def _atomic_write(path: Path, content: str) -> None:
@@ -77,9 +89,9 @@ def migrate_profile(profile_root: Path) -> dict[str, Any]:
     jobs_path = profile_root / "cron" / "jobs.json"
     if jobs_path.is_file():
         payload = json.loads(jobs_path.read_text(encoding="utf-8"))
-        updated, changed = _replace_strings(payload, replacements)
+        changed = _migrate_active_jobs(payload, replacements)
         if changed:
-            _atomic_write(jobs_path, json.dumps(updated, ensure_ascii=False, indent=2) + "\n")
+            _atomic_write(jobs_path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
             changed_files.append(str(jobs_path))
             replaced_values += changed
 
@@ -94,13 +106,11 @@ def migrate_profile(profile_root: Path) -> dict[str, Any]:
                 original = script_path.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
                 continue
-            updated = original
-            for old, new in replacements:
-                updated = updated.replace(old, new)
-            if updated != original:
+            updated, changed = _replace_text(original, replacements)
+            if changed:
                 _atomic_write(script_path, updated)
                 changed_files.append(str(script_path))
-                replaced_values += 1
+                replaced_values += changed
 
     return {
         "ok": True,

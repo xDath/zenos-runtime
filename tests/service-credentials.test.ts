@@ -183,6 +183,7 @@ test('Hermes runtime path migration rewrites only active cron metadata and scrip
         id: 'job-1',
         workdir: '/root/openclaw-projects/karir-vpn',
         prompt: 'Use /root/.hermes/scripts/batang_hunt.sh from /root/openclaw-projects/karir-vpn.',
+        last_error: "Historical failure at /root/openclaw-projects/karir-vpn",
       }],
     }));
     writeFileSync(scriptPath, '#!/bin/sh\nexec /root/openclaw-projects/karir-vpn/run_hunt.sh\n');
@@ -196,7 +197,8 @@ test('Hermes runtime path migration rewrites only active cron metadata and scrip
     const script = readFileSync(scriptPath, 'utf8');
     assert.match(jobs, /\/srv\/etla\/workspaces\/karir-vpn/);
     assert.match(jobs, new RegExp(`${directory.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/scripts/batang_hunt\\.sh`));
-    assert.doesNotMatch(jobs, /\/root\/openclaw-projects|\/root\/\.hermes\/scripts/);
+    assert.doesNotMatch(jobs, /"workdir": "\/root\/openclaw-projects|\/root\/\.hermes\/scripts/);
+    assert.match(jobs, /Historical failure at \/root\/openclaw-projects\/karir-vpn/);
     assert.match(script, /\/srv\/etla\/workspaces\/karir-vpn\/run_hunt\.sh/);
 
     const second = spawnSync('python3', ['scripts/migrate-hermes-runtime-paths.py', directory], { encoding: 'utf8' });
@@ -224,6 +226,15 @@ test('Runtime stores mutable intelligence and checkpoints outside the read-only 
   assert.match(unit, /^Environment=ZENOS_RUNTIME_CODING_CHECKPOINT_DIR=\/var\/lib\/zenos-runtime\/coding-checkpoints$/m);
   assert.match(unit, /^ReadOnlyPaths=.*\/srv\/etla\/workspaces$/m);
   assert.match(unit, /^ReadWritePaths=\/var\/lib\/zenos-runtime \/var\/cache\/zenos-runtime$/m);
+});
+
+test('Runtime deployment retries transient backup gates before rollback', () => {
+  const installer = readFileSync('scripts/install-control-plane-service.sh', 'utf8');
+  assert.match(installer, /start_oneshot_with_retry\(\)/);
+  assert.match(installer, /start_oneshot_with_retry zenos-runtime-backup\.service 6 30/);
+  assert.match(installer, /start_oneshot_with_retry zenos-memory-secondary-backup\.service 3 10/);
+  assert.match(installer, /systemctl reset-failed "\$\{unit\}"/);
+  assert.match(installer, /if systemctl start "\$\{unit\}"; then/);
 });
 
 test('Runtime deployment activates the release only after preparation completes', () => {

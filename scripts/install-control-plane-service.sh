@@ -349,6 +349,24 @@ if [[ "${RUNTIME_READY}" != "true" ]]; then
   exit 1
 fi
 
+start_oneshot_with_retry() {
+  local unit="$1"
+  local attempts="${2:-3}"
+  local delay_seconds="${3:-10}"
+  local attempt
+  for ((attempt = 1; attempt <= attempts; attempt += 1)); do
+    systemctl reset-failed "${unit}" >/dev/null 2>&1 || true
+    if systemctl start "${unit}"; then
+      return 0
+    fi
+    if ((attempt < attempts)); then
+      echo "${unit} failed attempt ${attempt}/${attempts}; retrying in ${delay_seconds}s." >&2
+      sleep "${delay_seconds}"
+    fi
+  done
+  return 1
+}
+
 # Prove the cloud Memory data plane end to end before removing the legacy local
 # sidecar from the boot graph. This performs scoped auth, Drive-backed write,
 # recall, optimistic edit, readiness, and archive in an isolated smoke namespace.
@@ -368,10 +386,10 @@ fi
 # Backups are a deployment gate, not an afterthought. Produce and locally
 # restore-verify both encrypted artifacts, then upload/read-back verify them in
 # Drive while the legacy sidecar is still available for emergency rollback.
-if ! systemctl start zenos-runtime-backup.service \
-  || ! systemctl start zenos-memory-secondary-backup.service \
-  || ! systemctl start zenos-offsite-backup.service \
-  || ! systemctl start etla-maintenance.service; then
+if ! start_oneshot_with_retry zenos-runtime-backup.service 6 30 \
+  || ! start_oneshot_with_retry zenos-memory-secondary-backup.service 3 10 \
+  || ! start_oneshot_with_retry zenos-offsite-backup.service 3 10 \
+  || ! start_oneshot_with_retry etla-maintenance.service 3 10; then
   rollback_runtime
   systemctl enable --now zenos-memory.service >/dev/null 2>&1 || true
   echo "Backup, offsite read-back, or maintenance gate failed; restored Runtime and kept local Memory." >&2
