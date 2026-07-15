@@ -122,14 +122,16 @@ def _allowed_uids() -> set[int]:
 
 
 def serve() -> None:
+    group = grp.getgrnam("hermes")
     SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
+    os.chown(SOCKET_PATH.parent, 0, group.gr_gid)
+    os.chmod(SOCKET_PATH.parent, 0o750)
     try:
         SOCKET_PATH.unlink()
     except FileNotFoundError:
         pass
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(str(SOCKET_PATH))
-    group = grp.getgrnam("hermes")
     os.chown(SOCKET_PATH, 0, group.gr_gid)
     os.chmod(SOCKET_PATH, 0o660)
     server.listen(16)

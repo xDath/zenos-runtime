@@ -6,7 +6,7 @@ Before=hermes-gateway.service
 [Service]
 Type=simple
 User=root
-Group=root
+Group=hermes
 ExecStart=/usr/bin/python3 /usr/local/sbin/etla-ops-broker
 Restart=on-failure
 RestartSec=2

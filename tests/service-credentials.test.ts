@@ -156,7 +156,12 @@ test('Hermes gateway runs non-root and delegates only narrow privileged operatio
 test('privileged broker keeps cloud deployment outside its AF_UNIX-only sandbox', () => {
   const broker = readFileSync('scripts/etla-ops-broker.py', 'utf8');
   const unit = readFileSync('etla-ops-broker.service', 'utf8');
+  assert.match(unit, /^Group=hermes$/m);
+  assert.match(unit, /^RuntimeDirectoryMode=0750$/m);
   assert.match(unit, /^RestrictAddressFamilies=AF_UNIX$/m);
+  assert.match(broker, /os\.chown\(SOCKET_PATH\.parent, 0, group\.gr_gid\)/);
+  assert.match(broker, /os\.chmod\(SOCKET_PATH\.parent, 0o750\)/);
+  assert.match(broker, /os\.chmod\(SOCKET_PATH, 0o660\)/);
   assert.match(broker, /\/usr\/bin\/systemd-run/);
   assert.match(broker, /--wait/);
   assert.match(broker, /--collect/);
