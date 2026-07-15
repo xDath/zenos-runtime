@@ -142,7 +142,13 @@ function sha256(input: Buffer | string): string {
 
 function defaultCachePath(root: string): string {
   const workspaceKey = sha256(path.resolve(root)).slice(0, 16);
-  return path.join(root, '.data', 'repository-index', `${workspaceKey}.json`);
+  const configuredRoot = process.env.ZENOS_RUNTIME_REPOSITORY_INDEX_DIR?.trim();
+  const cacheRoot = configuredRoot
+    ? path.resolve(configuredRoot)
+    : process.env.NODE_ENV === 'production'
+      ? '/var/cache/zenos-runtime/repository-index'
+      : path.join(root, '.data', 'repository-index');
+  return path.join(cacheRoot, `${workspaceKey}.json`);
 }
 
 function isInsideRoot(root: string, candidate: string): boolean {

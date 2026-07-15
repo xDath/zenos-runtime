@@ -48,7 +48,20 @@ export type AutonomousModelResult = {
   provider: string;
   content?: string;
   parsed?: unknown;
-  usage: { inputTokens: number; outputTokens: number; totalTokens: number; estimated: boolean };
+  usage: {
+    inputTokens: number;
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
+    outputTokens: number;
+    reasoningTokens?: number;
+    totalTokens: number;
+    accountedTokens: number;
+    estimated: boolean;
+    source: 'provider' | 'estimate' | 'hermes-session-delta';
+    valid: boolean;
+    invalidReason?: string;
+    providerRequestId?: string;
+  };
   inputTokensEstimate: number;
   outputTokensEstimate: number;
   latencyMs: number;

@@ -17,6 +17,21 @@ export const GatewayContextMessageSchema = z.object({
   tool_call_id: z.string().trim().max(500).optional(),
 });
 
+export const GatewayWorkspaceFileSchema = z.object({
+  path: z.string().trim().min(1).max(4_096),
+  sha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+  exists: z.boolean(),
+});
+
+export const GatewayWorkspaceStateSchema = z.object({
+  workspaceRoot: z.string().trim().min(1).max(4_096),
+  gitHead: z.string().trim().max(200).default(''),
+  dirtyDiffSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  changedFiles: z.array(GatewayWorkspaceFileSchema).max(200).default([]),
+  clean: z.boolean(),
+  capturedAt: z.string().datetime(),
+});
+
 export const GatewayTurnPreflightRequestSchema = RuntimeContextSchema.extend({
   sessionId: z.string().trim().min(1).max(220),
   turnId: z.string().trim().min(1).max(220),
@@ -25,6 +40,7 @@ export const GatewayTurnPreflightRequestSchema = RuntimeContextSchema.extend({
   context: z.string().max(120_000).optional().default(''),
   handoffMessages: z.array(GatewayContextMessageSchema).max(400).optional().default([]),
   workspaceRoot: z.string().trim().min(1).max(4_096).optional(),
+  workspaceState: GatewayWorkspaceStateSchema.optional(),
   approvalGranted: z.boolean().optional().default(false),
   modelOverrides: z.object({
     baseUrl: z.string().trim().min(1).optional(),
@@ -47,6 +63,7 @@ export const GatewayTurnPostflightRequestSchema = z.object({
   draft: z.string().max(200_000),
   host: GatewayModelIdentitySchema,
   toolSummary: z.string().max(80_000).optional().default(''),
+  workspaceState: GatewayWorkspaceStateSchema.optional(),
   failed: z.boolean().optional().default(false),
   hostUsage: z.object({
     inputTokens: z.number().int().nonnegative().default(0),
@@ -55,6 +72,10 @@ export const GatewayTurnPostflightRequestSchema = z.object({
     outputTokens: z.number().int().nonnegative().default(0),
     reasoningTokens: z.number().int().nonnegative().default(0),
     calls: z.number().int().nonnegative().max(500).default(1),
+    source: z.enum(['provider', 'estimate', 'hermes-session-delta']).default('hermes-session-delta'),
+    valid: z.boolean().default(true),
+    invalidReason: z.string().max(2_000).optional(),
+    providerRequestId: z.string().max(500).optional(),
   }).optional().default({
     inputTokens: 0,
     cacheReadTokens: 0,
@@ -62,6 +83,8 @@ export const GatewayTurnPostflightRequestSchema = z.object({
     outputTokens: 0,
     reasoningTokens: 0,
     calls: 1,
+    source: 'hermes-session-delta',
+    valid: true,
   }),
   hostDurationMs: z.number().int().nonnegative().max(86_400_000).optional().default(0),
 });
@@ -107,6 +130,9 @@ export const StoredGatewayPreflightSchema = z.object({
   preflightLatency: z.array(LatencyObservationSchema).default([]),
   turnStartedAtMs: z.number().int().nonnegative().optional(),
   holdFinalDelivery: z.boolean(),
+  codingTaskId: z.string().optional(),
+  codingPhase: z.string().optional(),
+  workspaceState: GatewayWorkspaceStateSchema.optional(),
 });
 
 export type GatewayTurnPreflightRequest = z.output<typeof GatewayTurnPreflightRequestSchema>;

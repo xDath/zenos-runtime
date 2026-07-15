@@ -127,6 +127,35 @@ test('Boss-requested Host revision may consume the final-answer reserve', () => 
   completeTokenBudget(budget.budgetId);
 });
 
+test('implausible or invalid usage is bounded to its reservation and counted as an anomaly', () => {
+  resetRuntimeStoreForTests(':memory:');
+  const budget = plan('budget-invalid-usage');
+  const authorization = authorizeTokenSpend({
+    plan: budget,
+    requestId: 'host-invalid-usage',
+    role: 'host',
+    estimatedTokens: 2_000,
+    mandatory: true,
+  });
+  assert.equal(authorization.allowed, true);
+
+  const settled = settleTokenSpend({
+    plan: budget,
+    requestId: 'host-invalid-usage',
+    role: 'host',
+    actualTokens: 2_000_000,
+    attempted: true,
+    usageValid: false,
+    invalidReason: 'cumulative provider counter',
+  });
+
+  assert.equal(settled.spentTokens, 2_000);
+  assert.equal(settled.anomalyCount, 1);
+  assert.equal(settled.invalidSamples, 1);
+  assert.ok(settled.spentTokens <= settled.limitTokens);
+  completeTokenBudget(budget.budgetId);
+});
+
 test('governor reservations and spend survive a process-cache reset', () => {
   resetRuntimeStoreForTests(':memory:');
   const budget = plan('budget-durable-process-restart');

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import shlex
 import sys
 import urllib.error
@@ -208,6 +209,8 @@ def prepare_runtime_environment(destination: Path, values: dict[str, str], confi
         )
     if provider_credential and not resolved_environment_value(runtime_values, "ZENOS_LLM_API_KEY"):
         runtime_values["ZENOS_LLM_API_KEY"] = shlex.quote(provider_credential)
+    if not resolved_environment_value(runtime_values, "ZENOS_BACKUP_ENCRYPTION_KEY"):
+        runtime_values["ZENOS_BACKUP_ENCRYPTION_KEY"] = shlex.quote(secrets.token_urlsafe(48))
 
     provider_base_url = discovered_base_url or str(provider.get("base_url") or provider.get("url") or "").strip()
     if not resolved_environment_value(runtime_values, "ZENOS_LLM_BASE_URL"):
@@ -219,15 +222,24 @@ def prepare_runtime_environment(destination: Path, values: dict[str, str], confi
         if fallback_base_url:
             runtime_values["ZENOS_LLM_BASE_URL"] = shlex.quote(fallback_base_url)
 
-    # The VPS installs Memory as a loopback sidecar. Keep Runtime on that
-    # release-consistent path instead of silently drifting to an older public
-    # deployment inherited from a historical environment file.
-    runtime_values["ZENOS_MEMORY_URL"] = "http://127.0.0.1:3091"
+    # Production Memory compute is cloud-first. Google Drive remains the
+    # canonical append-only store and the VPS is only a thin client. Preserve an
+    # explicitly supplied cloud URL, otherwise use the official Vercel endpoint;
+    # never silently couple Runtime availability to a loopback sidecar.
+    configured_memory_url = resolved_environment_value(values, "ZENOS_MEMORY_URL")
+    if configured_memory_url.startswith("https://"):
+        runtime_values["ZENOS_MEMORY_URL"] = shlex.quote(configured_memory_url)
+    else:
+        runtime_values["ZENOS_MEMORY_URL"] = "https://zenos-memory.vercel.app"
     write_environment(destination, runtime_values, "Runtime")
 
 
 def prepare_hermes_environment(destination: Path, values: dict[str, str], config_source: Path) -> None:
     hermes_values = dict(values)
+    configured_memory_url = resolved_environment_value(values, "ZENOS_MEMORY_URL")
+    hermes_values["ZENOS_MEMORY_URL"] = shlex.quote(
+        configured_memory_url if configured_memory_url.startswith("https://") else "https://zenos-memory.vercel.app"
+    )
     if config_source.is_file():
         config = yaml.safe_load(config_source.read_text(encoding="utf-8")) or {}
         for field_path, value in secret_literals(config):
@@ -279,6 +291,50 @@ def prepare_hermes_config(source: Path, destination: Path) -> None:
                 else {"description": f"{model_id} - Etla Router"}
                 for model_id in discovered_models
             }
+
+    # Production invariants. Memory compute is cloud-first with Google Drive as
+    # canonical storage; Runtime provides task-aware working sets, while Hermes'
+    # global compressor is only the final safety valve. Failed summaries must
+    # preserve the full transcript instead of replacing coding evidence with a
+    # placeholder marker.
+    model = data.setdefault("model", {})
+    if isinstance(model, dict):
+        model["context_length"] = max(int(model.get("context_length") or 0), 1_000_000)
+    compression = data.setdefault("compression", {})
+    if not isinstance(compression, dict):
+        compression = {}
+        data["compression"] = compression
+    compression.update({
+        "enabled": True,
+        "threshold": 0.20,
+        "target_ratio": 0.25,
+        "protect_first_n": 3,
+        "protect_last_n": 12,
+        "hygiene_hard_message_limit": 600,
+        "abort_on_summary_failure": True,
+        "in_place": True,
+    })
+    runtime = data.setdefault("zenos_runtime", {})
+    if not isinstance(runtime, dict):
+        runtime = {}
+        data["zenos_runtime"] = runtime
+    runtime.update({
+        "enabled": True,
+        "url": "http://127.0.0.1:3090",
+        "fail_open": True,
+        "max_history_chars": 64_000,
+        "context_soft_limit_tokens": 192_000,
+        "handoff_history_chars": 240_000,
+        "handoff_max_messages": 300,
+        "disable_streaming_when_verified": True,
+        "report_failures": True,
+    })
+    terminal = data.setdefault("terminal", {})
+    if not isinstance(terminal, dict):
+        terminal = {}
+        data["terminal"] = terminal
+    terminal["cwd"] = "/srv/etla/workspaces"
+
     sanitized = replace_secret_literals(deepcopy(data))
     destination.write_text(yaml.safe_dump(sanitized, sort_keys=False, allow_unicode=True), encoding="utf-8")
     destination.chmod(0o600)

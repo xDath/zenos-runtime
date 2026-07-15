@@ -51,7 +51,10 @@ loadCredentialEnvironment();
 const source = process.env.ZENOS_RUNTIME_DB_PATH || '/var/lib/zenos-runtime/runtime.db';
 const outputDirectory = process.env.ZENOS_RUNTIME_BACKUP_DIR || '/var/backups/zenos-runtime';
 const retention = Math.max(2, Math.min(Number(process.env.ZENOS_RUNTIME_BACKUP_KEEP || 14), 90));
-const secret = process.env.ZENOS_RUNTIME_BACKUP_SECRET || process.env.ETLA_MASTER_SECRET || '';
+const secret = process.env.ZENOS_BACKUP_ENCRYPTION_KEY
+  || process.env.ZENOS_RUNTIME_BACKUP_SECRET
+  || process.env.ETLA_MASTER_SECRET
+  || '';
 
 if (!secret) throw new Error('Runtime backup refused: no encryption secret is configured');
 if (!existsSync(source)) throw new Error(`Runtime backup source does not exist: ${source}`);

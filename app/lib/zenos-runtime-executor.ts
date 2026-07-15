@@ -113,7 +113,12 @@ export type RuntimeModelUsage = {
   outputTokens: number;
   reasoningTokens?: number;
   totalTokens: number;
+  accountedTokens: number;
   estimated: boolean;
+  source: 'provider' | 'estimate' | 'hermes-session-delta';
+  valid: boolean;
+  invalidReason?: string;
+  providerRequestId?: string;
 };
 
 export interface RuntimeModelResult {
@@ -206,6 +211,7 @@ export interface RuntimePipelineResult {
 }
 
 const OpenAIResponseSchema = z.object({
+  id: z.string().optional(),
   choices: z.array(z.object({
     message: z.object({ content: z.union([z.string(), z.null()]).optional() }).passthrough(),
     finish_reason: z.string().nullable().optional(),
@@ -423,31 +429,75 @@ function recordModelCallLifecycle(input: {
   }
 }
 
-function modelUsage(data: z.infer<typeof OpenAIResponseSchema>, prompt: string, content: string): RuntimeModelUsage {
+function modelUsage(
+  data: z.infer<typeof OpenAIResponseSchema>,
+  prompt: string,
+  content: string,
+  limits: { maxInputTokens: number; maxOutputTokens: number },
+): RuntimeModelUsage {
   const usage = data.usage;
-  const promptTotal = usage?.prompt_tokens ?? usage?.input_tokens;
   const outputTokens = usage?.completion_tokens ?? usage?.output_tokens;
-  if (promptTotal !== undefined || outputTokens !== undefined) {
-    const cacheReadTokens = usage?.prompt_tokens_details?.cached_tokens
-      ?? usage?.cache_read_input_tokens
-      ?? usage?.cached_tokens
+  if (usage && (usage.prompt_tokens !== undefined || usage.input_tokens !== undefined || outputTokens !== undefined)) {
+    const cacheReadTokens = usage.prompt_tokens_details?.cached_tokens
+      ?? usage.cache_read_input_tokens
+      ?? usage.cached_tokens
       ?? 0;
-    const cacheWriteTokens = usage?.prompt_tokens_details?.cache_write_tokens
-      ?? usage?.cache_creation_input_tokens
+    const cacheWriteTokens = usage.prompt_tokens_details?.cache_write_tokens
+      ?? usage.cache_creation_input_tokens
       ?? 0;
-    const inputTokens = Math.max(0, (promptTotal || 0) - cacheReadTokens - cacheWriteTokens);
-    const output = outputTokens || 0;
-    const reasoningTokens = usage?.completion_tokens_details?.reasoning_tokens
-      ?? usage?.reasoning_tokens
+    const openAiPromptTotal = usage.prompt_tokens;
+    const nativeInput = usage.input_tokens;
+    const inputTokens = openAiPromptTotal !== undefined
+      ? Math.max(0, openAiPromptTotal - cacheReadTokens)
+      : Math.max(0, nativeInput || 0);
+    const logicalInput = openAiPromptTotal !== undefined
+      ? Math.max(0, openAiPromptTotal)
+      : inputTokens + cacheReadTokens + cacheWriteTokens;
+    const output = Math.max(0, outputTokens || 0);
+    const reasoningTokens = usage.completion_tokens_details?.reasoning_tokens
+      ?? usage.reasoning_tokens
       ?? 0;
+    const totalTokens = logicalInput + output;
+    const accountedTokens = inputTokens + cacheWriteTokens + output;
+    const maxPlausibleInput = Math.max(16_000, limits.maxInputTokens * 2 + 8_000);
+    const maxPlausibleOutput = Math.max(2_048, limits.maxOutputTokens * 2 + 1_024);
+    const invalidReason = logicalInput > maxPlausibleInput
+      ? `provider input usage ${logicalInput} exceeds plausible cap ${maxPlausibleInput}`
+      : output > maxPlausibleOutput
+        ? `provider output usage ${output} exceeds plausible cap ${maxPlausibleOutput}`
+        : cacheReadTokens > maxPlausibleInput * 4 || cacheWriteTokens > maxPlausibleInput * 2
+          ? 'provider cache usage exceeds plausible per-call bounds'
+          : undefined;
+    if (!invalidReason) {
+      return {
+        inputTokens,
+        cacheReadTokens,
+        cacheWriteTokens,
+        outputTokens: output,
+        reasoningTokens,
+        totalTokens,
+        accountedTokens,
+        estimated: false,
+        source: 'provider',
+        valid: true,
+        providerRequestId: data.id,
+      };
+    }
+    const estimatedInput = estimateTokens(prompt);
+    const estimatedOutput = estimateTokens(content);
     return {
-      inputTokens,
-      cacheReadTokens,
-      cacheWriteTokens,
-      outputTokens: output,
-      reasoningTokens,
-      totalTokens: inputTokens + cacheReadTokens + cacheWriteTokens + output,
-      estimated: false,
+      inputTokens: estimatedInput,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      outputTokens: estimatedOutput,
+      reasoningTokens: 0,
+      totalTokens: estimatedInput + estimatedOutput,
+      accountedTokens: estimatedInput + estimatedOutput,
+      estimated: true,
+      source: 'estimate',
+      valid: false,
+      invalidReason,
+      providerRequestId: data.id,
     };
   }
   const input = estimateTokens(prompt);
@@ -459,7 +509,11 @@ function modelUsage(data: z.infer<typeof OpenAIResponseSchema>, prompt: string, 
     outputTokens: output,
     reasoningTokens: 0,
     totalTokens: input + output,
+    accountedTokens: input + output,
     estimated: true,
+    source: 'estimate',
+    valid: true,
+    providerRequestId: data.id,
   };
 }
 
@@ -515,7 +569,10 @@ async function callHermesCliTransport(
     outputTokens: 0,
     reasoningTokens: 0,
     totalTokens: inputEstimate,
+    accountedTokens: inputEstimate,
     estimated: true,
+    source: 'estimate',
+    valid: true,
   };
   const started = Date.now();
   const maxAttempts = Math.min(Math.max((options.retries ?? 1) + 1, 1), 3);
@@ -576,14 +633,18 @@ async function callHermesCliTransport(
           resolve(clean);
         });
       });
+      const outputEstimate = estimateTokens(content);
       const usage: RuntimeModelUsage = {
         inputTokens: inputEstimate,
         cacheReadTokens: 0,
         cacheWriteTokens: 0,
-        outputTokens: estimateTokens(content),
+        outputTokens: outputEstimate,
         reasoningTokens: 0,
-        totalTokens: inputEstimate + estimateTokens(content),
+        totalTokens: inputEstimate + outputEstimate,
+        accountedTokens: inputEstimate + outputEstimate,
         estimated: true,
+        source: 'estimate',
+        valid: true,
       };
       const latencyMs = observeDuration('model_call_duration', started, { role: config.role, model: config.model, transport: 'hermes-cli', ok: true });
       incrementMetric('model_calls_total', { role: config.role, model: config.model, transport: 'hermes-cli', status: 'success' });
@@ -668,7 +729,10 @@ export async function callRuntimeModel(
     outputTokens: 0,
     reasoningTokens: 0,
     totalTokens: inputEstimate,
+    accountedTokens: inputEstimate,
     estimated: true,
+    source: 'estimate',
+    valid: true,
   };
   let governorAuthorized = false;
   if (options.tokenBudgetPlan) {
@@ -686,7 +750,7 @@ export async function callRuntimeModel(
         role,
         model: config.model,
         provider: config.provider,
-        usage: { ...emptyUsage, inputTokens: 0, totalTokens: 0 },
+        usage: { ...emptyUsage, inputTokens: 0, totalTokens: 0, accountedTokens: 0 },
         inputTokensEstimate: inputEstimate,
         outputTokensEstimate: 0,
         latencyMs: 0,
@@ -709,7 +773,7 @@ export async function callRuntimeModel(
     trigger: options.trigger,
   });
   const finalize = (result: RuntimeModelResult): RuntimeModelResult => {
-    if (result.attempts > 0 && !result.usage.estimated) {
+    if (result.attempts > 0 && !result.usage.estimated && result.usage.valid) {
       recordTokenEstimateCalibration(
         inputEstimate,
         result.usage.inputTokens + (result.usage.cacheReadTokens || 0) + (result.usage.cacheWriteTokens || 0),
@@ -721,10 +785,10 @@ export async function callRuntimeModel(
         plan: options.tokenBudgetPlan,
         requestId,
         role,
-        actualTokens: result.attempts > 0
-          ? result.usage.inputTokens + (result.usage.cacheWriteTokens || 0) + result.usage.outputTokens
-          : 0,
+        actualTokens: result.attempts > 0 ? result.usage.accountedTokens : 0,
         attempted: result.attempts > 0,
+        usageValid: result.usage.valid,
+        invalidReason: result.usage.invalidReason,
       });
     }
     recordModelCallLifecycle({
@@ -841,7 +905,20 @@ export async function callRuntimeModel(
       if (!parsedTransport.success) throw new Error('Model response did not match the OpenAI-compatible response contract');
       const content = parsedTransport.data.choices[0]?.message.content || '';
       if (!content.trim()) throw new Error('Model response contained no assistant content');
-      const usage = modelUsage(parsedTransport.data, prompt, content);
+      const usage = modelUsage(parsedTransport.data, prompt, content, {
+        maxInputTokens,
+        maxOutputTokens: requestedOutputTokens,
+      });
+      if (!usage.valid) {
+        incrementMetric('runtime_usage_anomaly_total', { role, model: config.model, source: usage.source });
+        log('warn', 'Rejected implausible provider token usage', {
+          role,
+          model: config.model,
+          requestId,
+          providerRequestId: usage.providerRequestId,
+          reason: usage.invalidReason,
+        });
+      }
       const latencyMs = observeDuration('model_call_duration', started, { role, model: config.model, ok: true });
       incrementMetric('model_calls_total', { role, model: config.model, status: 'success' });
       incrementMetric('model_tokens_total', { role, direction: 'input' }, usage.inputTokens);

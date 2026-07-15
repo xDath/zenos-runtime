@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import {
   postflightGatewayTurn,
   preflightGatewayTurn,
@@ -178,6 +181,10 @@ test('native gateway worker path calls the configured Worker and injects its bou
 
 test('clear coding work keeps Host as orchestrator before bounded Worker delegation', async () => {
   const originalFetch = globalThis.fetch;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'etla-gateway-coding-'));
+  fs.mkdirSync(path.join(root, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({ name: 'gateway-coding-fixture', scripts: { test: 'node --test' } }));
+  fs.writeFileSync(path.join(root, 'src', 'parser.ts'), 'export const parse = (value: string) => value.trim();\n');
   const calledModels: string[] = [];
   globalThis.fetch = async (_input: string | URL | Request, init?: RequestInit) => {
     const body = JSON.parse(String(init?.body || '{}')) as { model: string };
@@ -210,6 +217,7 @@ test('clear coding work keeps Host as orchestrator before bounded Worker delegat
       turnId: 'turn-clear-coding-1',
       platform: 'telegram',
       host: { model: 'grok', provider: 'etla-router' },
+      workspaceRoot: root,
       hasFiles: true,
       hasCodeChangeIntent: true,
       estimatedContextTokens: 2_500,
@@ -220,9 +228,13 @@ test('clear coding work keeps Host as orchestrator before bounded Worker delegat
     assert.equal(preflight.decision.taskType, 'coding_change');
     assert.equal(preflight.decision.useWorker, true);
     assert.equal(preflight.receipt.host.plannerInvoked, true);
+    assert.ok(preflight.codingTaskId);
+    assert.equal(preflight.codingPhase, 'inspect');
+    assert.match(preflight.hostContext, new RegExp(preflight.codingTaskId || 'missing-task'));
     assert.deepEqual(calledModels, ['runtime-host', 'runtime-worker']);
   } finally {
     globalThis.fetch = originalFetch;
+    fs.rmSync(root, { recursive: true, force: true });
   }
 });
 

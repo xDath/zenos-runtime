@@ -13,7 +13,7 @@ import {
 } from './zenos-runtime-state';
 import { log } from './logger';
 
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 8;
 
 function defaultDatabasePath(): string {
   if (process.env.ZENOS_RUNTIME_DB_PATH) return process.env.ZENOS_RUNTIME_DB_PATH;
@@ -89,6 +89,8 @@ export type TokenGovernorStoreRecord = {
   reserveTokens: number;
   spentTokens: number;
   calls: number;
+  anomalyCount: number;
+  invalidSamples: number;
   reservations: Record<string, number>;
   status: 'active' | 'completed';
   updatedAt: string;
@@ -110,6 +112,12 @@ export class RuntimeStore {
     const recoveredRuns = this.reconcileAbandonedRuns();
     if (recoveredRuns > 0) {
       log('warn', 'Recovered abandoned Runtime runs after process restart', { recoveredRuns });
+    }
+    const recoveredCodingTasks = this.reconcileInactiveCodingTasks(
+      'Coding task cancelled because its Runtime run was missing or terminated unsuccessfully.',
+    );
+    if (recoveredCodingTasks > 0) {
+      log('warn', 'Recovered orphaned coding tasks after process restart', { recoveredCodingTasks });
     }
   }
 
@@ -194,6 +202,8 @@ export class RuntimeStore {
         result_json TEXT,
         errors_json TEXT NOT NULL,
         started_at TEXT NOT NULL,
+        heartbeat_at TEXT,
+        lease_expires_at TEXT,
         completed_at TEXT
       );
 
@@ -273,7 +283,10 @@ export class RuntimeStore {
         limit_tokens INTEGER NOT NULL,
         reserve_tokens INTEGER NOT NULL,
         spent_tokens INTEGER NOT NULL,
+        reported_spent_tokens INTEGER,
         calls INTEGER NOT NULL,
+        anomaly_count INTEGER NOT NULL DEFAULT 0,
+        invalid_samples INTEGER NOT NULL DEFAULT 0,
         reservations_json TEXT NOT NULL,
         status TEXT NOT NULL,
         updated_at TEXT NOT NULL,
@@ -285,10 +298,43 @@ export class RuntimeStore {
       CREATE INDEX IF NOT EXISTS idx_token_governors_status ON token_governors(status, updated_at DESC);
     `);
 
+    const runColumns = new Set(
+      this.db.prepare('PRAGMA table_info(runtime_runs)').all().map((row) => asString(row.name)),
+    );
+    if (!runColumns.has('heartbeat_at')) this.db.exec('ALTER TABLE runtime_runs ADD COLUMN heartbeat_at TEXT;');
+    if (!runColumns.has('lease_expires_at')) this.db.exec('ALTER TABLE runtime_runs ADD COLUMN lease_expires_at TEXT;');
+    const governorColumns = new Set(
+      this.db.prepare('PRAGMA table_info(token_governors)').all().map((row) => asString(row.name)),
+    );
+    if (!governorColumns.has('anomaly_count')) {
+      this.db.exec('ALTER TABLE token_governors ADD COLUMN anomaly_count INTEGER NOT NULL DEFAULT 0;');
+    }
+    if (!governorColumns.has('invalid_samples')) {
+      this.db.exec('ALTER TABLE token_governors ADD COLUMN invalid_samples INTEGER NOT NULL DEFAULT 0;');
+    }
+    if (!governorColumns.has('reported_spent_tokens')) {
+      this.db.exec('ALTER TABLE token_governors ADD COLUMN reported_spent_tokens INTEGER;');
+    }
+
     const current = this.db.prepare('SELECT value FROM runtime_meta WHERE key = ?').get('schema_version');
     const version = Number(asString(current?.value, '0'));
     if (version > SCHEMA_VERSION) {
       throw new Error(`Runtime database schema ${version} is newer than supported schema ${SCHEMA_VERSION}`);
+    }
+    if (version < 8) {
+      const migratedAt = new Date().toISOString();
+      this.db.prepare(`
+        UPDATE token_governors
+        SET reported_spent_tokens = spent_tokens,
+            spent_tokens = limit_tokens,
+            anomaly_count = anomaly_count + 1,
+            invalid_samples = invalid_samples + 1,
+            status = 'expired',
+            completed_at = COALESCE(completed_at, ?),
+            updated_at = ?
+        WHERE spent_tokens > limit_tokens
+          AND reported_spent_tokens IS NULL
+      `).run(migratedAt, migratedAt);
     }
     this.db.prepare(`
       INSERT INTO runtime_meta(key, value) VALUES('schema_version', ?)
@@ -412,14 +458,14 @@ export class RuntimeStore {
     const completedAt = new Date().toISOString();
     const update = this.db.prepare(`
       UPDATE runtime_runs
-      SET status = 'failed', errors_json = ?, completed_at = ?
+      SET status = 'abandoned', errors_json = ?, completed_at = ?, heartbeat_at = ?, lease_expires_at = ?
       WHERE run_id = ? AND status = 'running'
     `);
     this.transaction(() => {
       for (const run of abandoned) {
         const message = 'Runtime process exited before this run completed.';
         const errors = run.errors.includes(message) ? run.errors : [...run.errors, message];
-        update.run(json(errors), completedAt, run.runId);
+        update.run(json(errors), completedAt, completedAt, completedAt, run.runId);
       }
     });
     return abandoned.length;
@@ -446,6 +492,8 @@ export class RuntimeStore {
       reserveTokens: asNumber(row.reserve_tokens),
       spentTokens: asNumber(row.spent_tokens),
       calls: asNumber(row.calls),
+      anomalyCount: asNumber(row.anomaly_count),
+      invalidSamples: asNumber(row.invalid_samples),
       reservations: parseJson<Record<string, number>>(row.reservations_json, {}),
       status: 'active',
       updatedAt: asString(row.updated_at),
@@ -458,13 +506,15 @@ export class RuntimeStore {
     this.db.prepare(`
       INSERT INTO token_governors(
         budget_id, limit_tokens, reserve_tokens, spent_tokens, calls,
-        reservations_json, status, updated_at, expires_at, completed_at
-      ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        anomaly_count, invalid_samples, reservations_json, status, updated_at, expires_at, completed_at
+      ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(budget_id) DO UPDATE SET
         limit_tokens = excluded.limit_tokens,
         reserve_tokens = excluded.reserve_tokens,
         spent_tokens = excluded.spent_tokens,
         calls = excluded.calls,
+        anomaly_count = excluded.anomaly_count,
+        invalid_samples = excluded.invalid_samples,
         reservations_json = excluded.reservations_json,
         status = excluded.status,
         updated_at = excluded.updated_at,
@@ -476,6 +526,8 @@ export class RuntimeStore {
       record.reserveTokens,
       record.spentTokens,
       record.calls,
+      record.anomalyCount,
+      record.invalidSamples,
       json(record.reservations),
       record.status,
       record.updatedAt,
@@ -725,17 +777,24 @@ export class RuntimeStore {
 
   saveRun(input: RuntimeRunRecord): RuntimeRunRecord {
     const run = RuntimeRunRecordSchema.parse(input);
+    const active = ['queued', 'running', 'revising', 'escalated'].includes(run.status);
+    const heartbeatAt = active ? (run.heartbeatAt || new Date().toISOString()) : run.heartbeatAt;
+    const leaseExpiresAt = active
+      ? (run.leaseExpiresAt || new Date(Date.now() + 10 * 60_000).toISOString())
+      : run.leaseExpiresAt;
     this.db.prepare(`
       INSERT INTO runtime_runs(
         run_id, session_id, request_hash, status, decision_json, result_json,
-        errors_json, started_at, completed_at
-      ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+        errors_json, started_at, heartbeat_at, lease_expires_at, completed_at
+      ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(run_id) DO UPDATE SET
         session_id = excluded.session_id,
         status = excluded.status,
         decision_json = excluded.decision_json,
         result_json = excluded.result_json,
         errors_json = excluded.errors_json,
+        heartbeat_at = excluded.heartbeat_at,
+        lease_expires_at = excluded.lease_expires_at,
         completed_at = excluded.completed_at
     `).run(
       run.runId,
@@ -746,6 +805,8 @@ export class RuntimeStore {
       run.result === undefined ? null : json(run.result),
       json(run.errors),
       run.startedAt,
+      heartbeatAt || null,
+      leaseExpiresAt || null,
       run.completedAt || null,
     );
     return run;
@@ -763,8 +824,63 @@ export class RuntimeStore {
       result: row.result_json ? parseJson(row.result_json, undefined) : undefined,
       errors: parseJson<string[]>(row.errors_json, []),
       startedAt: asString(row.started_at),
+      heartbeatAt: row.heartbeat_at ? asString(row.heartbeat_at) : undefined,
+      leaseExpiresAt: row.lease_expires_at ? asString(row.lease_expires_at) : undefined,
       completedAt: row.completed_at ? asString(row.completed_at) : undefined,
     });
+  }
+
+  heartbeatRun(runId: string, leaseMs = 10 * 60_000): RuntimeRunRecord | undefined {
+    const heartbeatAt = new Date().toISOString();
+    const leaseExpiresAt = new Date(Date.now() + Math.max(60_000, leaseMs)).toISOString();
+    this.db.prepare(`
+      UPDATE runtime_runs
+      SET heartbeat_at = ?, lease_expires_at = ?
+      WHERE run_id = ? AND status IN ('queued', 'running', 'revising', 'escalated')
+    `).run(heartbeatAt, leaseExpiresAt, runId);
+    return this.getRun(runId);
+  }
+
+  reconcileExpiredRuns(nowIso = new Date().toISOString(), excludeRunId?: string): number {
+    const rows = this.db.prepare(`
+      SELECT run_id, errors_json
+      FROM runtime_runs
+      WHERE status IN ('queued', 'running', 'revising', 'escalated')
+        AND lease_expires_at IS NOT NULL
+        AND lease_expires_at <= ?
+        AND (? IS NULL OR run_id <> ?)
+    `).all(nowIso, excludeRunId || null, excludeRunId || null).map((row) => ({
+      runId: asString(row.run_id),
+      errors: parseJson<string[]>(row.errors_json, []),
+    }));
+    if (!rows.length) return 0;
+    const update = this.db.prepare(`
+      UPDATE runtime_runs
+      SET status = 'abandoned', errors_json = ?, completed_at = ?, heartbeat_at = ?, lease_expires_at = ?
+      WHERE run_id = ? AND status IN ('queued', 'running', 'revising', 'escalated')
+    `);
+    this.transaction(() => {
+      for (const row of rows) {
+        const reason = 'Runtime run lease expired before postflight completed.';
+        const errors = row.errors.includes(reason) ? row.errors : [...row.errors, reason];
+        update.run(json(errors), nowIso, nowIso, nowIso, row.runId);
+      }
+    });
+    this.reconcileInactiveCodingTasks('Coding task cancelled because its Runtime run lease expired.');
+    return rows.length;
+  }
+
+  abandonRun(runId: string, reason: string): RuntimeRunRecord | undefined {
+    const run = this.getRun(runId);
+    if (!run || !['queued', 'running', 'revising', 'escalated'].includes(run.status)) return run;
+    const completedAt = new Date().toISOString();
+    const errors = run.errors.includes(reason) ? run.errors : [...run.errors, reason];
+    this.db.prepare(`
+      UPDATE runtime_runs
+      SET status = 'abandoned', errors_json = ?, completed_at = ?, heartbeat_at = ?, lease_expires_at = ?
+      WHERE run_id = ?
+    `).run(json(errors), completedAt, completedAt, completedAt, runId);
+    return this.getRun(runId);
   }
 
   saveCodingTask(input: CodingTaskRecord): CodingTaskRecord {
@@ -806,6 +922,25 @@ export class RuntimeStore {
     };
   }
 
+  findActiveCodingTaskBySession(sessionId: string): CodingTaskRecord | undefined {
+    const row = this.db.prepare(`
+      SELECT * FROM coding_tasks
+      WHERE session_id = ? AND status = 'active'
+      ORDER BY updated_at DESC LIMIT 1
+    `).get(sessionId);
+    if (!row) return undefined;
+    return {
+      taskId: asString(row.task_id),
+      runId: row.run_id ? asString(row.run_id) : undefined,
+      sessionId: row.session_id ? asString(row.session_id) : undefined,
+      status: asString(row.status),
+      phase: asString(row.phase),
+      state: parseJson(row.state_json, null),
+      createdAt: asString(row.created_at),
+      updatedAt: asString(row.updated_at),
+    };
+  }
+
   listCodingTasks(limit = 100, status?: string): CodingTaskRecord[] {
     const safeLimit = Math.min(Math.max(limit, 1), 500);
     const rows = status
@@ -821,6 +956,54 @@ export class RuntimeStore {
       createdAt: asString(row.created_at),
       updatedAt: asString(row.updated_at),
     }));
+  }
+
+  cancelCodingTasksForRun(runId: string, reason: string): CodingTaskRecord[] {
+    const rows = this.db.prepare(`
+      SELECT * FROM coding_tasks
+      WHERE run_id = ? AND status = 'active'
+      ORDER BY updated_at
+    `).all(runId);
+    if (!rows.length) return [];
+    const updatedAt = new Date().toISOString();
+    const update = this.db.prepare(`
+      UPDATE coding_tasks
+      SET status = 'cancelled', state_json = ?, updated_at = ?
+      WHERE task_id = ? AND status = 'active'
+    `);
+    const taskIds: string[] = [];
+    this.transaction(() => {
+      for (const row of rows) {
+        const taskId = asString(row.task_id);
+        const state = parseJson<Record<string, unknown>>(row.state_json, {});
+        const currentRisks = Array.isArray(state.unresolvedRisks)
+          ? state.unresolvedRisks.filter((value): value is string => typeof value === 'string')
+          : [];
+        const nextState = {
+          ...state,
+          version: Math.max(1, asNumber(state.version, 1)) + 1,
+          status: 'cancelled',
+          unresolvedRisks: [...new Set([...currentRisks, reason])],
+          updatedAt,
+        };
+        if (Number(update.run(json(nextState), updatedAt, taskId).changes) > 0) taskIds.push(taskId);
+      }
+    });
+    return taskIds.map((taskId) => this.getCodingTask(taskId)).filter((task): task is CodingTaskRecord => Boolean(task));
+  }
+
+  reconcileInactiveCodingTasks(reason: string): number {
+    const runIds = this.db.prepare(`
+      SELECT DISTINCT c.run_id
+      FROM coding_tasks c
+      LEFT JOIN runtime_runs r ON r.run_id = c.run_id
+      WHERE c.status = 'active'
+        AND c.run_id IS NOT NULL
+        AND (r.run_id IS NULL OR r.status IN ('failed', 'blocked', 'abandoned'))
+    `).all().map((row) => asString(row.run_id)).filter(Boolean);
+    let reconciled = 0;
+    for (const runId of runIds) reconciled += this.cancelCodingTasksForRun(runId, reason).length;
+    return reconciled;
   }
 
   claimIdempotency(key: string, scope: string, requestHash: string, ttlSeconds = 86_400): { state: 'claimed' | 'replay' | 'conflict' | 'running'; record?: IdempotencyRecord } {

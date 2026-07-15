@@ -38,7 +38,7 @@ import {
   StoredGatewayPreflightSchema,
 } from './gateway-contracts';
 import { accountGatewayModelUsage, callIdentity, gatewayHostCallCount } from './gateway-accounting';
-import { prepareGatewayContexts } from './gateway-continuity';
+import { hostWorkingSetForDecision, prepareGatewayContexts } from './gateway-continuity';
 import { compactHostPlan, runGatewayHostPlanning } from './gateway-planning';
 import { askUserAnswer, blockedAnswer, renderHostContext } from './gateway-rendering';
 import {
@@ -48,6 +48,14 @@ import {
   roleLatencyTimeout,
 } from './latency-budget';
 import { recordOutcomePassport } from './outcome-ledger';
+import {
+  CodingTaskState,
+  prepareCodexExecution,
+  recordCodexPatch,
+  recordCodingValidation,
+  transitionCodingTask,
+  updateCodingTask,
+} from './codex-execution-core';
 
 export { GatewayTurnPostflightRequestSchema, GatewayTurnPreflightRequestSchema } from './gateway-contracts';
 
@@ -183,6 +191,17 @@ function preserveUnfinishedCodingContinuity(request: GatewayTurnPreflightRequest
   });
 }
 
+function workspaceMutationObserved(
+  before: GatewayTurnPreflightRequest['workspaceState'],
+  after: GatewayTurnPreflightRequest['workspaceState'],
+): boolean {
+  if (!before || !after) return false;
+  if (before.dirtyDiffSha256 !== after.dirtyDiffSha256) return true;
+  const beforeFiles = new Map(before.changedFiles.map((file) => [file.path, `${file.exists}:${file.sha256 || ''}`]));
+  return after.changedFiles.some((file) => beforeFiles.get(file.path) !== `${file.exists}:${file.sha256 || ''}`)
+    || before.changedFiles.some((file) => !after.changedFiles.some((candidate) => candidate.path === file.path));
+}
+
 function observedCodingState(toolSummary: string): { mutated: boolean; broken: boolean } {
   const text = String(toolSummary || '');
   const hasCodeArtifact = CODE_ARTIFACT_PATTERN.test(text);
@@ -225,8 +244,21 @@ function postflightDecisionForObservedMutation(
 
 export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
   const turnStartedAtMs = Date.now();
-  const request = preserveUnfinishedCodingContinuity(GatewayTurnPreflightRequestSchema.parse(raw));
+  const store = getRuntimeStore();
+  let request = preserveUnfinishedCodingContinuity(GatewayTurnPreflightRequestSchema.parse(raw));
+  const activeCodingRecord = store.findActiveCodingTaskBySession(request.sessionId);
+  if (activeCodingRecord && request.workspaceRoot) {
+    request = GatewayTurnPreflightRequestSchema.parse({
+      ...request,
+      hasFiles: true,
+      hasCodeChangeIntent: true,
+      userRequestedVerification: true,
+      intent: request.intent === 'execute' ? 'execute' : 'mutate',
+      confidence: Math.max(request.confidence, 0.95),
+    });
+  }
   reconcileStaleRuntimeSessions({ excludeSessionId: request.sessionId });
+  store.reconcileExpiredRuns(now());
   const runId = `gateway_${crypto.randomUUID()}`;
   const baselineDecision = choosePipeline(request);
   const latencyPlan = createLatencyBudgetPlan(baselineDecision);
@@ -240,11 +272,28 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
   });
   const { repositoryContext, memoryBrief } = preparedContexts;
   const preflightLatency: LatencyObservation[] = [...preparedContexts.observations];
+  let codingTask: CodingTaskState | undefined;
+  let codingContext = '';
+  if (
+    request.workspaceRoot
+    && ['coding_change', 'debugging'].includes(baselineDecision.taskType)
+  ) {
+    const preparedCoding = await prepareCodexExecution({
+      taskId: activeCodingRecord?.taskId,
+      runId,
+      sessionId: request.sessionId,
+      request: request.request,
+      workspaceRoot: request.workspaceRoot,
+      acceptanceCriteria: ['Requested behavior is implemented.', 'Affected deterministic validation passes.', 'No unrelated files are modified.'],
+    }, store);
+    codingTask = preparedCoding.state;
+    codingContext = preparedCoding.context;
+  }
   const input = RuntimeRunRequestSchema.parse({
     ...request,
     sessionId: request.sessionId,
     persistSession: true,
-    context: [request.context, repositoryContext].filter(Boolean).join('\n\n'),
+    context: [request.context, repositoryContext, codingContext].filter(Boolean).join('\n\n'),
     memoryContext: memoryBrief.context,
     toolContext: repositoryContext,
     namespace: 'zenos',
@@ -254,6 +303,7 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
     approvalGranted: request.approvalGranted,
     dryRun: false,
     modelOverrides: request.modelOverrides,
+    codingTaskId: codingTask?.taskId,
     autonomousCoding: false,
     includeExecutionReceipt: false,
   });
@@ -270,7 +320,6 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
     memorySource: memoryBrief.source,
     memoryCoverageComplete: memoryBrief.coverage?.complete,
   });
-  const store = getRuntimeStore();
   recordActivity(
     request.sessionId,
     'tool',
@@ -509,6 +558,9 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
     preflightLatency,
     turnStartedAtMs,
     holdFinalDelivery,
+    codingTaskId: codingTask?.taskId,
+    codingPhase: codingTask?.currentPhase,
+    workspaceState: request.workspaceState,
   };
   store.saveRun({
     runId,
@@ -528,7 +580,15 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
     turnId: request.turnId,
     decision,
     holdFinalDelivery,
-    hostContext: renderHostContext(decision, hostPlan, workerResult, bossPreflight, memoryBrief, runId),
+    codingTaskId: codingTask?.taskId,
+    codingPhase: codingTask?.currentPhase,
+    hostContext: [
+      renderHostContext(decision, hostPlan, workerResult, bossPreflight, memoryBrief, runId),
+      codingTask
+        ? `Transactional coding state:\n- task_id: ${codingTask.taskId}\n- phase: ${codingTask.currentPhase}\n- checkpoint: ${codingTask.checkpoints.at(-1)?.checkpointId || 'pending'}\n- workspace_revision: ${codingTask.workspaceRevision}\n- Rule: before any new mutation after compaction or interruption, reconcile Git HEAD, dirty diff hash, and changed-file hashes. Never deploy or restart before deterministic validation passes.`
+        : '',
+    ].filter(Boolean).join('\n\n'),
+    hostWorkingSetTokens: hostWorkingSetForDecision(decision),
     hostBudget: {
       budgetId: budget.budgetId,
       reservationId: hostCallId,
@@ -562,9 +622,15 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
   const stored = StoredGatewayPreflightSchema.parse(run.result);
   const turnStartedAtMs = stored.turnStartedAtMs || Date.parse(run.startedAt) || Date.now();
   const deterministicValidation = deterministicValidationState(request.toolSummary);
-  const observedCoding = observedCodingState(request.toolSummary);
+  const textObservedCoding = observedCodingState(request.toolSummary);
+  const workspaceMutated = workspaceMutationObserved(stored.workspaceState, request.workspaceState);
+  const observedCoding = {
+    mutated: textObservedCoding.mutated || workspaceMutated,
+    broken: textObservedCoding.broken,
+  };
+  const missingWorkspaceEvidence = Boolean(stored.codingTaskId && observedCoding.mutated && !request.workspaceState);
   const unresolvedCodingMutation = observedCoding.mutated
-    && (observedCoding.broken || deterministicValidation !== 'passed');
+    && (observedCoding.broken || deterministicValidation !== 'passed' || missingWorkspaceEvidence);
   const baseInput = RuntimeRunRequestSchema.parse({
     ...stored.input,
     sessionId: request.sessionId,
@@ -587,6 +653,54 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
   const decision = observedCoding.mutated
     ? postflightDecisionForObservedMutation(storedDecision, input)
     : storedDecision;
+
+  if (stored.codingTaskId) {
+    let codingTask = store.getCodingTask(stored.codingTaskId)?.state as CodingTaskState | undefined;
+    if (codingTask && observedCoding.mutated && !request.workspaceState) {
+      codingTask = updateCodingTask(codingTask.taskId, {
+        status: 'blocked',
+        unresolvedRisks: [
+          ...codingTask.unresolvedRisks,
+          'Postflight workspace state was missing after a reported code mutation; reconcile hashes before any further write.',
+        ],
+      }, store);
+    } else if (codingTask && observedCoding.mutated && request.workspaceState) {
+      const changedFiles = request.workspaceState.changedFiles.map((file) => file.path);
+      const patch = await recordCodexPatch({
+        taskId: codingTask.taskId,
+        changedFiles,
+        allowedFiles: [...new Set([...codingTask.filesInspected, ...codingTask.filesChanged])],
+      }, store);
+      codingTask = patch.state;
+      if (deterministicValidation === 'passed' && codingTask.status === 'active') {
+        codingTask = recordCodingValidation(codingTask.taskId, {
+          kind: 'targeted_test',
+          status: 'passed',
+          summary: 'Hermes postflight tool evidence reported deterministic validation passed.',
+        }, store);
+        if (codingTask.currentPhase === 'patch' || codingTask.currentPhase === 'revise') {
+          codingTask = transitionCodingTask(codingTask.taskId, 'targeted_validation', {
+            summary: 'Recorded deterministic postflight validation evidence.',
+          }, store);
+        }
+        if (codingTask.currentPhase === 'targeted_validation') {
+          codingTask = transitionCodingTask(codingTask.taskId, 'summarize', {
+            summary: 'Workspace hashes were reconciled and deterministic validation passed.',
+            status: 'completed',
+          }, store);
+        }
+      } else if (codingTask.status === 'active') {
+        codingTask = updateCodingTask(codingTask.taskId, {
+          unresolvedRisks: [
+            ...codingTask.unresolvedRisks,
+            missingWorkspaceEvidence
+              ? 'Postflight workspace state was missing after a code mutation.'
+              : 'Code mutation remains pending deterministic validation.',
+          ],
+        }, store);
+      }
+    }
+  }
   const latencyPlan = decision.pipelineMode === storedDecision.pipelineMode
     ? stored.latencyPlan || createLatencyBudgetPlan(decision)
     : createLatencyBudgetPlan(decision);
@@ -626,6 +740,8 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
       + request.hostUsage.cacheWriteTokens
       + request.hostUsage.outputTokens,
     attempted: request.hostUsage.calls > 0,
+    usageValid: request.hostUsage.valid,
+    invalidReason: request.hostUsage.invalidReason,
   });
 
   recordActivity(
@@ -653,7 +769,11 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
           + request.hostUsage.cacheReadTokens
           + request.hostUsage.cacheWriteTokens
           + request.hostUsage.outputTokens,
-        estimated: false,
+        estimated: request.hostUsage.source === 'estimate',
+        source: request.hostUsage.source,
+        valid: request.hostUsage.valid,
+        invalidReason: request.hostUsage.invalidReason,
+        providerRequestId: request.hostUsage.providerRequestId,
       },
       latencyMs: request.hostDurationMs,
     },
@@ -679,6 +799,8 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
       bossConfidence: stored.bossPreflight?.confidence,
       evidenceCoverage: stored.memoryCoverage,
       memorySource: stored.memorySource,
+      hostModel: stored.host.model,
+      hostProvider: stored.host.provider,
     });
     store.saveRun({
       ...run,
@@ -1056,6 +1178,8 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
     bossConfidence: bossDecision?.confidence,
     evidenceCoverage: stored.memoryCoverage,
     memorySource: stored.memorySource,
+    hostModel: stored.host.model,
+    hostProvider: stored.host.provider,
   });
   if (terminalCodingFailure) {
     updateRuntimeSession(request.sessionId, {

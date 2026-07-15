@@ -4,6 +4,7 @@ import * as crypto from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import {
   choosePipeline,
   runRuntimeEval,
@@ -17,6 +18,7 @@ import {
   runQualityGate,
 } from '../app/lib/zenos-runtime-three-agent';
 import { authorizeRequest, issueScopedToken } from '../app/lib/auth';
+import { createCodingTask } from '../app/lib/codex-execution-core';
 import { getRuntimeStore, resetRuntimeStoreForTests, RuntimeStore } from '../app/lib/zenos-runtime-store';
 import { runZenosPipeline } from '../app/lib/zenos-runtime-executor';
 import { OutcomePassportSchema } from '../app/lib/outcome-ledger';
@@ -135,7 +137,7 @@ test('SQLite store persists session, workers, events, and quality-gate state tra
   assert.equal(gate.verdict, 'escalate');
 });
 
-test('Runtime store marks runs abandoned by a process restart as failed', () => {
+test('Runtime store marks runs abandoned by a process restart as abandoned', () => {
   const directory = mkdtempSync(path.join(tmpdir(), 'zenos-runtime-recovery-'));
   const databasePath = path.join(directory, 'runtime.db');
   try {
@@ -147,17 +149,93 @@ test('Runtime store marks runs abandoned by a process restart as failed', () => 
       errors: [],
       startedAt: new Date(Date.now() - 60_000).toISOString(),
     });
+    createCodingTask({
+      taskId: 'task_abandoned_test',
+      runId: 'run_abandoned_test',
+      request: 'recover the interrupted coding task',
+      workspaceRoot: directory,
+      workspaceRevision: 'revision-before-restart',
+    }, firstProcess);
     firstProcess.close();
 
     const restartedProcess = new RuntimeStore(databasePath);
     const recovered = restartedProcess.getRun('run_abandoned_test');
-    assert.equal(recovered?.status, 'failed');
+    assert.equal(recovered?.status, 'abandoned');
     assert.ok(recovered?.completedAt);
     assert.match(recovered?.errors.join(' ') || '', /process exited/i);
+    const recoveredTask = restartedProcess.getCodingTask('task_abandoned_test');
+    assert.equal(recoveredTask?.status, 'cancelled');
+    assert.match(JSON.stringify(recoveredTask?.state), /missing or terminated unsuccessfully/i);
     restartedProcess.close();
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test('Runtime store quarantines legacy overspent token governors while preserving raw evidence', () => {
+  const directory = mkdtempSync(path.join(tmpdir(), 'zenos-runtime-governor-migration-'));
+  const databasePath = path.join(directory, 'runtime.db');
+  const legacy = new DatabaseSync(databasePath);
+  legacy.exec(`
+    CREATE TABLE runtime_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    INSERT INTO runtime_meta(key, value) VALUES('schema_version', '7');
+    CREATE TABLE token_governors (
+      budget_id TEXT PRIMARY KEY,
+      limit_tokens INTEGER NOT NULL,
+      reserve_tokens INTEGER NOT NULL,
+      spent_tokens INTEGER NOT NULL,
+      calls INTEGER NOT NULL,
+      anomaly_count INTEGER NOT NULL DEFAULT 0,
+      invalid_samples INTEGER NOT NULL DEFAULT 0,
+      reservations_json TEXT NOT NULL,
+      status TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      completed_at TEXT
+    );
+    INSERT INTO token_governors VALUES(
+      'legacy-overspent', 2500, 0, 2212480, 4, 0, 0, '{}', 'completed',
+      '2026-07-15T00:00:00.000Z', '2026-07-16T00:00:00.000Z', '2026-07-15T00:01:00.000Z'
+    );
+  `);
+  legacy.close();
+
+  try {
+    const store = new RuntimeStore(databasePath);
+    store.close();
+    const verified = new DatabaseSync(databasePath, { readOnly: true });
+    const row = verified.prepare('SELECT * FROM token_governors WHERE budget_id = ?').get('legacy-overspent');
+    const version = verified.prepare("SELECT value FROM runtime_meta WHERE key = 'schema_version'").get();
+    assert.equal(Number(row?.spent_tokens), 2500);
+    assert.equal(Number(row?.reported_spent_tokens), 2212480);
+    assert.equal(Number(row?.anomaly_count), 1);
+    assert.equal(Number(row?.invalid_samples), 1);
+    assert.equal(String(row?.status), 'expired');
+    assert.equal(String(version?.value), '8');
+    verified.close();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('Runtime store abandons expired leases without waiting for a process restart', () => {
+  const store = new RuntimeStore(':memory:');
+  const expired = new Date(Date.now() - 60_000).toISOString();
+  store.saveRun({
+    runId: 'run_expired_lease',
+    requestHash: 'request-hash-expired',
+    status: 'running',
+    errors: [],
+    startedAt: new Date(Date.now() - 120_000).toISOString(),
+    heartbeatAt: expired,
+    leaseExpiresAt: expired,
+  });
+
+  assert.equal(store.reconcileExpiredRuns(), 1);
+  const reconciled = store.getRun('run_expired_lease');
+  assert.equal(reconciled?.status, 'abandoned');
+  assert.match(reconciled?.errors.join(' ') || '', /lease expired/i);
+  store.close();
 });
 
 test('idempotency claims replay exact responses and reject conflicting bodies', () => {

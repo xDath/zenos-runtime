@@ -1,11 +1,16 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { GET as healthGet } from '../app/api/health/route';
+import { POST as abortPost } from '../app/api/runtime/gateway/abort/route';
 import { POST as routePost } from '../app/api/runtime/route/route';
 import { GET as sessionGet, POST as sessionPost } from '../app/api/runtime/session/route';
 import { POST as runPost } from '../app/api/runtime/run/route';
+import { createCodingTask } from '../app/lib/codex-execution-core';
 import { resetRateLimitsForTests } from '../app/lib/rate-limit';
-import { resetRuntimeStoreForTests } from '../app/lib/zenos-runtime-store';
+import { choosePipeline } from '../app/lib/zenos-runtime';
+import { createRuntimeSession } from '../app/lib/zenos-runtime-three-agent';
+import { RuntimeRunRequestSchema } from '../app/lib/zenos-runtime-executor';
+import { getRuntimeStore, resetRuntimeStoreForTests } from '../app/lib/zenos-runtime-store';
 
 const apiKey = 'runtime-route-contract-key';
 
@@ -92,6 +97,117 @@ test('session route persists through the HTTP boundary', async () => {
   const listedBody = await listed.json() as { sessions: Array<{ sessionId: string }> };
   assert.equal(listed.status, 200);
   assert.equal(listedBody.sessions.some(item => item.sessionId === 'route-contract-session'), true);
+});
+
+test('gateway abort terminalizes both the Runtime run and its active coding task', async () => {
+  const store = getRuntimeStore();
+  const sessionId = 'route-contract-abort-session';
+  const runId = 'route-contract-abort-run';
+  createRuntimeSession({
+    request: 'repair the interrupted coding change',
+    hasFiles: true,
+    hasCodeChangeIntent: true,
+    intent: 'mutate',
+  }, { sessionId });
+  const task = createCodingTask({
+    taskId: 'route-contract-abort-task',
+    runId,
+    sessionId,
+    request: 'repair the interrupted coding change',
+    workspaceRoot: '/tmp/route-contract-abort-workspace',
+    workspaceRevision: 'revision-abort-test',
+  }, store);
+  const input = RuntimeRunRequestSchema.parse({
+    request: 'repair the interrupted coding change',
+    sessionId,
+    hasFiles: true,
+    hasCodeChangeIntent: true,
+    intent: 'mutate',
+  });
+  store.saveRun({
+    runId,
+    sessionId,
+    requestHash: 'abort-contract-hash',
+    status: 'running',
+    decision: choosePipeline({
+      request: 'repair the interrupted coding change',
+      hasFiles: true,
+      hasCodeChangeIntent: true,
+      intent: 'mutate',
+    }),
+    result: {
+      kind: 'gateway_preflight_v2',
+      input,
+      turnId: 'route-contract-abort-turn',
+      platform: 'test',
+      host: { model: 'host-test', provider: 'test-router' },
+      preflightLatency: [],
+      holdFinalDelivery: true,
+      codingTaskId: task.taskId,
+      codingPhase: task.currentPhase,
+    },
+    errors: [],
+    startedAt: new Date().toISOString(),
+  });
+
+  const response = await abortPost(request('/api/runtime/gateway/abort', {
+    authenticated: true,
+    body: {
+      sessionId,
+      runId,
+      turnId: 'route-contract-abort-turn',
+      reason: 'test interruption',
+    },
+  }));
+  const body = await response.json() as {
+    ok: boolean;
+    run: { status: string };
+    codingTask: { status: string; unresolvedRisks: string[] };
+  };
+  assert.equal(response.status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(body.run.status, 'abandoned');
+  assert.equal(body.codingTask.status, 'cancelled');
+  assert.match(body.codingTask.unresolvedRisks.join(' '), /test interruption/i);
+  assert.equal(store.getCodingTask(task.taskId)?.status, 'cancelled');
+});
+
+test('gateway abort closes an orphan coding task even when its run record is missing', async () => {
+  const store = getRuntimeStore();
+  const sessionId = 'route-contract-orphan-session';
+  const runId = 'route-contract-missing-run';
+  createRuntimeSession({
+    request: 'recover an orphan coding task',
+    hasFiles: true,
+    hasCodeChangeIntent: true,
+    intent: 'mutate',
+  }, { sessionId });
+  const task = createCodingTask({
+    taskId: 'route-contract-orphan-task',
+    runId,
+    sessionId,
+    request: 'recover an orphan coding task',
+    workspaceRoot: '/tmp/route-contract-orphan-workspace',
+    workspaceRevision: 'revision-orphan-test',
+  }, store);
+
+  const response = await abortPost(request('/api/runtime/gateway/abort', {
+    authenticated: true,
+    body: {
+      sessionId,
+      runId,
+      reason: 'orphan cleanup test',
+    },
+  }));
+  const body = await response.json() as {
+    ok: boolean;
+    codingTask: { status: string; unresolvedRisks: string[] };
+  };
+  assert.equal(response.status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(body.codingTask.status, 'cancelled');
+  assert.match(body.codingTask.unresolvedRisks.join(' '), /orphan cleanup test/i);
+  assert.equal(store.getCodingTask(task.taskId)?.status, 'cancelled');
 });
 
 test('run route executes a real dry-run pipeline and persistently replays idempotent HTTP requests', async () => {

@@ -357,7 +357,19 @@ export function recordCodingFailure(taskId: string, failure: Omit<CodingFailure,
 }
 
 function checkpointDirectory(root: string, taskId: string): string {
-  return path.join(root, '.data', 'coding-checkpoints', taskId);
+  const configuredRoot = process.env.ZENOS_RUNTIME_CODING_CHECKPOINT_DIR?.trim();
+  const checkpointRoot = configuredRoot
+    ? path.resolve(configuredRoot)
+    : process.env.NODE_ENV === 'production'
+      ? '/var/lib/zenos-runtime/coding-checkpoints'
+      : path.join(root, '.data', 'coding-checkpoints');
+  const workspaceKey = crypto.createHash('sha256').update(path.resolve(root)).digest('hex').slice(0, 16);
+  const taskLabel = taskId
+    .replace(/[^A-Za-z0-9._-]+/g, '-')
+    .replace(/^[._-]+|[._-]+$/g, '')
+    .slice(0, 64) || 'task';
+  const taskKey = `${taskLabel}-${crypto.createHash('sha256').update(taskId).digest('hex').slice(0, 12)}`;
+  return path.join(checkpointRoot, workspaceKey, taskKey);
 }
 
 function writeCheckpointSnapshot(snapshotPath: string, snapshot: CheckpointSnapshot): void {

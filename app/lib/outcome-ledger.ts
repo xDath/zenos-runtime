@@ -6,7 +6,7 @@ import { RouteDecisionSchema } from './zenos-runtime';
 import type { RuntimeModelResult } from './zenos-runtime-executor';
 import { getRuntimeStore } from './zenos-runtime-store';
 
-export const OUTCOME_LEDGER_VERSION = 'etla-outcome-passport-v1';
+export const OUTCOME_LEDGER_VERSION = 'etla-outcome-passport-v2';
 
 const RoleUsageSchema = z.object({
   calls: z.number().int().nonnegative(),
@@ -16,6 +16,7 @@ const RoleUsageSchema = z.object({
   outputTokens: z.number().int().nonnegative(),
   reasoningTokens: z.number().int().nonnegative(),
   totalTokens: z.number().int().nonnegative(),
+  invalidSamples: z.number().int().nonnegative().default(0),
 });
 
 const ShadowRouteSchema = z.object({
@@ -50,6 +51,8 @@ export const OutcomePassportSchema = z.object({
     bossConfidence: z.number().min(0).max(1).optional(),
     evidenceCoverage: z.number().min(0).max(1).optional(),
     memorySource: z.string().optional(),
+    modelFingerprint: z.string().min(1),
+    models: z.array(z.string()).default([]),
   }),
   shadowRoute: ShadowRouteSchema,
   userFeedback: z.object({
@@ -72,6 +75,7 @@ function usageFromCalls(calls: RuntimeModelResult[], hostUsage?: {
   outputTokens: number;
   reasoningTokens: number;
   calls: number;
+  valid?: boolean;
 }) {
   const empty = () => ({
     calls: 0,
@@ -81,6 +85,7 @@ function usageFromCalls(calls: RuntimeModelResult[], hostUsage?: {
     outputTokens: 0,
     reasoningTokens: 0,
     totalTokens: 0,
+    invalidSamples: 0,
   });
   const usage: Record<string, ReturnType<typeof empty>> = {
     hermes_host: empty(),
@@ -98,6 +103,7 @@ function usageFromCalls(calls: RuntimeModelResult[], hostUsage?: {
       outputTokens: hostUsage.outputTokens,
       reasoningTokens: hostUsage.reasoningTokens,
       totalTokens: hostUsage.inputTokens + hostUsage.cacheReadTokens + hostUsage.cacheWriteTokens + hostUsage.outputTokens,
+      invalidSamples: hostUsage.valid === false ? 1 : 0,
     };
   }
   for (const call of calls) {
@@ -112,6 +118,7 @@ function usageFromCalls(calls: RuntimeModelResult[], hostUsage?: {
     target.reasoningTokens += modelUsage?.reasoningTokens || 0;
     target.totalTokens += modelUsage?.totalTokens
       || (modelUsage?.inputTokens || 0) + (modelUsage?.cacheReadTokens || 0) + (modelUsage?.cacheWriteTokens || 0) + (modelUsage?.outputTokens || 0);
+    if (modelUsage?.valid === false) target.invalidSamples += 1;
   }
   return usage;
 }
@@ -173,6 +180,7 @@ export function recordOutcomePassport(input: {
     outputTokens: number;
     reasoningTokens: number;
     calls: number;
+    valid?: boolean;
   };
   latencyObservations?: z.input<typeof LatencyObservationSchema>[];
   verifierVerdict?: string;
@@ -181,12 +189,19 @@ export function recordOutcomePassport(input: {
   bossConfidence?: number;
   evidenceCoverage?: number;
   memorySource?: string;
+  hostModel?: string;
+  hostProvider?: string;
 }): OutcomePassport {
   const decision = RouteDecisionSchema.parse(input.decision);
   const observations = (input.latencyObservations || []).map((item) => LatencyObservationSchema.parse(item));
   const latency = latencySummary(observations);
   const createdAt = new Date().toISOString();
   const outcomeId = `outcome_${crypto.randomUUID()}`;
+  const models = [...new Set([
+    input.hostModel && `hermes:${input.hostProvider || 'default'}:${input.hostModel}`,
+    ...input.calls.map((call) => `${call.role}:${call.provider}:${call.model}`),
+  ].filter((value): value is string => Boolean(value)))].sort();
+  const modelFingerprint = hash(models).slice(0, 24);
   const passport = OutcomePassportSchema.parse({
     ledgerVersion: OUTCOME_LEDGER_VERSION,
     outcomeId,
@@ -212,6 +227,8 @@ export function recordOutcomePassport(input: {
       bossConfidence: input.bossConfidence,
       evidenceCoverage: input.evidenceCoverage,
       memorySource: input.memorySource,
+      modelFingerprint,
+      models,
     },
     shadowRoute: shadowRoute({
       decision,
@@ -250,7 +267,7 @@ export function buildOutcomeAnalytics(records = getRuntimeStore().listOutcomes(5
   const passports = [...latestByRun.values()];
   const groups = new Map<string, OutcomePassport[]>();
   for (const passport of passports) {
-    const key = `${passport.decision.taskType}:${passport.decision.pipelineMode}`;
+    const key = `${passport.decision.taskType}:${passport.decision.pipelineMode}:${passport.quality.modelFingerprint}`;
     groups.set(key, [...(groups.get(key) || []), passport]);
   }
   const routes = [...groups.entries()].map(([key, items]) => {
@@ -260,6 +277,10 @@ export function buildOutcomeAnalytics(records = getRuntimeStore().listOutcomes(5
     const feedbackCount = items.filter((item) => item.userFeedback?.accepted !== undefined).length;
     const totalTokens = items.reduce((sum, item) => sum + Object.values(item.roleUsage).reduce((roleSum, usage) => roleSum + usage.totalTokens, 0), 0);
     const totalLatency = items.reduce((sum, item) => sum + (item.latency.observations.find((entry) => entry.component === 'total')?.durationMs || 0), 0);
+    const invalidUsageSamples = items.reduce(
+      (sum, item) => sum + Object.values(item.roleUsage).reduce((roleSum, usage) => roleSum + usage.invalidSamples, 0),
+      0,
+    );
     const cheaperVotes = items.filter((item) => item.shadowRoute.recommendation === 'cheaper_candidate').length;
     const strongerVotes = items.filter((item) => item.shadowRoute.recommendation === 'stronger_candidate').length;
     const sampleSize = items.length;
@@ -271,29 +292,37 @@ export function buildOutcomeAnalytics(records = getRuntimeStore().listOutcomes(5
       : strongerVotes > cheaperVotes
         ? 'stronger_candidate'
         : 'retain';
-    const evidenceReady = sampleSize >= 20
+    const evidenceReady = sampleSize >= 100
+      && invalidUsageSamples === 0
       && successRate >= 0.9
       && failureRate <= 0.03
-      && (feedbackAcceptanceRate === undefined || feedbackAcceptanceRate >= 0.85);
+      && feedbackCount >= 10
+      && feedbackAcceptanceRate !== undefined
+      && feedbackAcceptanceRate >= 0.85;
     return {
       key,
       taskType: items[0].decision.taskType,
       pipelineMode: items[0].decision.pipelineMode,
+      modelFingerprint: items[0].quality.modelFingerprint,
+      models: items[0].quality.models,
       sampleSize,
       successRate,
       failureRate,
       feedbackAcceptanceRate,
       averageTokens: sampleSize ? Math.round(totalTokens / sampleSize) : 0,
       averageLatencyMs: sampleSize ? Math.round(totalLatency / sampleSize) : 0,
+      invalidUsageSamples,
+      feedbackCount,
       shadowVotes: { cheaper: cheaperVotes, stronger: strongerVotes, retain: sampleSize - cheaperVotes - strongerVotes },
       recommendation: candidate,
       evidenceReady,
       automaticPromotionAllowed: false,
       promotionRequirements: [
-        'minimum 20 latest run outcomes',
+        'minimum 100 clean outcomes for the same task, route, and model fingerprint',
         'success rate at least 90%',
         'blocked/failed rate at most 3%',
-        'feedback acceptance at least 85% when feedback exists',
+        'zero invalid token-usage samples',
+        'at least 10 explicit feedback samples with acceptance at least 85%',
         'explicit human promotion approval',
       ],
     };

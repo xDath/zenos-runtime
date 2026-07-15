@@ -33,7 +33,7 @@ def main() -> None:
     credential = directory / credential_name()
     environment = os.environ.copy()
     environment.update(credential_environment(credential))
-    python = "/usr/local/lib/hermes-agent/venv/bin/python"
+    python = "/usr/local/lib/hermes-python/bin/python3.11"
     arguments = [python, "-m", "hermes_cli.main", "-p", "zenos", "gateway", "run", "--replace"]
     os.execve(python, arguments, environment)
 

@@ -10,6 +10,8 @@ export type TokenGovernorSnapshot = {
   reservedTokens: number;
   remainingTokens: number;
   calls: number;
+  anomalyCount: number;
+  invalidSamples: number;
 };
 
 type GovernorState = {
@@ -17,6 +19,8 @@ type GovernorState = {
   reserveTokens: number;
   spentTokens: number;
   calls: number;
+  anomalyCount: number;
+  invalidSamples: number;
   updatedAt: number;
   reservations: Map<string, number>;
 };
@@ -43,6 +47,8 @@ function persistState(id: string, state: GovernorState): void {
     reserveTokens: state.reserveTokens,
     spentTokens: state.spentTokens,
     calls: state.calls,
+    anomalyCount: state.anomalyCount,
+    invalidSamples: state.invalidSamples,
     reservations: Object.fromEntries(state.reservations),
     status: 'active',
     updatedAt,
@@ -66,6 +72,8 @@ function stateFor(plan: TokenBudgetPlan): GovernorState {
       reserveTokens: Math.max(persisted.reserveTokens, plan.reserveTokens),
       spentTokens: persisted.spentTokens,
       calls: persisted.calls,
+      anomalyCount: persisted.anomalyCount,
+      invalidSamples: persisted.invalidSamples,
       updatedAt: Date.now(),
       reservations: new Map(Object.entries(persisted.reservations)),
     };
@@ -78,6 +86,8 @@ function stateFor(plan: TokenBudgetPlan): GovernorState {
     reserveTokens: plan.reserveTokens,
     spentTokens: 0,
     calls: 0,
+    anomalyCount: 0,
+    invalidSamples: 0,
     updatedAt: Date.now(),
     reservations: new Map(),
   };
@@ -130,12 +140,28 @@ export function settleTokenSpend(input: {
   role: RuntimeRole;
   actualTokens: number;
   attempted: boolean;
+  usageValid?: boolean;
+  invalidReason?: string;
 }): TokenGovernorSnapshot {
   const state = stateFor(input.plan);
+  const reserved = state.reservations.get(input.requestId) || 0;
   state.reservations.delete(input.requestId);
   if (input.attempted) {
-    const actual = Math.max(0, Math.round(input.actualTokens));
-    state.spentTokens += actual;
+    const reported = Math.max(0, Math.round(input.actualTokens));
+    const plausibleCap = Math.max(reserved + 2_048, reserved * 2, 2_500);
+    const invalid = input.usageValid === false || reported > plausibleCap;
+    const actual = invalid
+      ? Math.min(Math.max(1, reserved), Math.max(0, state.limitTokens - state.spentTokens))
+      : Math.min(reported, plausibleCap);
+    if (invalid) {
+      state.anomalyCount += 1;
+      if (input.usageValid === false) state.invalidSamples += 1;
+      incrementMetric('runtime_token_governor_anomaly_total', {
+        role: input.role,
+        reason: input.usageValid === false ? 'invalid_usage' : 'oversized_actual',
+      });
+    }
+    state.spentTokens = Math.min(state.limitTokens, state.spentTokens + actual);
     state.calls += 1;
     incrementMetric('runtime_token_governor_spent_total', { role: input.role }, actual);
   }
@@ -155,6 +181,8 @@ export function tokenGovernorSnapshot(plan: TokenBudgetPlan): TokenGovernorSnaps
     reservedTokens: reserved,
     remainingTokens: Math.max(0, state.limitTokens - state.spentTokens - reserved),
     calls: state.calls,
+    anomalyCount: state.anomalyCount,
+    invalidSamples: state.invalidSamples,
   };
 }
 

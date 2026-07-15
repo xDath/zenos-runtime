@@ -1,0 +1,24 @@
+[Unit]
+Description=Etla disk hygiene and capacity alerting
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/local/sbin/etla-maintenance
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/root/zenos-upgrade-backups /root/.npm /root/openclaw-projects /opt/zenos-runtime/releases /var/log/journal /run/log/journal
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+TimeoutStartSec=300
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=etla-maintenance

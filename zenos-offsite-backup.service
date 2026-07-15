@@ -1,0 +1,36 @@
+[Unit]
+Description=Upload verified encrypted Zenos backups to Google Drive
+After=network-online.target zenos-runtime-backup.service zenos-memory-secondary-backup.service srv-etla-workspaces.mount
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=zenos-runtime
+Group=zenos-runtime
+WorkingDirectory=/srv/etla/workspaces/zenos-memory
+LoadCredentialEncrypted=zenos-runtime.env:/etc/credstore.encrypted/zenos-runtime.env.cred
+LoadCredentialEncrypted=zenos-memory.env:/etc/credstore.encrypted/zenos-memory.env.cred
+Environment=HOME=/var/lib/zenos-runtime
+Environment=NODE_ENV=production
+Environment=ZENOS_OFFSITE_BACKUP_MODE=append-only
+ExecStart=/usr/bin/node /srv/etla/workspaces/zenos-memory/scripts/upload-offsite-backups.mjs
+UMask=0077
+NoNewPrivileges=true
+CapabilityBoundingSet=
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadOnlyPaths=/srv/etla/workspaces/zenos-memory /var/backups/zenos-memory /var/backups/zenos-runtime
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+TimeoutStartSec=300
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zenos-offsite-backup

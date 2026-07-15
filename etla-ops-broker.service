@@ -1,0 +1,35 @@
+[Unit]
+Description=Etla Narrow Privileged Operations Broker
+After=local-fs.target
+Before=hermes-gateway.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/bin/python3 /usr/local/sbin/etla-ops-broker
+Restart=on-failure
+RestartSec=2
+RuntimeDirectory=etla-ops
+RuntimeDirectoryMode=0750
+UMask=0077
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_SETGID CAP_SETUID
+AmbientCapabilities=
+PrivateTmp=true
+ProtectHome=read-only
+ProtectSystem=strict
+ReadOnlyPaths=/opt/zenos-runtime/current /usr/local/sbin/etla-maintenance
+ReadWritePaths=/run/etla-ops /run/systemd /var/run /etc/systemd/system /opt/zenos-runtime /etc/credstore.encrypted /etc/zenos-runtime /var/lib/zenos-runtime /var/lib/hermes /var/lib/9router /var/cache/9router /var/backups /srv/etla/workspaces /usr/local/bin /usr/local/sbin /usr/local/lib/hermes-python
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=etla-ops-broker
+
+[Install]
+WantedBy=multi-user.target

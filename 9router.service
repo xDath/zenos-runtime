@@ -1,0 +1,53 @@
+[Unit]
+Description=9Router - Internal AI Router and Token Saver
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=8
+
+[Service]
+Type=simple
+User=etla-router
+Group=etla-router
+WorkingDirectory=/opt/9router
+LoadCredentialEncrypted=9router.env:/etc/credstore.encrypted/9router.env.cred
+Environment=HOME=/var/lib/9router
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 /usr/local/sbin/run-9router-with-credential
+Restart=always
+RestartSec=5
+StateDirectory=9router
+StateDirectoryMode=0700
+CacheDirectory=9router
+CacheDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectHostname=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectProc=invisible
+ProcSubset=pid
+ReadOnlyPaths=/opt/9router /opt/zenos-runtime/current
+ReadWritePaths=/var/lib/9router /var/cache/9router
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=9router
+
+[Install]
+WantedBy=multi-user.target

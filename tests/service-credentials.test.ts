@@ -107,7 +107,9 @@ test('deployment prepares separate least-privilege Runtime and full Hermes crede
     assert.equal(runtime.ZENOS_MEMORY_API_KEY, 'memory-api-secret');
     assert.equal(runtime.ZENOS_LLM_API_KEY, 'router-api-secret');
     assert.equal(runtime.ZENOS_LLM_BASE_URL, 'http://127.0.0.1:20128/v1');
-    assert.equal(runtime.ZENOS_MEMORY_URL, 'http://127.0.0.1:3091');
+    assert.equal(runtime.ZENOS_MEMORY_URL, 'https://zenos-memory.vercel.app');
+    assert.ok(runtime.ZENOS_BACKUP_ENCRYPTION_KEY?.length >= 48);
+    assert.equal(hermes.ZENOS_MEMORY_URL, 'https://zenos-memory.vercel.app');
 
     for (const forbidden of ['TELEGRAM_BOT_TOKEN', 'PRIVATE_KEY', 'MNEMONIC', 'X_PASSWORD']) {
       assert.equal(runtime[forbidden], undefined, `${forbidden} leaked into Runtime credentials`);
@@ -130,26 +132,51 @@ test('Hermes gateway consumes only its dedicated credential bundle', () => {
   const launcher = readFileSync('scripts/run-hermes-gateway-with-credential.py', 'utf8');
   assert.match(unit, /LoadCredentialEncrypted=hermes-zenos\.env:/);
   assert.match(unit, /HERMES_CREDENTIAL_NAME=hermes-zenos\.env/);
-  assert.match(unit, /run-hermes-gateway-with-credential\.py/);
+  assert.match(unit, /\/usr\/local\/sbin\/run-hermes-gateway-with-credential/);
   assert.match(launcher, /HERMES_CREDENTIAL_NAME/);
   assert.doesNotMatch(unit, /LoadCredentialEncrypted=zenos-runtime\.env:/);
 });
 
-test('Hermes gateway runs as root for direct VPS operations', () => {
+test('Hermes gateway runs non-root and delegates only narrow privileged operations', () => {
   const unit = readFileSync('hermes-gateway-zenos.service', 'utf8');
-  assert.match(unit, /^User=root$/m);
-  assert.match(unit, /^Group=root$/m);
-  assert.match(unit, /^Environment=USER=root$/m);
-  assert.match(unit, /^Environment=LOGNAME=root$/m);
-  assert.match(unit, /^NoNewPrivileges=false$/m);
-  assert.doesNotMatch(unit, /^StateDirectory=/m);
+  const broker = readFileSync('scripts/etla-ops-broker.py', 'utf8');
+  assert.match(unit, /^User=hermes$/m);
+  assert.match(unit, /^Group=hermes$/m);
+  assert.match(unit, /^Environment=USER=hermes$/m);
+  assert.match(unit, /^Environment=LOGNAME=hermes$/m);
+  assert.match(unit, /^NoNewPrivileges=true$/m);
+  assert.match(unit, /^CapabilityBoundingSet=$/m);
+  assert.match(unit, /^ProtectProc=invisible$/m);
+  assert.match(unit, /^ProcSubset=all$/m);
+  assert.match(unit, /ReadWritePaths=\/var\/lib\/hermes \/srv\/etla\/workspaces/);
+  assert.match(broker, /ALLOWED_UNITS/);
+  assert.doesNotMatch(broker, /shell=True|os\.system\(|subprocess\.(?:call|run)\([^\n]*shell/);
+});
+
+test('privileged broker keeps cloud deployment outside its AF_UNIX-only sandbox', () => {
+  const broker = readFileSync('scripts/etla-ops-broker.py', 'utf8');
+  const unit = readFileSync('etla-ops-broker.service', 'utf8');
+  assert.match(unit, /^RestrictAddressFamilies=AF_UNIX$/m);
+  assert.match(broker, /\/usr\/bin\/systemd-run/);
+  assert.match(broker, /--wait/);
+  assert.match(broker, /--collect/);
+  assert.match(broker, /ZENOS_DEPLOY_RESTART_BROKER=false/);
+  assert.doesNotMatch(broker, /"zenos-memory\.service"/);
+});
+
+test('Runtime stores mutable intelligence and checkpoints outside the read-only checkout', () => {
+  const unit = readFileSync('zenos-runtime.service', 'utf8');
+  assert.match(unit, /^Environment=ZENOS_RUNTIME_REPOSITORY_INDEX_DIR=\/var\/cache\/zenos-runtime\/repository-index$/m);
+  assert.match(unit, /^Environment=ZENOS_RUNTIME_CODING_CHECKPOINT_DIR=\/var\/lib\/zenos-runtime\/coding-checkpoints$/m);
+  assert.match(unit, /^ReadOnlyPaths=.*\/srv\/etla\/workspaces$/m);
+  assert.match(unit, /^ReadWritePaths=\/var\/lib\/zenos-runtime \/var\/cache\/zenos-runtime$/m);
 });
 
 test('Runtime deployment activates the release only after preparation completes', () => {
   const installer = readFileSync('scripts/install-control-plane-service.sh', 'utf8');
   const releaseCreated = installer.indexOf('mv "${STAGING}" "${RELEASE_ROOT}"');
   const credentialPrepared = installer.indexOf('prepare-runtime-service-files.py');
-  const unitInstalled = installer.indexOf('hermes-gateway.service');
+  const unitInstalled = installer.indexOf('/etc/systemd/system/hermes-gateway.service');
   const releaseActivated = installer.indexOf('ln -sfn "${RELEASE_ROOT}" /opt/zenos-runtime/current');
   const serviceRestarted = installer.indexOf('systemctl restart zenos-runtime.service', releaseActivated);
 

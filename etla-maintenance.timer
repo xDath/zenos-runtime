@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Etla maintenance and disk alerting
+
+[Timer]
+OnCalendar=*-*-* 02:40:00
+Persistent=true
+RandomizedDelaySec=900
+Unit=etla-maintenance.service
+
+[Install]
+WantedBy=timers.target

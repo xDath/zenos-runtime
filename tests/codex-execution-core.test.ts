@@ -115,6 +115,35 @@ test('Codex preparation creates repository-aware inspect state and checkpoint', 
   assert.match(prepared.context, /Validation plan:/);
 });
 
+test('production coding checkpoints persist outside the read-only checkout', async (context) => {
+  const root = createFixture();
+  const checkpointRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'etla-coding-checkpoints-'));
+  const previousCheckpointRoot = process.env.ZENOS_RUNTIME_CODING_CHECKPOINT_DIR;
+  const store = new RuntimeStore(':memory:');
+  context.after(() => {
+    store.close();
+    if (previousCheckpointRoot === undefined) delete process.env.ZENOS_RUNTIME_CODING_CHECKPOINT_DIR;
+    else process.env.ZENOS_RUNTIME_CODING_CHECKPOINT_DIR = previousCheckpointRoot;
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(checkpointRoot, { recursive: true, force: true });
+  });
+
+  process.env.ZENOS_RUNTIME_CODING_CHECKPOINT_DIR = checkpointRoot;
+  const task = createCodingTask({
+    taskId: '../unsafe task id',
+    request: 'checkpoint src/value.ts',
+    workspaceRoot: root,
+    workspaceRevision: 'revision-checkpoint',
+  }, store);
+  const checkpointed = await createCodingCheckpoint(task.taskId, ['src/value.ts'], {}, store);
+  const snapshotPath = checkpointed.checkpoints[0]?.snapshotPath || '';
+
+  assert.ok(snapshotPath.startsWith(`${checkpointRoot}${path.sep}`));
+  assert.equal(snapshotPath.includes('..'), false);
+  assert.equal(fs.existsSync(snapshotPath), true);
+  assert.equal(fs.existsSync(path.join(root, '.data')), false);
+});
+
 test('checkpoint rollback restores file content only with approval', async (context) => {
   const root = createFixture();
   const store = new RuntimeStore(':memory:');

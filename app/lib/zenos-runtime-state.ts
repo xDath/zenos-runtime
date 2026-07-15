@@ -17,7 +17,7 @@ export const RuntimeSessionStatusSchema = z.enum([
 ]);
 export const WorkerLeaseStatusSchema = z.enum(['queued', 'running', 'paused', 'done', 'failed', 'cancelled']);
 export const BossVerdictSchema = z.enum(['approve', 'revise', 'block', 'ask_user', 'delegate']);
-export const RuntimeRunStatusSchema = z.enum(['queued', 'running', 'revising', 'escalated', 'done', 'failed', 'blocked']);
+export const RuntimeRunStatusSchema = z.enum(['queued', 'running', 'revising', 'escalated', 'done', 'failed', 'blocked', 'abandoned']);
 
 export const RuntimeBudgetStateSchema = z.object({
   maxPremiumTokens: z.number().int().nonnegative().default(6_000),
@@ -133,6 +133,8 @@ export const RuntimeRunRecordSchema = z.object({
   result: z.unknown().optional(),
   errors: z.array(z.string()).default([]),
   startedAt: z.string().datetime(),
+  heartbeatAt: z.string().datetime().optional(),
+  leaseExpiresAt: z.string().datetime().optional(),
   completedAt: z.string().datetime().optional(),
 });
 

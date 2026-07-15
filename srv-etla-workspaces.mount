@@ -1,0 +1,13 @@
+[Unit]
+Description=Etla Agent Workspace Bind Mount
+Before=zenos-runtime.service hermes-gateway.service
+ConditionPathIsDirectory=/root/openclaw-projects
+
+[Mount]
+What=/root/openclaw-projects
+Where=/srv/etla/workspaces
+Type=none
+Options=bind,nosuid,nodev
+
+[Install]
+WantedBy=multi-user.target

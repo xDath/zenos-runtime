@@ -49,26 +49,26 @@ function memoryTokenBudget(decision: RouteDecision): number {
   return Math.max(300, Math.min(2_500, byTask[decision.taskType] + riskBoost));
 }
 
-function contextSoftLimit(decision: RouteDecision): number {
+export function hostWorkingSetForDecision(decision: RouteDecision): number {
   const configured = Number(process.env.ZENOS_HOST_CONTEXT_SOFT_LIMIT_TOKENS || '0');
   if (Number.isFinite(configured) && configured > 0 && process.env.ZENOS_ADAPTIVE_CONTEXT_LIMITS === 'false') {
-    return Math.max(24_000, Math.min(configured, 96_000));
+    return Math.max(24_000, Math.min(configured, 256_000));
   }
   const byTask: Record<RouteDecision['taskType'], number> = {
-    simple_chat: 24_000,
-    memory_question: 32_000,
-    repo_question: 56_000,
-    coding_change: 64_000,
-    debugging: 56_000,
-    summarization: 96_000,
-    planning_or_architecture: 48_000,
-    security_or_secret: 40_000,
-    deploy_or_destructive_action: 40_000,
-    eval_or_benchmark: 56_000,
+    simple_chat: 48_000,
+    memory_question: 64_000,
+    repo_question: 128_000,
+    coding_change: 192_000,
+    debugging: 160_000,
+    summarization: 128_000,
+    planning_or_architecture: 96_000,
+    security_or_secret: 96_000,
+    deploy_or_destructive_action: 128_000,
+    eval_or_benchmark: 96_000,
   };
   const baseline = byTask[decision.taskType];
   const riskFactor = decision.risk === 'critical' ? 0.8 : decision.risk === 'high' ? 0.9 : 1;
-  return Math.max(24_000, Math.min(96_000, Math.round(baseline * riskFactor)));
+  return Math.max(24_000, Math.min(256_000, Math.round(baseline * riskFactor)));
 }
 
 function safeNamespacePart(value: string): string {
@@ -155,7 +155,7 @@ export async function gatewayMemoryContextFor(
   existingSession: boolean,
 ): Promise<GatewayMemoryBrief> {
   const namespaces = memoryNamespaces(request);
-  const softLimit = contextSoftLimit(decision);
+  const softLimit = hostWorkingSetForDecision(decision);
   const contextBudget = memoryTokenBudget(decision);
   const projectName = request.workspaceRoot ? path.basename(request.workspaceRoot) : '';
   const memoryQuery = projectName

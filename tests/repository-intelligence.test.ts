@@ -91,6 +91,25 @@ test('repository intelligence builds symbols, references, imports, tests, script
   assert.ok(impact.affectedFiles.includes('src/alpha.ts'));
 });
 
+test('production repository index persists outside the read-only checkout', async (context) => {
+  const root = createFixture();
+  const cacheRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'etla-repo-cache-'));
+  const previousCacheRoot = process.env.ZENOS_RUNTIME_REPOSITORY_INDEX_DIR;
+  context.after(() => {
+    if (previousCacheRoot === undefined) delete process.env.ZENOS_RUNTIME_REPOSITORY_INDEX_DIR;
+    else process.env.ZENOS_RUNTIME_REPOSITORY_INDEX_DIR = previousCacheRoot;
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(cacheRoot, { recursive: true, force: true });
+  });
+
+  process.env.ZENOS_RUNTIME_REPOSITORY_INDEX_DIR = cacheRoot;
+  await buildRepositoryIndex(root);
+
+  const persisted = fs.readdirSync(cacheRoot).filter((name) => name.endsWith('.json'));
+  assert.equal(persisted.length, 1);
+  assert.equal(fs.existsSync(path.join(root, '.data')), false);
+});
+
 test('default tool broker exposes real repository and validation tools', async (context) => {
   const root = createFixture();
   context.after(() => fs.rmSync(root, { recursive: true, force: true }));

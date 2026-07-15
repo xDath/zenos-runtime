@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily offsite Google Drive backup for Zenos
+
+[Timer]
+OnCalendar=*-*-* 04:15:00
+Persistent=true
+RandomizedDelaySec=900
+Unit=zenos-offsite-backup.service
+
+[Install]
+WantedBy=timers.target

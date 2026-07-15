@@ -1,9 +1,8 @@
 [Unit]
 Description=Zenos Runtime v0.6 - Durable Token-Governed Control Plane
 Documentation=file:/opt/zenos-runtime/current/README.md
-After=network-online.target 9router.service zenos-memory.service
-Wants=network-online.target
-Requires=9router.service zenos-memory.service
+After=network-online.target 9router.service srv-etla-workspaces.mount
+Wants=network-online.target 9router.service srv-etla-workspaces.mount
 StartLimitIntervalSec=60
 StartLimitBurst=8
 
@@ -19,16 +18,18 @@ Environment=NODE_OPTIONS=--disable-warning=ExperimentalWarning
 Environment=PORT=3090
 Environment=ZENOS_BIND_HOST=127.0.0.1
 Environment=ZENOS_RUNTIME_DB_PATH=/var/lib/zenos-runtime/runtime.db
-Environment=ZENOS_MEMORY_BASE_URL=http://127.0.0.1:3091
+Environment=ZENOS_MEMORY_BASE_URL=https://zenos-memory.vercel.app
 Environment=ZENOS_RUNTIME_LEGACY_STORE_PATH=/var/lib/zenos-runtime/legacy-sessions.json
 Environment=ZENOS_RUNTIME_CONFIG_PATH=/etc/zenos-runtime/models.json
 Environment=ZENOS_VERIFIER_MODEL=ag/gemini-3.5-flash-low
 Environment=ZENOS_VERIFIER_PROVIDER=etla-router
 Environment=ZENOS_RUNTIME_SESSION_MODEL_DIR=/var/lib/zenos-runtime/session-models
+Environment=ZENOS_RUNTIME_REPOSITORY_INDEX_DIR=/var/cache/zenos-runtime/repository-index
+Environment=ZENOS_RUNTIME_CODING_CHECKPOINT_DIR=/var/lib/zenos-runtime/coding-checkpoints
 Environment=HERMES_CONFIG_PATH=/etc/zenos-runtime/hermes-config.yaml
 Environment=ZENOS_RUNTIME_EXECUTION_MODE=control-plane
-Environment=ZENOS_RUNTIME_REMOTE_VALIDATION_ENABLED=false
-Environment=ZENOS_RUNTIME_READ_ROOTS=/opt/zenos-runtime/current:/usr/local/lib/hermes-agent:/root/openclaw-projects:/var/lib/zenos-runtime/validation-workspaces
+Environment=ZENOS_RUNTIME_REMOTE_VALIDATION_ENABLED=true
+Environment=ZENOS_RUNTIME_READ_ROOTS=/opt/zenos-runtime/current:/usr/local/lib/hermes-agent:/srv/etla/workspaces:/var/lib/zenos-runtime/validation-workspaces
 Environment=ZENOS_RUNTIME_VALIDATION_ROOTS=/var/lib/zenos-runtime/validation-workspaces
 Environment=ZENOS_RUNTIME_MUTATION_ROOTS=/var/lib/zenos-runtime/executor-workspaces
 Environment=ZENOS_ALLOW_LEGACY_HMAC=false
@@ -63,7 +64,7 @@ ProtectKernelLogs=true
 ProtectControlGroups=true
 ProtectProc=invisible
 ProcSubset=pid
-ReadOnlyPaths=/opt/zenos-runtime/current /etc/zenos-runtime
+ReadOnlyPaths=/opt/zenos-runtime/current /etc/zenos-runtime /srv/etla/workspaces
 ReadWritePaths=/var/lib/zenos-runtime /var/cache/zenos-runtime
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictNamespaces=true
