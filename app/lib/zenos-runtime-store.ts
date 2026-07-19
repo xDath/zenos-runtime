@@ -97,6 +97,23 @@ export type ContinuationQueueRecord = {
   updatedAt: string;
 };
 
+function continuationRecordFromRow(row: Record<string, unknown>): ContinuationQueueRecord {
+  return {
+    continuationId: asString(row.continuation_id),
+    taskId: asString(row.task_id),
+    runId: asString(row.run_id),
+    sessionId: asString(row.session_id),
+    status: asString(row.status) as ContinuationQueueRecord['status'],
+    prompt: asString(row.prompt),
+    reason: asString(row.reason),
+    attempt: asNumber(row.attempt),
+    maxAttempts: asNumber(row.max_attempts),
+    leaseExpiresAt: row.lease_expires_at ? asString(row.lease_expires_at) : undefined,
+    createdAt: asString(row.created_at),
+    updatedAt: asString(row.updated_at),
+  };
+}
+
 export type OutcomeLedgerRecord = {
   outcomeId: string;
   runId: string;
@@ -1177,7 +1194,11 @@ export class RuntimeStore {
     return input;
   }
 
-  claimContinuationForSession(sessionId: string, leaseMs = 30 * 60_000): ContinuationQueueRecord | undefined {
+  claimContinuationForSession(
+    sessionId: string,
+    leaseMs = 30 * 60_000,
+    recoverLeasedBefore?: string,
+  ): ContinuationQueueRecord | undefined {
     return this.transaction(() => {
       const nowIso = new Date().toISOString();
       const leaseExpiresAt = new Date(Date.now() + Math.max(60_000, leaseMs)).toISOString();
@@ -1186,6 +1207,13 @@ export class RuntimeStore {
         SET status = 'queued', lease_expires_at = NULL, updated_at = ?
         WHERE session_id = ? AND status = 'leased' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?
       `).run(nowIso, sessionId, nowIso);
+      if (recoverLeasedBefore) {
+        this.db.prepare(`
+          UPDATE continuation_queue
+          SET status = 'queued', lease_expires_at = NULL, updated_at = ?
+          WHERE session_id = ? AND status = 'leased' AND updated_at <= ?
+        `).run(nowIso, sessionId, recoverLeasedBefore);
+      }
       const row = this.db.prepare(`
         SELECT * FROM continuation_queue
         WHERE session_id = ? AND status = 'queued'
@@ -1223,21 +1251,19 @@ export class RuntimeStore {
       WHERE continuation_id = ?
     `).run(cancelled ? 'cancelled' : 'completed', updatedAt, continuationId);
     const row = this.db.prepare('SELECT * FROM continuation_queue WHERE continuation_id = ?').get(continuationId);
-    if (!row) return undefined;
-    return {
-      continuationId: asString(row.continuation_id),
-      taskId: asString(row.task_id),
-      runId: asString(row.run_id),
-      sessionId: asString(row.session_id),
-      status: asString(row.status) as ContinuationQueueRecord['status'],
-      prompt: asString(row.prompt),
-      reason: asString(row.reason),
-      attempt: asNumber(row.attempt),
-      maxAttempts: asNumber(row.max_attempts),
-      leaseExpiresAt: row.lease_expires_at ? asString(row.lease_expires_at) : undefined,
-      createdAt: asString(row.created_at),
-      updatedAt: asString(row.updated_at),
-    };
+    return row ? continuationRecordFromRow(row) : undefined;
+  }
+
+  cancelContinuationsForRun(runId: string): ContinuationQueueRecord[] {
+    const updatedAt = new Date().toISOString();
+    this.db.prepare(`
+      UPDATE continuation_queue
+      SET status = 'cancelled', lease_expires_at = NULL, updated_at = ?
+      WHERE run_id = ? AND status IN ('queued', 'leased')
+    `).run(updatedAt, runId);
+    return this.db.prepare(`
+      SELECT * FROM continuation_queue WHERE run_id = ? ORDER BY created_at ASC
+    `).all(runId).map(continuationRecordFromRow);
   }
 
   claimIdempotency(key: string, scope: string, requestHash: string, ttlSeconds = 86_400): { state: 'claimed' | 'replay' | 'conflict' | 'running'; record?: IdempotencyRecord } {

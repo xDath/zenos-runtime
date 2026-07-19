@@ -13,6 +13,8 @@ const ContinuationActionSchema = z.object({
   action: z.enum(['complete', 'cancel']),
 });
 
+const RecoveryCutoffSchema = z.string().datetime({ offset: true }).optional();
+
 export async function GET(req: Request) {
   const secured = await secureRequest(req, {
     scope: 'runtime:run',
@@ -24,7 +26,14 @@ export async function GET(req: Request) {
     const url = new URL(req.url);
     const sessionId = String(url.searchParams.get('sessionId') || '').trim();
     if (!sessionId) throw new Error('sessionId is required');
-    const continuation = getRuntimeStore().claimContinuationForSession(sessionId);
+    const recoverLeasedBefore = RecoveryCutoffSchema.parse(
+      String(url.searchParams.get('recoverLeasedBefore') || '').trim() || undefined,
+    );
+    const continuation = getRuntimeStore().claimContinuationForSession(
+      sessionId,
+      30 * 60_000,
+      recoverLeasedBefore,
+    );
     return routeSuccessResponse({ ok: true, continuation: continuation || null }, secured.context, `${ROUTE}.claim`);
   } catch (error) {
     return routeErrorResponse(error, secured.context, `${ROUTE}.claim`);

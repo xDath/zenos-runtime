@@ -365,6 +365,50 @@ test('Runtime store abandons expired leases without waiting for a process restar
   store.close();
 });
 
+test('continuation recovery reclaims only leases created before the gateway startup cutoff', () => {
+  const store = new RuntimeStore(':memory:');
+  const createdAt = new Date(Date.now() - 5_000).toISOString();
+  store.enqueueContinuation({
+    continuationId: 'continuation-restart-recovery',
+    taskId: 'cognitive-restart-recovery',
+    runId: 'run-restart-recovery',
+    sessionId: 'session-restart-recovery',
+    status: 'queued',
+    prompt: 'Continue the same root task.',
+    reason: 'gateway restart smoke',
+    attempt: 1,
+    maxAttempts: 6,
+    createdAt,
+    updatedAt: createdAt,
+  });
+
+  const inBandLease = store.claimContinuationForSession('session-restart-recovery');
+  assert.equal(inBandLease?.status, 'leased');
+  assert.equal(store.claimContinuationForSession('session-restart-recovery'), undefined);
+
+  const olderCutoff = new Date(Date.parse(inBandLease?.updatedAt || createdAt) - 1).toISOString();
+  assert.equal(
+    store.claimContinuationForSession('session-restart-recovery', 60_000, olderCutoff),
+    undefined,
+    'the current process must not steal a lease newer than its startup cutoff',
+  );
+
+  const restartCutoff = new Date(Date.parse(inBandLease?.updatedAt || createdAt) + 1_000).toISOString();
+  const recovered = store.claimContinuationForSession(
+    'session-restart-recovery',
+    60_000,
+    restartCutoff,
+  );
+  assert.equal(recovered?.continuationId, inBandLease?.continuationId);
+  assert.equal(recovered?.status, 'leased');
+  assert.ok(Date.parse(recovered?.updatedAt || '') >= Date.parse(inBandLease?.updatedAt || ''));
+
+  const cancelled = store.cancelContinuationsForRun('run-restart-recovery');
+  assert.equal(cancelled[0]?.status, 'cancelled');
+  assert.equal(cancelled[0]?.leaseExpiresAt, undefined);
+  store.close();
+});
+
 test('idempotency claims replay exact responses and reject conflicting bodies', () => {
   const store = resetRuntimeStoreForTests(':memory:');
   const first = store.claimIdempotency('runtime-test-key', 'runtime.run', 'hash-a', 60);

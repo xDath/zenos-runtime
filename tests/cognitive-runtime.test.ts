@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { POST as abortPost } from '../app/api/runtime/gateway/abort/route';
 import { modelForSlot, providerForSlot } from '../app/lib/zenos-runtime-model-config';
 import { resolveRuntimeModelSlots } from '../app/lib/zenos-runtime-executor';
 import { postflightGatewayTurn, preflightGatewayTurn } from '../app/lib/gateway-orchestration';
@@ -39,6 +40,7 @@ test.beforeEach(() => {
   process.env.ZENOS_ORCHESTRATION_MODE = 'host-led';
   process.env.ZENOS_RUNTIME_DISABLE_MEMORY = 'true';
   process.env.ZENOS_RUNTIME_DISABLE_MEMORY_AUTO_RECALL = 'true';
+  process.env.ZENOS_RUNTIME_API_KEY = 'cognitive-runtime-test-key';
 });
 
 test('host-led coding preflight uses no Runtime planner or Worker and compiles a native delegation task graph', async () => {
@@ -199,8 +201,28 @@ test('unfinished work creates a leased durable continuation and keeps one root c
     assert.match(postflight.continuation?.prompt || '', /not a new user request/i);
     assert.equal(getRuntimeSession('cognitive-continuation-session')?.status, 'working');
 
-    const record = getRuntimeStore().completeContinuation(postflight.continuation?.continuationId || '');
-    assert.equal(record?.status, 'completed');
+    const abortResponse = await abortPost(new Request('http://runtime.test/api/runtime/gateway/abort', {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer cognitive-runtime-test-key',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        sessionId: 'cognitive-continuation-session',
+        runId: preflight.runId,
+        turnId: 'cognitive-continuation-turn-1',
+        reason: 'synthetic continuation cleanup',
+      }),
+    }));
+    const abortBody = await abortResponse.json() as {
+      run?: { status: string };
+      cognitiveTasks?: Array<{ status: string }>;
+      continuationRecords?: Array<{ status: string }>;
+    };
+    assert.equal(abortResponse.status, 200);
+    assert.equal(abortBody.run?.status, 'done');
+    assert.equal(abortBody.cognitiveTasks?.[0]?.status, 'cancelled');
+    assert.equal(abortBody.continuationRecords?.[0]?.status, 'cancelled');
   } finally {
     globalThis.fetch = originalFetch;
     fs.rmSync(root, { recursive: true, force: true });

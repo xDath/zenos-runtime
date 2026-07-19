@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { GET as healthGet } from '../app/api/health/route';
 import { POST as abortPost } from '../app/api/runtime/gateway/abort/route';
+import { GET as continuationGet } from '../app/api/runtime/gateway/continuation/route';
 import { POST as routePost } from '../app/api/runtime/route/route';
 import { GET as sessionGet, POST as sessionPost } from '../app/api/runtime/session/route';
 import { POST as runPost } from '../app/api/runtime/run/route';
@@ -140,6 +141,43 @@ test('session route persists through the HTTP boundary', async () => {
   const listedBody = await listed.json() as { sessions: Array<{ sessionId: string }> };
   assert.equal(listed.status, 200);
   assert.equal(listedBody.sessions.some(item => item.sessionId === 'route-contract-session'), true);
+});
+
+test('continuation recovery endpoint reclaims only pre-start leased work', async () => {
+  const store = getRuntimeStore();
+  const createdAt = new Date(Date.now() - 5_000).toISOString();
+  store.enqueueContinuation({
+    continuationId: 'continuation-route-recovery',
+    taskId: 'cognitive-route-recovery',
+    runId: 'run-route-recovery',
+    sessionId: 'session-route-recovery',
+    status: 'queued',
+    prompt: 'Continue the same root task.',
+    reason: 'gateway restart recovery route test',
+    attempt: 1,
+    maxAttempts: 6,
+    createdAt,
+    updatedAt: createdAt,
+  });
+  const leased = store.claimContinuationForSession('session-route-recovery');
+  assert.equal(leased?.status, 'leased');
+
+  const cutoff = new Date(Date.parse(leased?.updatedAt || createdAt) + 1_000).toISOString();
+  const response = await continuationGet(request(
+    `/api/runtime/gateway/continuation?sessionId=session-route-recovery&recoverLeasedBefore=${encodeURIComponent(cutoff)}`,
+    { authenticated: true },
+  ));
+  const body = await response.json() as { ok: boolean; continuation?: { continuationId: string; status: string } };
+  assert.equal(response.status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(body.continuation?.continuationId, 'continuation-route-recovery');
+  assert.equal(body.continuation?.status, 'leased');
+
+  const invalid = await continuationGet(request(
+    '/api/runtime/gateway/continuation?sessionId=session-route-recovery&recoverLeasedBefore=not-a-date',
+    { authenticated: true },
+  ));
+  assert.equal(invalid.status, 400);
 });
 
 test('gateway abort terminalizes both the Runtime run and its active coding task', async () => {
