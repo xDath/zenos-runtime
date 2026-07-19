@@ -80,7 +80,7 @@ export function readRuntimeModelSlots(): RuntimeModelSlots {
 }
 
 export function writeRuntimeModelSlots(update: RuntimeModelSlots): RuntimeModelSlots {
-  return writeSlotsFile(runtimeConfigPath(), update);
+  return writeSlotsFile(runtimeConfigPath(), normalizeSingleModelSlots(update));
 }
 
 export function readSessionModelSlots(sessionId?: string): RuntimeModelSlots {
@@ -88,7 +88,7 @@ export function readSessionModelSlots(sessionId?: string): RuntimeModelSlots {
 }
 
 export function writeSessionModelSlots(sessionId: string, update: RuntimeModelSlots): RuntimeModelSlots {
-  return writeSlotsFile(runtimeSessionConfigPath(sessionId), update);
+  return writeSlotsFile(runtimeSessionConfigPath(sessionId), normalizeSingleModelSlots(update));
 }
 
 export function deleteSessionModelSlots(sessionId: string): boolean {
@@ -112,20 +112,38 @@ export function mergeModelSlots(...configs: RuntimeModelSlots[]): RuntimeModelSl
   return RuntimeModelSlotsSchema.parse(merged);
 }
 
-export function providerForSlot(config: RuntimeModelSlots, slot: RuntimeModelSlot): string {
-  return config[`${slot}Provider` as keyof RuntimeModelSlots] || config.hostProvider || 'default';
+export function providerForSlot(config: RuntimeModelSlots, _slot: RuntimeModelSlot): string {
+  // Zenos Cognitive Runtime has one session model. Legacy per-role fields are
+  // still parsed so old files remain readable, but every auxiliary call and
+  // native Hermes worker inherits the current Host provider.
+  return config.hostProvider || 'default';
 }
 
-export function modelForSlot(config: RuntimeModelSlots, slot: RuntimeModelSlot): string {
-  return config[`${slot}Model` as keyof RuntimeModelSlots] || '';
+export function modelForSlot(config: RuntimeModelSlots, _slot: RuntimeModelSlot): string {
+  return config.hostModel || '';
 }
 
-export function baseUrlForSlot(config: RuntimeModelSlots, slot: RuntimeModelSlot): string {
-  return config[`${slot}BaseUrl` as keyof RuntimeModelSlots] || config.baseUrl || '';
+export function baseUrlForSlot(config: RuntimeModelSlots, _slot: RuntimeModelSlot): string {
+  return config.hostBaseUrl || config.baseUrl || '';
 }
 
-export function apiKeyForSlot(config: RuntimeModelSlots, slot: RuntimeModelSlot): string {
-  return config[`${slot}ApiKey` as keyof RuntimeModelSlots] || config.apiKey || '';
+export function apiKeyForSlot(config: RuntimeModelSlots, _slot: RuntimeModelSlot): string {
+  return config.hostApiKey || config.apiKey || '';
+}
+
+export function normalizeSingleModelSlots(config: RuntimeModelSlots): RuntimeModelSlots {
+  const hostModel = config.hostModel || config.workerModel || config.verifierModel || config.bossModel;
+  const hostProvider = config.hostProvider || config.workerProvider || config.verifierProvider || config.bossProvider;
+  const hostBaseUrl = config.hostBaseUrl || config.workerBaseUrl || config.verifierBaseUrl || config.bossBaseUrl;
+  const hostApiKey = config.hostApiKey || config.workerApiKey || config.verifierApiKey || config.bossApiKey;
+  return RuntimeModelSlotsSchema.parse({
+    baseUrl: config.baseUrl,
+    apiKey: config.apiKey,
+    hostModel,
+    hostProvider,
+    hostBaseUrl,
+    hostApiKey,
+  });
 }
 
 export function publicModelSlots(config: RuntimeModelSlots): Omit<RuntimeModelSlots, 'apiKey' | 'hostApiKey' | 'workerApiKey' | 'bossApiKey' | 'verifierApiKey'> & { hasApiKey: boolean } {

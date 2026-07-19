@@ -131,8 +131,11 @@ function saveArtifact(input: { stdout: string; stderr: string; command: string; 
     const root = artifactDirectory(directory);
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
     const id = `artifact_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
-    const target = path.join(root, `${id}.json`);
-    fs.writeFileSync(target, JSON.stringify({ ...input, createdAt: new Date().toISOString() }), { mode: 0o600 });
+    const target = `${root.replace(/[\\/]+$/, '')}${path.sep}${id}.json`;
+    // Resolve the runtime writer dynamically so Next/Turbopack does not treat
+    // a mutable artifact path as a build-time file-tracing glob.
+    const writeRuntimeFile = Reflect.get(fs, 'writeFileSync') as typeof fs.writeFileSync;
+    writeRuntimeFile(target, JSON.stringify({ ...input, createdAt: new Date().toISOString() }), { mode: 0o600 });
     return id;
   } catch (error) {
     log('warn', 'Could not persist governed command artifact', { error });

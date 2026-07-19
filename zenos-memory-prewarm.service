@@ -1,0 +1,42 @@
+[Unit]
+Description=Prewarm Zenos Memory authenticated cloud path
+After=network-online.target zenos-runtime.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=zenos-runtime
+Group=zenos-runtime
+WorkingDirectory=/opt/zenos-runtime/current
+LoadCredentialEncrypted=zenos-runtime.env:/etc/credstore.encrypted/zenos-runtime.env.cred
+Environment=HOME=/var/lib/zenos-runtime
+Environment=NODE_ENV=production
+Environment=ZENOS_MEMORY_BASE_URL=https://zenos-memory.vercel.app
+Environment=ZENOS_MEMORY_HEALTH_TIMEOUT_MS=25000
+ExecStart=/usr/bin/node /opt/zenos-runtime/current/scripts/prewarm-zenos-memory.mjs
+UMask=0077
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectHostname=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+TimeoutStartSec=45
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zenos-memory-prewarm

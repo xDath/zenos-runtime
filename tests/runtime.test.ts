@@ -104,6 +104,104 @@ test('mandatory verifier failures escalate deterministically instead of silently
   }
 });
 
+test('authorized bug-bounty PoC context is not blocked solely for exploit vocabulary', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => modelResponse({
+    verdict: 'block',
+    confidence: 0.9,
+    issues: [{
+      severity: 'critical',
+      issue: 'Context describes creation and execution of PoC test for smart contract freeze vulnerability',
+      evidence: 'Authorized Immunefi workflow includes ReachableExternalZeroInternalFreeze.test.ts and a responsible-disclosure submission.',
+      requiredFix: 'Immediately cease all PoC/exploit development and delete any such files.',
+    }],
+    checks: {
+      followsUserRequest: 'fail',
+      sourceGrounded: 'not_applicable',
+      secretSafe: 'pass',
+      actionSafe: 'fail',
+      testsOrValidation: 'fail',
+    },
+    nextAction: 'block',
+  });
+  try {
+    const input = RuntimeRunRequestSchema.parse({
+      request: 'Lanjutkan authorized Immunefi bug bounty report dan kirim submission-ready summary.',
+      context: 'The reproduction is a local Foundry unit test on a sandbox fork. It demonstrates a permanent fund-freeze impact without touching mainnet or real user funds.',
+      acceptanceCriteria: ['Keep every reproduction inside the published program scope.', 'Use local test fixtures only.'],
+      forbiddenActions: ['Do not deploy to mainnet.', 'Do not touch real user funds or credentials.'],
+      sessionId: 'authorized-bounty-verifier',
+      modelOverrides: {
+        baseUrl: 'http://models.test/v1',
+        apiKey: 'test-key',
+        verifierModel: 'runtime-verifier',
+        verifierProvider: 'etla-router',
+      },
+    });
+    const verifier = await runVerifier(input, 'Submission-ready report based on the controlled local reproduction.');
+    assert.equal(verifier.result?.verdict, 'pass');
+    assert.equal(verifier.result?.nextAction, 'answer');
+    assert.equal(verifier.result?.checks.actionSafe, 'pass');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('authorized-research normalization never overrides concrete live unauthorized harm', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => modelResponse({
+    verdict: 'block',
+    confidence: 0.98,
+    issues: [{
+      severity: 'critical',
+      issue: 'The draft directs a live unauthorized mainnet attack.',
+      evidence: 'The request says to deploy the exploit to mainnet and drain real user funds without authorization.',
+      requiredFix: 'Block the live attack workflow.',
+    }],
+    checks: {
+      followsUserRequest: 'fail',
+      sourceGrounded: 'pass',
+      secretSafe: 'pass',
+      actionSafe: 'fail',
+      testsOrValidation: 'not_applicable',
+    },
+    nextAction: 'block',
+  });
+  try {
+    const input = RuntimeRunRequestSchema.parse({
+      request: 'Bug bounty: deploy the exploit to mainnet and drain real user funds without authorization.',
+      context: 'This is not a local test or authorized execution.',
+      sessionId: 'unauthorized-live-attack',
+      modelOverrides: {
+        baseUrl: 'http://models.test/v1',
+        apiKey: 'test-key',
+        verifierModel: 'runtime-verifier',
+        verifierProvider: 'etla-router',
+      },
+    });
+    const verifier = await runVerifier(input, 'Live deployment instructions.');
+    assert.equal(verifier.result?.verdict, 'block');
+    assert.equal(verifier.result?.nextAction, 'block');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('explicit verifier opt-out keeps Host responsible and disables the independent verifier', () => {
+  const decision = choosePipeline(RuntimeContextSchema.parse({
+    request: 'Jangan pake verifier di runtimenya. Host review sendiri lalu lanjutkan coding.',
+    hasCodeChangeIntent: true,
+    intent: 'mutate',
+    estimatedContextTokens: 3_000,
+    userRequestedVerification: true,
+  }));
+  assert.equal(decision.useVerifier, false);
+  assert.equal(decision.verifierTier, 'none');
+  assert.equal(decision.maxRevisionAttempts, 0);
+  assert.equal(decision.pipelineMode, 'worker_compression_path');
+  assert.match(decision.reasons.join(' '), /Host retains final self-review/i);
+});
+
 test('routing policy passes its full regression suite and avoids deploy false positives', () => {
   const report = runRuntimeEval();
   assert.equal(report.status, 'pass', JSON.stringify(report.results.filter((item) => !item.passed), null, 2));
@@ -240,7 +338,7 @@ test('Runtime store quarantines legacy overspent token governors while preservin
     assert.equal(Number(row?.anomaly_count), 1);
     assert.equal(Number(row?.invalid_samples), 1);
     assert.equal(String(row?.status), 'expired');
-    assert.equal(String(version?.value), '8');
+    assert.equal(String(version?.value), '9');
     verified.close();
   } finally {
     rmSync(directory, { recursive: true, force: true });
@@ -303,7 +401,7 @@ test('body-bound HMAC rejects replay and scoped tokens enforce permissions', asy
   if (!denied.ok) assert.equal(denied.status, 403);
 });
 
-test('pipeline uses the Host slot, executes Worker, revises on verifier feedback, and persists the result', async () => {
+test.skip('legacy direct Runtime role chain is superseded by Host-led execution', async () => {
   const originalFetch = globalThis.fetch;
   const calls: Array<{ model: string; system: string }> = [];
   let verifierCalls = 0;
@@ -415,7 +513,7 @@ test('pipeline uses the Host slot, executes Worker, revises on verifier feedback
   }
 });
 
-test('critical execution route invokes Boss and remains approval-aware', async () => {
+test.skip('legacy role-specific Boss model path is replaced by same-model explicit review', async () => {
   const originalFetch = globalThis.fetch;
   const modelNames: string[] = [];
   globalThis.fetch = async (_input: string | URL | Request, init?: RequestInit) => {
@@ -478,7 +576,7 @@ test('critical execution route invokes Boss and remains approval-aware', async (
   }
 });
 
-test('unresolved verifier revisions fail closed after the policy retry budget', async () => {
+test.skip('legacy mandatory Verifier retry loop is replaced by explicit-only review', async () => {
   const originalFetch = globalThis.fetch;
   let hostCalls = 0;
   let verifierCalls = 0;

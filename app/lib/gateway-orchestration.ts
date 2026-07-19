@@ -10,6 +10,7 @@ import {
 import {
   RuntimeModelResult,
   RuntimeRunRequestSchema,
+  getRuntimeRoleIdentity,
   runBossReviewModel,
   runHostRevision,
   runVerifier,
@@ -39,7 +40,21 @@ import {
 } from './gateway-contracts';
 import { accountGatewayModelUsage, callIdentity, gatewayHostCallCount } from './gateway-accounting';
 import { hostWorkingSetForDecision, prepareGatewayContexts } from './gateway-continuity';
-import { compactHostPlan, runGatewayHostPlanning } from './gateway-planning';
+import {
+  compactHostPlan,
+  hostLedDecision,
+  hostLedRuntimeEnabled,
+  runGatewayHostPlanning,
+} from './gateway-planning';
+import { compileCognitivePacket, renderCognitivePacket } from './cognitive-kernel';
+import { persistCognitiveOutcome } from './zenos-memory-client';
+import {
+  ContinuationCapsuleSchema,
+  prepareCognitiveTask,
+  renderContinuationCapsule,
+  scheduleCognitiveContinuation,
+  updateCognitiveTask,
+} from './cognitive-task';
 import { askUserAnswer, blockedAnswer, renderHostContext } from './gateway-rendering';
 import {
   LatencyObservation,
@@ -170,7 +185,8 @@ const CODING_FOLLOW_UP_PATTERN = /^\s*(?:tapi|dan|terus|juga|sekalian|lanjut(?:k
 const WORKSPACE_ROOT_PATTERN = /(?:\/srv\/etla\/workspaces|\/root\/openclaw-projects)\/[A-Za-z0-9._-]+/g;
 const HOST_CONFIRMATION_PATTERN = /(?:\b(?:gas|lanjut|continue|proceed)\??\s*$|\b(?:mau|boleh)\s+(?:gue|aku|saya)\s+(?:lanjut|fix|kerjain|restart|test)|\bwant\s+me\s+to\s+(?:continue|proceed)|\bshall\s+i\s+(?:continue|proceed))/i;
 const TOOL_EXHAUSTION_PATTERN = /(?:maximum\s+number\s+of\s+tool[- ]calling\s+iterations|tool[- ]calling\s+limit|context\s+compaction|output\s+length\s+limit|continue\s+exactly\s+where\s+you\s+left\s+off)/i;
-const GENUINE_USER_INPUT_PATTERN = /(?:\b(?:missing|need|requires?)\s+(?:an?\s+)?(?:api\s+key|credential|secret|token|password|wallet\s+key)|\b(?:pilih|choose|which\s+option)\b|\bexplicit\s+approval\b|\bauthori[sz]ation\s+required\b)/i;
+const COGNITIVE_CONTINUATION_PATTERN = /continue the same root task as an internal zenos cognitive runtime cycle/i;
+const GENUINE_USER_INPUT_PATTERN = /(?:\b(?:missing|need|requires?)\s+(?:an?\s+)?(?:api\s+key|credential|secret|token|password|wallet\s+key|email\s+address|recipient|destination|nomor\s+tujuan|alamat\s+email)|\b(?:butuh|perlu)\s+(?:alamat\s+email|email\s+tujuan|nomor\s+tujuan|penerima|credential|api\s+key)\b|\b(?:pilih|choose|which\s+option)\b|\bexplicit\s+approval\b|\bauthori[sz]ation\s+required\b)/i;
 const MUTATING_TOOL_PATTERN = /\b(?:apply_patch|patch|edit_file|write_file|replace_in_file|str_replace|create_file|delete_file|editing|updated|modified|wrote|applied\s+patch)\b/i;
 const BROKEN_CODE_PATTERN = /\b(?:indentationerror|syntaxerror|compileerror|compile\s+error|typecheck\s+error|traceback|test(?:s)?\s+failed|lint\s+failed|build\s+failed|patch\s+failed|exit\s+(?:code\s*)?[1-9])\b/i;
 
@@ -188,34 +204,35 @@ function activeCodingContinuationDecision(
   request: GatewayTurnPreflightRequest,
 ): RouteDecision {
   const bossRequested = request.userRequestedBoss;
-  return RouteDecisionSchema.parse({
+  const continuation = RouteDecisionSchema.parse({
     ...decision,
     taskType: 'coding_change',
-    pipelineMode: bossRequested ? 'escalated_deep_path' : 'verified_path',
+    pipelineMode: bossRequested ? 'escalated_deep_path' : 'grounded_path',
     risk: 'high',
     hostTier: 'premium',
-    workerTier: decision.workerTier === 'premium' ? 'standard' : decision.workerTier,
-    verifierTier: 'cheap',
+    workerTier: 'none',
+    verifierTier: request.userRequestedVerification ? 'cheap' : 'none',
     useMemory: true,
     useTools: true,
-    useWorker: true,
-    useVerifier: true,
+    useWorker: false,
+    useVerifier: request.userRequestedVerification,
     useBoss: bossRequested,
-    allowEscalation: true,
+    allowEscalation: bossRequested,
     requiresApproval: false,
     requiresSourceContext: true,
     maxMemoryItems: Math.max(decision.maxMemoryItems, 4),
-    maxWorkerCalls: Math.max(decision.maxWorkerCalls, 1),
+    maxWorkerCalls: 0,
     maxContextTokens: Math.max(decision.maxContextTokens, 12_000),
-    maxRevisionAttempts: Math.max(decision.maxRevisionAttempts, 1),
+    maxRevisionAttempts: request.userRequestedVerification ? Math.max(decision.maxRevisionAttempts, 1) : 0,
     reasons: [
       ...decision.reasons.filter((reason) => !/^task:|^risk:|deploy_or_destructive_action/i.test(reason)),
       'task:coding_change',
       'risk:high',
       'active durable coding task overrides lexical classification of the internal continuation prompt',
-      'unfinished coding validation requires bounded Worker support and independent verification',
+      'Host continues with native Hermes tools/delegation and deterministic validation; Runtime Worker/Verifier are not mandatory',
     ],
   });
+  return hostLedRuntimeEnabled() ? hostLedDecision(continuation, request) : continuation;
 }
 
 function inferWorkspaceRootFromContinuity(continuity: string): string | undefined {
@@ -295,6 +312,18 @@ function postflightDecisionForObservedMutation(
   input: z.infer<typeof RuntimeRunRequestSchema>,
 ): RouteDecision {
   const upgraded = choosePipeline(input);
+  if (hostLedRuntimeEnabled()) {
+    return hostLedDecision(RouteDecisionSchema.parse({
+      ...upgraded,
+      useTools: true,
+      useMemory: current.useMemory || upgraded.useMemory,
+      reasons: [
+        ...upgraded.reasons,
+        'postflight observed an actual code mutation from Hermes tool evidence',
+        'deterministic validation, not a mandatory independent LLM judge, governs completion',
+      ],
+    }), input);
+  }
   const useWorker = current.useWorker;
   const useVerifier = upgraded.useVerifier;
   const useBoss = upgraded.useBoss;
@@ -324,6 +353,15 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
   const store = getRuntimeStore();
   const continuity = preserveUnfinishedCodingContinuity(GatewayTurnPreflightRequestSchema.parse(raw));
   let request = continuity.request;
+  const gatewayReportedHost = request.host;
+  const configuredHost = getRuntimeRoleIdentity('host', request.sessionId, request.modelOverrides);
+  const authoritativeHostEnabled = process.env.ZENOS_RUNTIME_AUTHORITATIVE_HOST !== 'false';
+  if (authoritativeHostEnabled && configuredHost.model && configuredHost.provider) {
+    request = GatewayTurnPreflightRequestSchema.parse({
+      ...request,
+      host: configuredHost,
+    });
+  }
   const activeCodingRecord = store.findActiveCodingTaskBySession(request.sessionId);
   if (activeCodingRecord && request.workspaceRoot) {
     request = GatewayTurnPreflightRequestSchema.parse({
@@ -412,6 +450,9 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
     platform: request.platform,
     hostModel: request.host.model,
     hostProvider: request.host.provider,
+    gatewayReportedHostModel: gatewayReportedHost.model,
+    gatewayReportedHostProvider: gatewayReportedHost.provider,
+    hostAuthority: authoritativeHostEnabled ? 'runtime' : 'gateway',
     memorySource: memoryBrief.source,
     memoryCoverageComplete: memoryBrief.coverage?.complete,
   });
@@ -459,7 +500,7 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
   );
 
   const hostPlanning = deterministicContinuation
-    ? { decision: baselineDecision }
+    ? { decision: hostLedRuntimeEnabled() ? hostLedDecision(baselineDecision, request) : baselineDecision }
     : await runGatewayHostPlanning(
         request,
         input,
@@ -477,16 +518,36 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
   const hostPlanCall = hostPlanning.call;
   completeTokenBudget(planningBudget.budgetId);
   decision = hostPlanning.decision;
+  const cognitivePacket = compileCognitivePacket({
+    request,
+    decision,
+    memory: memoryBrief,
+    repositoryContext,
+  });
+  const cognitiveCapsule = prepareCognitiveTask({
+    sessionId: request.sessionId,
+    runId,
+    packet: cognitivePacket,
+    workspaceRevision: codingTask?.workspaceRevision || request.workspaceState?.dirtyDiffSha256,
+    reuseActive: deterministicContinuation || COGNITIVE_CONTINUATION_PATTERN.test(request.request),
+    store,
+  });
   ensureGatewaySession(input, decision, runId, {
     turnId: request.turnId,
     platform: request.platform,
     hostModel: request.host.model,
     hostProvider: request.host.provider,
-    orchestration: deterministicContinuation
-      ? 'deterministic-continuation'
-      : hostPlan
-        ? 'host-led'
-        : 'deterministic-fallback',
+    orchestration: hostLedRuntimeEnabled()
+      ? 'cognitive-host-led'
+      : deterministicContinuation
+        ? 'deterministic-continuation'
+        : hostPlan
+          ? 'host-led'
+          : 'deterministic-fallback',
+    cognitivePhase: cognitivePacket.phase,
+    cognitiveTaskId: cognitiveCapsule.taskId,
+    cognitiveCycle: cognitiveCapsule.cycle,
+    cognitiveWorkerModelPolicy: cognitivePacket.workerModelPolicy,
     hostPlanConfidence: hostPlan?.confidence,
   });
   store.saveRun({
@@ -651,6 +712,9 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
     platform: request.platform,
     host: request.host,
     hostPlan,
+    cognitivePacket,
+    cognitiveTaskId: cognitiveCapsule.taskId,
+    continuationCapsule: cognitiveCapsule,
     hostPlanCall,
     workerResult,
     workerCall,
@@ -685,10 +749,19 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
     turnId: request.turnId,
     decision,
     holdFinalDelivery,
+    hostAuthority: authoritativeHostEnabled ? 'runtime' : 'gateway',
+    hostOverride: request.host,
+    cognitiveTaskId: cognitiveCapsule.taskId,
+    cognitivePhase: cognitiveCapsule.phase,
     codingTaskId: codingTask?.taskId,
     codingPhase: codingTask?.currentPhase,
     hostContext: [
       renderHostContext(decision, hostPlan, workerResult, bossPreflight, memoryBrief, runId),
+      renderCognitivePacket(cognitivePacket),
+      renderContinuationCapsule(cognitiveCapsule),
+      authoritativeHostEnabled
+        ? `Runtime Host authority:\n- selected_model: ${request.host.model}\n- selected_provider: ${request.host.provider}\n- gateway_reported_model: ${gatewayReportedHost.model}\n- gateway_reported_provider: ${gatewayReportedHost.provider}\n- The selected Runtime Host is authoritative for this turn and must be applied before Hermes creates or reuses its agent.`
+        : '',
       request.workspaceRoot
         ? `Canonical workspace root: ${request.workspaceRoot}\n- Use this path for every repository and terminal operation.\n- Treat /root/openclaw-projects as a legacy alias only; never send it to Hermes tools inside the hardened service sandbox.`
         : '',
@@ -728,6 +801,13 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
   if (!run || run.sessionId !== request.sessionId) throw new Error('Gateway Runtime run was not found for this session');
   const storedDecision = RouteDecisionSchema.parse(run.decision);
   const stored = StoredGatewayPreflightSchema.parse(run.result);
+  const storedCognitiveRecord = stored.cognitiveTaskId
+    ? store.getCognitiveTask(stored.cognitiveTaskId)
+    : undefined;
+  const parsedCognitiveCapsule = ContinuationCapsuleSchema.safeParse(
+    storedCognitiveRecord?.capsule || stored.continuationCapsule,
+  );
+  let cognitiveCapsule = parsedCognitiveCapsule.success ? parsedCognitiveCapsule.data : undefined;
   const turnStartedAtMs = stored.turnStartedAtMs || Date.parse(run.startedAt) || Date.now();
   const deterministicValidation = deterministicValidationState(request.toolSummary);
   const textObservedCoding = observedCodingState(request.toolSummary);
@@ -753,7 +833,9 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
         ...baseInput,
         hasFiles: true,
         hasCodeChangeIntent: true,
-        userRequestedVerification: baseInput.userRequestedVerification || unresolvedCodingMutation,
+        userRequestedVerification: hostLedRuntimeEnabled()
+          ? baseInput.userRequestedVerification
+          : baseInput.userRequestedVerification || unresolvedCodingMutation,
         intent: baseInput.intent === 'execute' ? 'execute' : 'mutate',
         confidence: Math.max(baseInput.confidence, 0.9),
       })
@@ -811,6 +893,45 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
     }
     codingTaskState = codingTask;
   }
+
+  if (cognitiveCapsule) {
+    const evidenceId = `tool:${hashRequest({
+      runId: request.runId,
+      toolSummary: request.toolSummary,
+      workspaceRevision: request.workspaceState?.dirtyDiffSha256,
+    }).slice(0, 24)}`;
+    const completed: string[] = [];
+    const failures: string[] = [];
+    if (deterministicValidation === 'passed') completed.push('Relevant deterministic validation passed in this Host cycle.');
+    if (observedCoding.broken) failures.push('This cycle produced broken-code evidence; repair before deployment or completion.');
+    if (request.toolSummary.trim()) {
+      completed.push(`Host tool cycle produced bounded evidence: ${request.toolSummary.slice(0, 900)}`);
+    }
+    cognitiveCapsule = updateCognitiveTask({
+      taskId: cognitiveCapsule.taskId,
+      runId: request.runId,
+      phase: observedCoding.broken
+        ? 'repair'
+        : unresolvedCodingMutation
+          ? 'validate'
+          : request.toolSummary.trim()
+            ? 'validate'
+            : cognitiveCapsule.phase,
+      completed,
+      failures,
+      evidence: request.toolSummary.trim()
+        ? [{
+            id: evidenceId,
+            kind: 'tool',
+            claim: request.toolSummary.slice(0, 4_000),
+            confidence: deterministicValidation === 'passed' ? 0.95 : 0.75,
+          }]
+        : [],
+      workspaceRevision: request.workspaceState?.dirtyDiffSha256 || cognitiveCapsule.workspaceRevision,
+      store,
+    });
+  }
+
   const latencyPlan = decision.pipelineMode === storedDecision.pipelineMode
     ? stored.latencyPlan || createLatencyBudgetPlan(decision)
     : createLatencyBudgetPlan(decision);
@@ -891,6 +1012,15 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
   );
 
   if (request.failed) {
+    if (cognitiveCapsule) {
+      cognitiveCapsule = updateCognitiveTask({
+        taskId: cognitiveCapsule.taskId,
+        runId: request.runId,
+        status: 'failed',
+        failures: ['Hermes Host reported a failed internal cycle.'],
+        store,
+      });
+    }
     accountGatewayModelUsage(request.sessionId, calls, request.hostUsage);
     recordOutcomePassport({
       runId: request.runId,
@@ -1191,13 +1321,22 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
     }
   }
 
-  const configuredContinuationLimit = Number(process.env.ZENOS_GATEWAY_MAX_AUTO_CONTINUATIONS || 5);
-  const maxAutoContinuations = Math.max(1, Math.min(Number.isFinite(configuredContinuationLimit) ? configuredContinuationLimit : 5, 5));
-  const hostInterrupted = Boolean(codingTaskState)
-    && codingTaskState?.status === 'active'
+  const configuredContinuationLimit = Number(process.env.ZENOS_GATEWAY_MAX_AUTO_CONTINUATIONS || 6);
+  const maxAutoContinuations = Math.max(
+    1,
+    Math.min(
+      cognitiveCapsule?.maxCycles
+        || (Number.isFinite(configuredContinuationLimit) ? configuredContinuationLimit : 6),
+      12,
+    ),
+  );
+  const genuineUserBlocker = GENUINE_USER_INPUT_PATTERN.test(request.draft)
+    || bossDecision?.verdict === 'ask_user';
+  const hostInterrupted = Boolean(cognitiveCapsule)
+    && cognitiveCapsule?.status === 'active'
     && hostStoppedBeforeTerminalWork(request.draft, request.toolSummary)
     && !decision.requiresApproval
-    && bossDecision?.verdict !== 'ask_user'
+    && !genuineUserBlocker
     && verifierResult?.verdict !== 'block';
   const continuationReason = unresolvedCodingMutation
     ? 'coding_validation_pending' as const
@@ -1205,13 +1344,14 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
       ? 'host_interrupted' as const
       : undefined;
   const continuationEligible = Boolean(continuationReason)
-    && Boolean(codingTaskState)
-    && codingTaskState?.status === 'active'
+    && Boolean(cognitiveCapsule)
+    && cognitiveCapsule?.status === 'active'
     && (!unresolvedCodingMutation || Boolean(request.workspaceState))
     && !request.failed
-    && (codingTaskState?.continuationAttempts || 0) < maxAutoContinuations;
+    && (cognitiveCapsule?.cycle || 0) < maxAutoContinuations;
   let continuation: {
     required: true;
+    continuationId: string;
     reason: 'coding_validation_pending' | 'host_interrupted';
     taskId: string;
     attempt: number;
@@ -1219,52 +1359,84 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
     prompt: string;
   } | undefined;
 
-  if (continuationEligible && codingTaskState && continuationReason) {
-    const nextAttempt = codingTaskState.continuationAttempts + 1;
+  if (genuineUserBlocker && cognitiveCapsule) {
+    cognitiveCapsule = updateCognitiveTask({
+      taskId: cognitiveCapsule.taskId,
+      runId: request.runId,
+      phase: 'waiting_for_user',
+      status: 'waiting_for_user',
+      pending: [
+        ...cognitiveCapsule.pending,
+        `Blocking user input requested by Host: ${request.draft.slice(0, 1_500)}`,
+      ],
+      store,
+    });
+  }
+
+  if (continuationEligible && cognitiveCapsule && continuationReason) {
     const continuationSummary = continuationReason === 'coding_validation_pending'
       ? `deterministic validation is ${deterministicValidation}`
-      : 'the Host stopped at a confirmation/tool-limit boundary before terminal work';
-    codingTaskState = updateCodingTask(codingTaskState.taskId, {
-      continuationAttempts: nextAttempt,
-      lastContinuationAt: now(),
-      unresolvedRisks: [
-        ...codingTaskState.unresolvedRisks.filter((risk) => !/pending deterministic validation|did not pass deterministic validation|host stopped before terminal work/i.test(risk)),
-        `Automatic continuation ${nextAttempt}/${maxAutoContinuations}: ${continuationSummary}.`,
+      : 'the Host stopped at a confirmation, context, output, or tool-iteration boundary before the root task completed';
+    if (codingTaskState) {
+      const nextCodingAttempt = codingTaskState.continuationAttempts + 1;
+      codingTaskState = updateCodingTask(codingTaskState.taskId, {
+        continuationAttempts: nextCodingAttempt,
+        lastContinuationAt: now(),
+        unresolvedRisks: [
+          ...codingTaskState.unresolvedRisks.filter((risk) => !/pending deterministic validation|did not pass deterministic validation|host stopped before terminal work/i.test(risk)),
+          `Automatic continuation ${nextCodingAttempt}/${maxAutoContinuations}: ${continuationSummary}.`,
+        ],
+      }, store);
+    }
+    cognitiveCapsule = updateCognitiveTask({
+      taskId: cognitiveCapsule.taskId,
+      runId: request.runId,
+      phase: unresolvedCodingMutation ? (observedCoding.broken ? 'repair' : 'validate') : cognitiveCapsule.phase,
+      pending: [
+        ...cognitiveCapsule.pending,
+        continuationSummary,
+        ...(codingTaskState
+          ? [
+              `Coding phase: ${codingTaskState.currentPhase}`,
+              `Changed files: ${codingTaskState.filesChanged.join(', ') || 'reconcile from current Git diff'}`,
+            ]
+          : []),
       ],
-    }, store);
+      failures: observedCoding.broken ? ['Broken-code evidence remains unresolved.'] : [],
+      workspaceRevision: request.workspaceState?.dirtyDiffSha256 || cognitiveCapsule.workspaceRevision,
+      store,
+    });
+    const queued = scheduleCognitiveContinuation({
+      capsule: cognitiveCapsule,
+      runId: request.runId,
+      reason: continuationSummary,
+      store,
+    });
+    const leased = store.claimContinuationForSession(request.sessionId) || queued;
     continuation = {
       required: true,
+      continuationId: leased.continuationId,
       reason: continuationReason,
-      taskId: codingTaskState.taskId,
-      attempt: nextAttempt,
-      maxAttempts: maxAutoContinuations,
-      prompt: [
-        `Continue the same Zenos Runtime coding task ${codingTaskState.taskId}; this is an internal continuation of the user's original command, not a new request.`,
-        `Continuation reason: ${continuationSummary}.`,
-        `Canonical workspace: ${codingTaskState.workspaceRoot}`,
-        `Current phase: ${codingTaskState.currentPhase}`,
-        `Deterministic validation state: ${deterministicValidation}${observedCoding.broken ? ' (broken evidence observed)' : ''}.`,
-        `Changed files: ${codingTaskState.filesChanged.join(', ') || 'reconcile from current Git diff'}.`,
-        `Acceptance criteria: ${codingTaskState.acceptanceCriteria.join('; ')}`,
-        'Continue autonomously through the next useful inspect, patch, or targeted-validation steps. Keep progress narration internal and do not split ordinary implementation into user confirmations.',
-        'Do not ask the user to reply “gas”, “lanjut”, or approve a routine next step. Ask only for genuinely missing user-owned input or an explicit privileged/destructive approval that cannot be safely inferred.',
-        'Do not restart or deploy until deterministic validation passes. Stop only after acceptance criteria pass or a genuine non-recoverable blocker requires user input.',
-      ].join('\n'),
+      taskId: cognitiveCapsule.taskId,
+      attempt: leased.attempt,
+      maxAttempts: leased.maxAttempts,
+      prompt: leased.prompt,
     };
     finalAnswer = request.draft;
     transformed = false;
     recordActivity(
       request.sessionId,
       'host',
-      `Runtime scheduled automatic coding continuation ${nextAttempt}/${maxAutoContinuations} (${continuationReason}) instead of exposing an incomplete turn to the user.`,
+      `Runtime scheduled durable cognitive continuation ${leased.attempt}/${leased.maxAttempts} (${continuationReason}) instead of exposing an incomplete draft.`,
       {
         runId: request.runId,
         turnId: request.turnId,
-        taskId: codingTaskState.taskId,
+        taskId: cognitiveCapsule.taskId,
+        continuationId: leased.continuationId,
         deterministicValidation,
         brokenCodeEvidence: observedCoding.broken,
         continuationReason,
-        continuationAttempt: nextAttempt,
+        continuationAttempt: leased.attempt,
       },
       'success',
     );
@@ -1324,6 +1496,37 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
 
   const terminalFailure = terminalCodingFailure || terminalAutonomyFailure;
 
+  if (cognitiveCapsule) {
+    if (terminalFailure || bossDecision?.verdict === 'block' || verifierResult?.verdict === 'block') {
+      cognitiveCapsule = updateCognitiveTask({
+        taskId: cognitiveCapsule.taskId,
+        runId: request.runId,
+        phase: observedCoding.broken ? 'repair' : cognitiveCapsule.phase,
+        status: 'failed',
+        failures: [
+          terminalCodingFailure
+            ? 'Code mutation did not pass deterministic validation before the continuation budget ended.'
+            : terminalAutonomyFailure
+              ? 'Host repeatedly stopped at an internal boundary until the continuation budget ended.'
+              : bossDecision?.verdict === 'block'
+                ? `Boss blocked completion: ${bossDecision.reasoningSummary}`
+                : 'Verifier blocked completion.',
+        ],
+        store,
+      });
+    } else if (!continuation && !genuineUserBlocker) {
+      cognitiveCapsule = updateCognitiveTask({
+        taskId: cognitiveCapsule.taskId,
+        runId: request.runId,
+        phase: 'complete',
+        status: 'completed',
+        completed: ['Host delivered the terminal response for the root task.'],
+        pending: [],
+        store,
+      });
+    }
+  }
+
   const receipt: GatewayTurnReceipt = {
     pipeline: decision.pipelineMode,
     host: {
@@ -1365,6 +1568,7 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
         ? { deterministic: deterministicValidation, broken: observedCoding.broken }
         : undefined,
       continuation,
+      cognitiveCapsule,
     },
     errors: terminalCodingFailure
       ? ['Code mutation did not pass deterministic validation']
@@ -1403,6 +1607,35 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
     hostModel: stored.host.model,
     hostProvider: stored.host.provider,
   });
+
+  // Learning is deliberately off the response critical path. Runtime stores
+  // the local task/capsule synchronously, then sends only a bounded validated
+  // outcome to cloud Memory so future low-tier Hosts can reuse procedures and
+  // avoid known failed attempts.
+  void persistCognitiveOutcome({
+    runId: request.runId,
+    sessionId: request.sessionId,
+    objective: input.request,
+    taskType: decision.taskType,
+    verdict: outcomeVerdict,
+    phase: cognitiveCapsule?.phase,
+    model: stored.host.model,
+    provider: stored.host.provider,
+    toolSummary: request.toolSummary,
+    deterministicValidation,
+    decisions: cognitiveCapsule?.decisions,
+    failures: cognitiveCapsule?.failures,
+    artifacts: [
+      ...(cognitiveCapsule?.artifacts || []).map((artifact) => artifact.path || artifact.id),
+      ...(request.workspaceState?.changedFiles || []).map((file) => file.path),
+    ],
+    tokenUsage: {
+      input: request.hostUsage.inputTokens + request.hostUsage.cacheWriteTokens,
+      output: request.hostUsage.outputTokens,
+      calls: request.hostUsage.calls,
+    },
+  }).catch(() => undefined);
+
   if (terminalFailure) {
     updateRuntimeSession(request.sessionId, {
       status: 'failed',
@@ -1420,9 +1653,21 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
       activeRunId: undefined,
       metadata: {
         continuationRequired: true,
+        continuationId: continuation.continuationId,
         continuationTaskId: continuation.taskId,
         continuationAttempt: continuation.attempt,
         continuationMaxAttempts: continuation.maxAttempts,
+      },
+    });
+  } else if (genuineUserBlocker) {
+    updateRuntimeSession(request.sessionId, {
+      status: 'paused',
+      finalAnswer,
+      lastError: undefined,
+      activeRunId: undefined,
+      metadata: {
+        waitingForUser: true,
+        cognitiveTaskId: cognitiveCapsule?.taskId,
       },
     });
   } else {
@@ -1440,5 +1685,7 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
     boss: bossDecision,
     tokenBudget: finalTokenBudget,
     continuation,
+    cognitiveTaskId: cognitiveCapsule?.taskId,
+    cognitivePhase: cognitiveCapsule?.phase,
   };
 }

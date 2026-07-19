@@ -44,14 +44,22 @@ test.beforeEach(() => {
   process.env.ZENOS_ALLOW_LEGACY_HMAC = 'false';
   process.env.ZENOS_RUNTIME_DISABLE_MEMORY = 'true';
   process.env.ZENOS_RUNTIME_DISABLE_MEMORY_AUTO_RECALL = 'true';
+  process.env.ZENOS_ORCHESTRATION_MODE = 'host-led';
 });
 
 test('public health is live while routing fails closed and validates real HTTP contracts', async () => {
   const health = await healthGet();
-  const healthBody = await health.json() as { ok: boolean; version: string };
+  const healthBody = await health.json() as {
+    ok: boolean;
+    version: string;
+    architecture: string;
+    orchestrationMode: string;
+  };
   assert.equal(health.status, 200);
   assert.equal(healthBody.ok, true);
   assert.equal(healthBody.version, '0.7.0');
+  assert.equal(healthBody.architecture, 'host-led-cognitive-runtime-v1');
+  assert.equal(healthBody.orchestrationMode, 'host-led');
   assert.equal(health.headers.get('cache-control'), 'no-store');
 
   const missingAuth = await routePost(request('/api/runtime/route', {
@@ -77,6 +85,41 @@ test('public health is live while routing fails closed and validates real HTTP c
   assert.equal(validBody.decision.requiresApproval, true);
   assert.equal(valid.headers.get('x-content-type-options'), 'nosniff');
   assert.ok(valid.headers.get('x-request-id'));
+
+  const coding = await routePost(request('/api/runtime/route', {
+    body: {
+      request: 'inspect this repository, patch the parser bug, and run targeted tests',
+      hasFiles: true,
+      hasCodeChangeIntent: true,
+      intent: 'mutate',
+      estimatedContextTokens: 12_000,
+    },
+    authenticated: true,
+  }));
+  const codingBody = await coding.json() as {
+    decision: { useWorker: boolean; useVerifier: boolean; workerTier: string; pipelineMode: string; reasons: string[] };
+  };
+  assert.equal(coding.status, 200);
+  assert.equal(codingBody.decision.useWorker, false);
+  assert.equal(codingBody.decision.workerTier, 'none');
+  assert.equal(codingBody.decision.useVerifier, false);
+  assert.equal(codingBody.decision.pipelineMode, 'grounded_path');
+  assert.match(codingBody.decision.reasons.join(' '), /Host is the sole orchestrator/i);
+
+  const verified = await routePost(request('/api/runtime/route', {
+    body: {
+      request: 'verify this implementation independently before answering',
+      hasFiles: true,
+      intent: 'analyze',
+      userRequestedVerification: true,
+    },
+    authenticated: true,
+  }));
+  const verifiedBody = await verified.json() as { decision: { useWorker: boolean; useVerifier: boolean; pipelineMode: string } };
+  assert.equal(verified.status, 200);
+  assert.equal(verifiedBody.decision.useWorker, false);
+  assert.equal(verifiedBody.decision.useVerifier, true);
+  assert.equal(verifiedBody.decision.pipelineMode, 'verified_path');
 });
 
 test('session route persists through the HTTP boundary', async () => {
@@ -234,7 +277,7 @@ test('run route executes a real dry-run pipeline and persistently replays idempo
   assert.equal(first.status, 200);
   assert.equal(firstBody.ok, true);
   assert.equal(firstBody.result.status, 'dry_run');
-  assert.equal(firstBody.result.decision.useWorker, true);
+  assert.equal(firstBody.result.decision.useWorker, false);
 
   const replay = await runPost(request('/api/runtime/run', { authenticated: true, body: payload, headers }));
   assert.equal(replay.status, 200);

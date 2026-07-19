@@ -1,3 +1,4 @@
+import { applyHostLedPolicy, hostLedRuntimeEnabled } from '@/app/lib/host-led-policy';
 import { buildRouteEvent, choosePipeline, RuntimeContextSchema } from '@/app/lib/zenos-runtime';
 import { parseJsonBody, routeErrorResponse, routeSuccessResponse, secureRequest } from '@/app/lib/http';
 import { RATE_LIMITS } from '@/app/lib/rate-limit';
@@ -12,7 +13,14 @@ export async function POST(req: Request) {
   if (!secured.ok) return secured.response;
   try {
     const context = await parseJsonBody(req, RuntimeContextSchema, 256_000);
-    const decision = choosePipeline(context);
+    const baseline = choosePipeline(context);
+    const decision = hostLedRuntimeEnabled()
+      ? applyHostLedPolicy(baseline, {
+          request: context.request,
+          userRequestedVerification: Boolean(context.userRequestedVerification),
+          userRequestedBoss: Boolean(context.userRequestedBoss),
+        })
+      : baseline;
     return routeSuccessResponse({ ok: true, decision, routeEvent: buildRouteEvent(decision, context) }, secured.context, ROUTE);
   } catch (error) {
     return routeErrorResponse(error, secured.context, ROUTE);

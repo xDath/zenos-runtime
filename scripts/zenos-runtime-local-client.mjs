@@ -14,6 +14,8 @@ function loadEnv(file) {
     if (process.env[key] === undefined) process.env[key] = value;
   }
 }
+const credentialDirectory = process.env.CREDENTIALS_DIRECTORY || '';
+loadEnv(credentialDirectory ? `${credentialDirectory}/zenos-runtime.env` : '');
 loadEnv('.env.local');
 loadEnv('.env');
 
@@ -47,7 +49,7 @@ function parseJsonArg(value, fallback = {}) {
 
 const [command, ...args] = process.argv.slice(2);
 if (!command || command === 'help') {
-  console.log(`Zenos Runtime local client\n\nCommands:\n  health\n  readiness\n  eval\n  metrics\n  tracker [today|24h|7d|30d|60d]\n  outcomes [limit]\n  outcome-feedback <json>\n  route <request-or-json>\n  run <request-or-json>\n  run-key <idempotencyKey> <request-or-json>\n  run-status <runId>\n  gateway-preflight <json>\n  gateway-postflight <json>\n  remote-validate <json>\n  session <request-or-json>\n  session-get <sessionId>\n  dispatch <sessionId> <template> <task>\n  event <json>\n  escalate <sessionId> [hostAssessment]\n  boss-review <sessionId> <decision-json>\n  quality-gate <json>\n  models [sessionId]\n  budget <sessionId>\n`);
+  console.log(`Zenos Runtime local client\n\nCommands:\n  health\n  readiness\n  eval\n  metrics\n  tracker [today|24h|7d|30d|60d]\n  outcomes [limit]\n  outcome-feedback <json>\n  route <request-or-json>\n  run <request-or-json>\n  run-key <idempotencyKey> <request-or-json>\n  run-status <runId>\n  gateway-preflight <json>\n  gateway-postflight <json>\n  gateway-abort <json>\n  remote-validate <json>\n  session <request-or-json>\n  session-get <sessionId>\n  dispatch <sessionId> <template> <task>\n  event <json>\n  escalate <sessionId> [hostAssessment]\n  boss-review <sessionId> <decision-json>\n  quality-gate <json>\n  models [sessionId]\n  budget <sessionId>\n`);
   process.exit(0);
 }
 
@@ -80,6 +82,7 @@ switch (command) {
   case 'run-status': output = await request(`/api/runtime/runs/${encodeURIComponent(args[0] || '')}`, null, 'GET'); break;
   case 'gateway-preflight': output = await request('/api/runtime/gateway/preflight', JSON.parse(args.join(' '))); break;
   case 'gateway-postflight': output = await request('/api/runtime/gateway/postflight', JSON.parse(args.join(' '))); break;
+  case 'gateway-abort': output = await request('/api/runtime/gateway/abort', JSON.parse(args.join(' '))); break;
   case 'remote-validate': output = await request('/api/runtime/remote-validation', JSON.parse(args.join(' '))); break;
   case 'session': output = await request('/api/runtime/session', parseJsonArg(args.join(' '))); break;
   case 'session-get': output = await request(`/api/runtime/session/${encodeURIComponent(args[0] || '')}`, null, 'GET'); break;

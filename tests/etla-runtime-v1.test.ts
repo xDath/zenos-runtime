@@ -111,6 +111,22 @@ test('concise response preferences do not override the actual task classificatio
   assert.equal(decision.useVerifier, true);
 });
 
+test('direct Host-only chat reserves framing headroom instead of denying the first model call', () => {
+  const context = RuntimeContextSchema.parse({
+    request: 'Reply exactly RUNTIME_GROK_OK',
+    intent: 'analyze',
+    estimatedContextTokens: 32,
+  });
+  const decision = choosePipeline(context);
+  const budget = createTokenBudgetPlan(decision, context);
+
+  assert.equal(decision.useWorker, false);
+  assert.equal(decision.useVerifier, false);
+  assert.equal(decision.useBoss, false);
+  assert.ok(budget.totalTokens >= 9_000);
+  assert.ok(budget.totalTokens >= budget.host.inputTokens + budget.host.outputTokens + 2_000);
+});
+
 test('four-role orchestration reserves enough structured output budget to avoid truncated contracts', () => {
   const context = RuntimeContextSchema.parse({
     request: 'analyze this bounded source-code readiness evidence',
@@ -126,10 +142,29 @@ test('four-role orchestration reserves enough structured output budget to avoid 
   assert.equal(decision.useWorker, true);
   assert.equal(decision.useVerifier, true);
   assert.equal(decision.useBoss, true);
-  assert.ok(budget.totalTokens >= 18_000);
+  assert.ok(budget.totalTokens >= 32_000);
   assert.ok(budget.worker.outputTokens >= 1_600);
   assert.ok(budget.verifier.outputTokens >= 2_200);
-  assert.ok(budget.boss.outputTokens >= 900);
+  assert.ok(budget.boss.outputTokens >= 1_800);
+});
+
+test('mandatory verifier and Boss remain executable after Host usage without forcing Worker', () => {
+  const context = RuntimeContextSchema.parse({
+    request: 'review this bounded readiness statement and ask the Boss for a final verdict',
+    intent: 'analyze',
+    estimatedContextTokens: 8_000,
+    userRequestedVerification: true,
+    userRequestedBoss: true,
+  });
+  const decision = choosePipeline(context);
+  const budget = createTokenBudgetPlan(decision, context);
+
+  assert.equal(decision.useWorker, false);
+  assert.equal(decision.useVerifier, true);
+  assert.equal(decision.useBoss, true);
+  assert.ok(budget.totalTokens >= 24_000);
+  assert.ok(budget.verifier.outputTokens >= 2_200);
+  assert.ok(budget.boss.outputTokens >= 1_800);
 });
 
 test('context compiler reduces raw context and emits role-specific packets', () => {

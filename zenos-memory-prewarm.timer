@@ -1,0 +1,13 @@
+[Unit]
+Description=Keep Zenos Memory cloud functions warm
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+RandomizedDelaySec=20
+AccuracySec=30s
+Persistent=true
+Unit=zenos-memory-prewarm.service
+
+[Install]
+WantedBy=timers.target

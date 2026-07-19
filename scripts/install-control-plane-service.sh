@@ -45,8 +45,12 @@ if [[ -e "${RELEASE_ROOT}" ]]; then
 fi
 SERVICE_USER="zenos-runtime"
 SERVICE_GROUP="zenos-runtime"
-HERMES_SERVICE_USER="hermes"
-HERMES_SERVICE_GROUP="hermes"
+# Hermes is intentionally root-authoritative on this operator-owned VPS.
+# The Runtime and router remain isolated service identities; only the user-facing
+# Hermes Host receives unrestricted host administration rights.
+HERMES_SERVICE_USER="root"
+HERMES_SERVICE_GROUP="root"
+HERMES_SERVICE_HOME="/root"
 ROUTER_SERVICE_USER="etla-router"
 ROUTER_SERVICE_GROUP="etla-router"
 OPS_SERVICE_GROUP="etla-ops"
@@ -76,17 +80,18 @@ fi
 if ! getent group "${OPS_SERVICE_GROUP}" >/dev/null; then
   groupadd --system "${OPS_SERVICE_GROUP}"
 fi
-usermod -a -G "${OPS_SERVICE_GROUP}" "${HERMES_SERVICE_USER}"
+if [[ "${HERMES_SERVICE_USER}" != "root" ]]; then
+  usermod -a -G "${OPS_SERVICE_GROUP}" "${HERMES_SERVICE_USER}"
+fi
 usermod -a -G "${OPS_SERVICE_GROUP}" "${SERVICE_USER}"
 command -v setfacl >/dev/null 2>&1 || {
   echo "The acl package is required for least-privilege workspace access." >&2
   exit 1
 }
 
-# Hermes was originally installed by uv with its CPython base under /root.
-# A non-root sandbox cannot safely traverse that path, and substituting the
-# system Python would mix CPython 3.12 with 3.11 extension modules. Mirror the
-# complete immutable 3.11 runtime into /usr/local instead.
+# Keep the complete immutable CPython 3.11 runtime mirrored under /usr/local.
+# Hermes now runs as root, but retaining this stable interpreter avoids coupling
+# gateway startup to uv's mutable installation layout under /root.
 HERMES_PYTHON_EXECUTABLE="$(readlink -f /usr/local/lib/hermes-agent/venv/bin/python)"
 HERMES_PYTHON_SOURCE="$(cd "$(dirname "${HERMES_PYTHON_EXECUTABLE}")/.." && pwd)"
 [[ -x "${HERMES_PYTHON_SOURCE}/bin/python3.11" && -d "${HERMES_PYTHON_SOURCE}/lib/python3.11" ]] || {
@@ -131,12 +136,15 @@ find "${HERMES_PROFILE_ROOT}" -xdev -type f -exec chmod u+rw,go-rwx {} +
 python3 "${SOURCE_ROOT}/scripts/migrate-hermes-runtime-paths.py" "${HERMES_PROFILE_ROOT}"
 install -d -o root -g "${SERVICE_GROUP}" -m 0750 /etc/zenos-runtime
 install -d -o "${ROUTER_SERVICE_USER}" -g "${ROUTER_SERVICE_GROUP}" -m 0700 /var/lib/9router /var/cache/9router
-if [[ -d /opt/9router/data ]]; then
+# Migrate legacy router state only on the first hardened install. Re-copying the
+# checkout's stale /opt/9router/data tree on every Runtime deployment can erase
+# freshly rotated OAuth credentials from the authoritative live database.
+if [[ ! -s /var/lib/9router/db/data.sqlite && -d /opt/9router/data ]]; then
   rsync -a /opt/9router/data/ /var/lib/9router/
-  chown -R "${ROUTER_SERVICE_USER}:${ROUTER_SERVICE_GROUP}" /var/lib/9router
-  find /var/lib/9router -xdev -type d -exec chmod 0700 {} +
-  find /var/lib/9router -xdev -type f -exec chmod 0600 {} +
 fi
+chown -R "${ROUTER_SERVICE_USER}:${ROUTER_SERVICE_GROUP}" /var/lib/9router
+find /var/lib/9router -xdev -type d -exec chmod 0700 {} +
+find /var/lib/9router -xdev -type f -exec chmod 0600 {} +
 install -d -o "${SERVICE_USER}" -g "${SERVICE_GROUP}" -m 0700 \
   /var/lib/zenos-runtime \
   /var/lib/zenos-runtime/session-models \
@@ -151,14 +159,14 @@ chown -R "${SERVICE_USER}:${SERVICE_GROUP}" /var/lib/zenos-runtime
 find /var/lib/zenos-runtime -xdev -type d -exec chmod 0700 {} +
 find /var/lib/zenos-runtime -xdev -type f -exec chmod 0600 {} +
 
-# The bind-mounted path avoids exposing /root to either service. ACLs grant the
-# gateway read/write access and Runtime read-only repository intelligence while
-# preserving existing project ownership.
-setfacl -R -m "u:${HERMES_SERVICE_USER}:rwX,u:${SERVICE_USER}:rX" "${WORKSPACE_SOURCE}"
+# Runtime still receives read-only repository intelligence through the bind
+# mount. Hermes itself is root-authoritative and therefore needs no workspace
+# ACL or broker-mediated privilege path.
+setfacl -R -m "u:${SERVICE_USER}:rX" "${WORKSPACE_SOURCE}"
 find "${WORKSPACE_SOURCE}" -xdev -type d -exec setfacl \
-  -m "d:u:${HERMES_SERVICE_USER}:rwX,d:u:${SERVICE_USER}:rX" {} +
-runuser -u "${HERMES_SERVICE_USER}" -- env HOME=/var/lib/hermes \
-  git -C /var/lib/hermes config --global --replace-all safe.directory '*'
+  -m "d:u:${SERVICE_USER}:rX" {} +
+runuser -u "${HERMES_SERVICE_USER}" -- env HOME="${HERMES_SERVICE_HOME}" \
+  git -C "${HERMES_SERVICE_HOME}" config --global --replace-all safe.directory '*'
 runuser -u "${SERVICE_USER}" -- env HOME=/var/lib/zenos-runtime \
   git -C /var/lib/zenos-runtime config --global --replace-all safe.directory '*'
 
@@ -278,6 +286,8 @@ install -o root -g root -m 0644 "${SOURCE_ROOT}/etla-ops-broker.service" /etc/sy
 install -o root -g root -m 0644 "${SOURCE_ROOT}/etla-maintenance.service" /etc/systemd/system/etla-maintenance.service
 install -o root -g root -m 0644 "${SOURCE_ROOT}/etla-maintenance.timer" /etc/systemd/system/etla-maintenance.timer
 install -o root -g root -m 0644 "${SOURCE_ROOT}/zenos-runtime.service" /etc/systemd/system/zenos-runtime.service
+install -o root -g root -m 0644 "${SOURCE_ROOT}/zenos-memory-prewarm.service" /etc/systemd/system/zenos-memory-prewarm.service
+install -o root -g root -m 0644 "${SOURCE_ROOT}/zenos-memory-prewarm.timer" /etc/systemd/system/zenos-memory-prewarm.timer
 install -o root -g root -m 0644 "${SOURCE_ROOT}/zenos-memory-secondary-backup.service" /etc/systemd/system/zenos-memory-secondary-backup.service
 install -o root -g root -m 0644 "${SOURCE_ROOT}/zenos-memory-secondary-backup.timer" /etc/systemd/system/zenos-memory-secondary-backup.timer
 install -o root -g root -m 0644 "${SOURCE_ROOT}/zenos-runtime-backup.service" /etc/systemd/system/zenos-runtime-backup.service
@@ -300,7 +310,7 @@ fi
 
 systemctl daemon-reload
 systemctl enable 9router.service srv-etla-workspaces.mount etla-ops-broker.service zenos-runtime.service \
-  zenos-memory-secondary-backup.timer zenos-runtime-backup.timer zenos-offsite-backup.timer \
+  zenos-memory-prewarm.timer zenos-memory-secondary-backup.timer zenos-runtime-backup.timer zenos-offsite-backup.timer \
   etla-maintenance.timer >/dev/null
 systemctl start srv-etla-workspaces.mount
 rollback_runtime() {
@@ -429,6 +439,7 @@ systemctl daemon-reload
 if [[ -n "${PREVIOUS_RELEASE}" && -d "${PREVIOUS_RELEASE}" && "${PREVIOUS_RELEASE}" != "${RELEASE_ROOT}" ]]; then
   ln -sfn "${PREVIOUS_RELEASE}" /opt/zenos-runtime/previous
 fi
+systemctl start zenos-memory-prewarm.timer
 systemctl start zenos-memory-secondary-backup.timer
 systemctl start zenos-runtime-backup.timer
 systemctl start zenos-offsite-backup.timer
@@ -436,6 +447,29 @@ systemctl start etla-maintenance.timer
 if [[ -f "${HERMES_ZENOS_UNIT}" && "${ZENOS_DEPLOY_RESTART_HERMES:-true}" == "true" ]]; then
   systemctl enable hermes-gateway.service >/dev/null
   systemctl restart hermes-gateway.service
+fi
+
+assert_hermes_root_authority() {
+  [[ "$(systemctl show hermes-gateway.service -p User --value)" == "root" ]]
+  [[ "$(systemctl show hermes-gateway.service -p Group --value)" == "root" ]]
+  [[ "$(systemctl show hermes-gateway.service -p NoNewPrivileges --value)" == "no" ]]
+  [[ "$(systemctl show hermes-gateway.service -p ProtectHome --value)" == "no" ]]
+  [[ "$(systemctl show hermes-gateway.service -p ProtectSystem --value)" == "no" ]]
+  [[ "$(systemctl show hermes-gateway.service -p PrivateDevices --value)" == "no" ]]
+  [[ -z "$(systemctl show hermes-gateway.service -p ReadOnlyPaths --value)" ]]
+  [[ -z "$(systemctl show hermes-gateway.service -p ReadWritePaths --value)" ]]
+  if [[ "${ZENOS_DEPLOY_RESTART_HERMES:-true}" == "true" ]]; then
+    local hermes_pid hermes_uid
+    hermes_pid="$(systemctl show hermes-gateway.service -p MainPID --value)"
+    [[ "${hermes_pid}" =~ ^[1-9][0-9]*$ ]]
+    hermes_uid="$(awk '/^Uid:/ {print $2}' "/proc/${hermes_pid}/status")"
+    [[ "${hermes_uid}" == "0" ]]
+    nsenter -t "${hermes_pid}" -m -- test -w /root
+  fi
+}
+if ! assert_hermes_root_authority; then
+  echo "Hermes root-authority gate failed; refusing a deployment that would restore the non-root sandbox." >&2
+  exit 1
 fi
 
 # Services now receive the same values from encrypted systemd credentials.

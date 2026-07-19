@@ -9,7 +9,8 @@ export async function GET() {
     status: 'alive',
     service: 'zenos-runtime',
     version: ZENOS_RUNTIME_VERSION,
-    architecture: 'host-worker-boss-verifier',
+    architecture: 'host-led-cognitive-runtime-v1',
+    orchestrationMode: 'host-led',
     timestamp: new Date().toISOString(),
     uptimeSeconds: Math.floor(process.uptime()),
   }, {

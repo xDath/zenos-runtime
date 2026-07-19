@@ -11,6 +11,7 @@ import {
 import { RouteDecision } from './zenos-runtime';
 import {
   bootstrapMemoryContext,
+  cognitiveMemoryBrief,
   compactMemoryHandoff,
   recallMemoryContext,
 } from './zenos-memory-client';
@@ -69,6 +70,14 @@ export function hostWorkingSetForDecision(decision: RouteDecision): number {
   const baseline = byTask[decision.taskType];
   const riskFactor = decision.risk === 'critical' ? 0.8 : decision.risk === 'high' ? 0.9 : 1;
   return Math.max(24_000, Math.min(256_000, Math.round(baseline * riskFactor)));
+}
+
+function cognitivePhaseForDecision(decision: RouteDecision): string {
+  if (decision.taskType === 'planning_or_architecture') return 'plan';
+  if (decision.taskType === 'debugging') return 'discover';
+  if (decision.taskType === 'coding_change' || decision.taskType === 'deploy_or_destructive_action') return 'execute';
+  if (decision.taskType === 'eval_or_benchmark') return 'validate';
+  return 'understand';
 }
 
 function safeNamespacePart(value: string): string {
@@ -199,6 +208,30 @@ export async function gatewayMemoryContextFor(
   }
 
   if (!decision.useMemory) return { context: '', source: 'none' };
+
+  // Prefer a decision-grade cognitive packet over a generic memory dump for
+  // every non-trivial Host task. It groups current decisions, procedures,
+  // failures, preferences, tasks, and artifacts around the active objective.
+  if (decision.taskType !== 'simple_chat') {
+    const cognitive = await cognitiveMemoryBrief({
+      objective: memoryQuery,
+      phase: cognitivePhaseForDecision(decision),
+      namespace: namespaces.primary,
+      sharedNamespace: namespaces.shared,
+      artifactHints: request.workspaceRoot ? [request.workspaceRoot, projectName] : undefined,
+      limit: Math.max(8, decision.maxMemoryItems * 3),
+      maxChars: Math.ceil(contextBudget * 3.4),
+    });
+    if (cognitive.ok && cognitive.value) {
+      return {
+        context: truncateToTokenBudget(cognitive.value, contextBudget, '\n[COGNITIVE BRIEF TRUNCATED]'),
+        source: existingSession ? 'recall' : 'bootstrap',
+        degraded: cognitive.degraded,
+        cacheHit: cognitive.cacheHit,
+        latencyMs: cognitive.latencyMs,
+      };
+    }
+  }
 
   if (!existingSession) {
     const bootstrap = await bootstrapAcrossNamespaces({

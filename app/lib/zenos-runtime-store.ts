@@ -13,7 +13,7 @@ import {
 } from './zenos-runtime-state';
 import { log } from './logger';
 
-const SCHEMA_VERSION = 8;
+const SCHEMA_VERSION = 9;
 
 function defaultDatabasePath(): string {
   if (process.env.ZENOS_RUNTIME_DB_PATH) return process.env.ZENOS_RUNTIME_DB_PATH;
@@ -66,6 +66,33 @@ export type CodingTaskRecord = {
   status: string;
   phase: string;
   state: unknown;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type CognitiveTaskRecord = {
+  taskId: string;
+  rootRunId?: string;
+  activeRunId?: string;
+  sessionId: string;
+  status: string;
+  phase: string;
+  capsule: unknown;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type ContinuationQueueRecord = {
+  continuationId: string;
+  taskId: string;
+  runId: string;
+  sessionId: string;
+  status: 'queued' | 'leased' | 'completed' | 'cancelled';
+  prompt: string;
+  reason: string;
+  attempt: number;
+  maxAttempts: number;
+  leaseExpiresAt?: string;
   createdAt: string;
   updatedAt: string;
 };
@@ -258,6 +285,39 @@ export class RuntimeStore {
       CREATE INDEX IF NOT EXISTS idx_coding_tasks_run ON coding_tasks(run_id, updated_at DESC);
       CREATE INDEX IF NOT EXISTS idx_coding_tasks_session ON coding_tasks(session_id, updated_at DESC);
       CREATE INDEX IF NOT EXISTS idx_coding_tasks_status ON coding_tasks(status, updated_at DESC);
+
+      CREATE TABLE IF NOT EXISTS cognitive_tasks (
+        task_id TEXT PRIMARY KEY,
+        root_run_id TEXT,
+        active_run_id TEXT,
+        session_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        phase TEXT NOT NULL,
+        capsule_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_cognitive_tasks_session ON cognitive_tasks(session_id, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_cognitive_tasks_status ON cognitive_tasks(status, updated_at DESC);
+
+      CREATE TABLE IF NOT EXISTS continuation_queue (
+        continuation_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        prompt TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        attempt INTEGER NOT NULL,
+        max_attempts INTEGER NOT NULL,
+        lease_expires_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_continuation_queue_session ON continuation_queue(session_id, status, updated_at);
+      CREATE INDEX IF NOT EXISTS idx_continuation_queue_lease ON continuation_queue(status, lease_expires_at);
 
       CREATE TABLE IF NOT EXISTS outcome_ledger (
         outcome_id TEXT PRIMARY KEY,
@@ -1004,6 +1064,180 @@ export class RuntimeStore {
     let reconciled = 0;
     for (const runId of runIds) reconciled += this.cancelCodingTasksForRun(runId, reason).length;
     return reconciled;
+  }
+
+  saveCognitiveTask(input: CognitiveTaskRecord): CognitiveTaskRecord {
+    this.db.prepare(`
+      INSERT INTO cognitive_tasks(task_id, root_run_id, active_run_id, session_id, status, phase, capsule_json, created_at, updated_at)
+      VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(task_id) DO UPDATE SET
+        root_run_id = excluded.root_run_id,
+        active_run_id = excluded.active_run_id,
+        session_id = excluded.session_id,
+        status = excluded.status,
+        phase = excluded.phase,
+        capsule_json = excluded.capsule_json,
+        updated_at = excluded.updated_at
+    `).run(
+      input.taskId,
+      input.rootRunId || null,
+      input.activeRunId || null,
+      input.sessionId,
+      input.status,
+      input.phase,
+      json(input.capsule),
+      input.createdAt,
+      input.updatedAt,
+    );
+    return input;
+  }
+
+  getCognitiveTask(taskId: string): CognitiveTaskRecord | undefined {
+    const row = this.db.prepare('SELECT * FROM cognitive_tasks WHERE task_id = ?').get(taskId);
+    if (!row) return undefined;
+    return {
+      taskId: asString(row.task_id),
+      rootRunId: row.root_run_id ? asString(row.root_run_id) : undefined,
+      activeRunId: row.active_run_id ? asString(row.active_run_id) : undefined,
+      sessionId: asString(row.session_id),
+      status: asString(row.status),
+      phase: asString(row.phase),
+      capsule: parseJson(row.capsule_json, null),
+      createdAt: asString(row.created_at),
+      updatedAt: asString(row.updated_at),
+    };
+  }
+
+  findActiveCognitiveTaskBySession(sessionId: string): CognitiveTaskRecord | undefined {
+    const row = this.db.prepare(`
+      SELECT * FROM cognitive_tasks
+      WHERE session_id = ? AND status IN ('active', 'waiting_for_user')
+      ORDER BY updated_at DESC LIMIT 1
+    `).get(sessionId);
+    if (!row) return undefined;
+    return {
+      taskId: asString(row.task_id),
+      rootRunId: row.root_run_id ? asString(row.root_run_id) : undefined,
+      activeRunId: row.active_run_id ? asString(row.active_run_id) : undefined,
+      sessionId: asString(row.session_id),
+      status: asString(row.status),
+      phase: asString(row.phase),
+      capsule: parseJson(row.capsule_json, null),
+      createdAt: asString(row.created_at),
+      updatedAt: asString(row.updated_at),
+    };
+  }
+
+  listCognitiveTasks(limit = 100, status?: string): CognitiveTaskRecord[] {
+    const safeLimit = Math.min(Math.max(limit, 1), 500);
+    const rows = status
+      ? this.db.prepare('SELECT * FROM cognitive_tasks WHERE status = ? ORDER BY updated_at DESC LIMIT ?').all(status, safeLimit)
+      : this.db.prepare('SELECT * FROM cognitive_tasks ORDER BY updated_at DESC LIMIT ?').all(safeLimit);
+    return rows.map((row) => ({
+      taskId: asString(row.task_id),
+      rootRunId: row.root_run_id ? asString(row.root_run_id) : undefined,
+      activeRunId: row.active_run_id ? asString(row.active_run_id) : undefined,
+      sessionId: asString(row.session_id),
+      status: asString(row.status),
+      phase: asString(row.phase),
+      capsule: parseJson(row.capsule_json, null),
+      createdAt: asString(row.created_at),
+      updatedAt: asString(row.updated_at),
+    }));
+  }
+
+  enqueueContinuation(input: ContinuationQueueRecord): ContinuationQueueRecord {
+    this.db.prepare(`
+      INSERT INTO continuation_queue(
+        continuation_id, task_id, run_id, session_id, status, prompt, reason,
+        attempt, max_attempts, lease_expires_at, created_at, updated_at
+      ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(continuation_id) DO UPDATE SET
+        status = excluded.status,
+        prompt = excluded.prompt,
+        reason = excluded.reason,
+        attempt = excluded.attempt,
+        max_attempts = excluded.max_attempts,
+        lease_expires_at = excluded.lease_expires_at,
+        updated_at = excluded.updated_at
+    `).run(
+      input.continuationId,
+      input.taskId,
+      input.runId,
+      input.sessionId,
+      input.status,
+      input.prompt,
+      input.reason,
+      input.attempt,
+      input.maxAttempts,
+      input.leaseExpiresAt || null,
+      input.createdAt,
+      input.updatedAt,
+    );
+    return input;
+  }
+
+  claimContinuationForSession(sessionId: string, leaseMs = 30 * 60_000): ContinuationQueueRecord | undefined {
+    return this.transaction(() => {
+      const nowIso = new Date().toISOString();
+      const leaseExpiresAt = new Date(Date.now() + Math.max(60_000, leaseMs)).toISOString();
+      this.db.prepare(`
+        UPDATE continuation_queue
+        SET status = 'queued', lease_expires_at = NULL, updated_at = ?
+        WHERE session_id = ? AND status = 'leased' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?
+      `).run(nowIso, sessionId, nowIso);
+      const row = this.db.prepare(`
+        SELECT * FROM continuation_queue
+        WHERE session_id = ? AND status = 'queued'
+        ORDER BY created_at ASC LIMIT 1
+      `).get(sessionId);
+      if (!row) return undefined;
+      const continuationId = asString(row.continuation_id);
+      this.db.prepare(`
+        UPDATE continuation_queue
+        SET status = 'leased', lease_expires_at = ?, updated_at = ?
+        WHERE continuation_id = ? AND status = 'queued'
+      `).run(leaseExpiresAt, nowIso, continuationId);
+      return {
+        continuationId,
+        taskId: asString(row.task_id),
+        runId: asString(row.run_id),
+        sessionId: asString(row.session_id),
+        status: 'leased',
+        prompt: asString(row.prompt),
+        reason: asString(row.reason),
+        attempt: asNumber(row.attempt),
+        maxAttempts: asNumber(row.max_attempts),
+        leaseExpiresAt,
+        createdAt: asString(row.created_at),
+        updatedAt: nowIso,
+      };
+    });
+  }
+
+  completeContinuation(continuationId: string, cancelled = false): ContinuationQueueRecord | undefined {
+    const updatedAt = new Date().toISOString();
+    this.db.prepare(`
+      UPDATE continuation_queue
+      SET status = ?, lease_expires_at = NULL, updated_at = ?
+      WHERE continuation_id = ?
+    `).run(cancelled ? 'cancelled' : 'completed', updatedAt, continuationId);
+    const row = this.db.prepare('SELECT * FROM continuation_queue WHERE continuation_id = ?').get(continuationId);
+    if (!row) return undefined;
+    return {
+      continuationId: asString(row.continuation_id),
+      taskId: asString(row.task_id),
+      runId: asString(row.run_id),
+      sessionId: asString(row.session_id),
+      status: asString(row.status) as ContinuationQueueRecord['status'],
+      prompt: asString(row.prompt),
+      reason: asString(row.reason),
+      attempt: asNumber(row.attempt),
+      maxAttempts: asNumber(row.max_attempts),
+      leaseExpiresAt: row.lease_expires_at ? asString(row.lease_expires_at) : undefined,
+      createdAt: asString(row.created_at),
+      updatedAt: asString(row.updated_at),
+    };
   }
 
   claimIdempotency(key: string, scope: string, requestHash: string, ttlSeconds = 86_400): { state: 'claimed' | 'replay' | 'conflict' | 'running'; record?: IdempotencyRecord } {

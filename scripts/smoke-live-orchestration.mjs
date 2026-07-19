@@ -17,6 +17,8 @@ function loadEnv(file) {
   }
 }
 
+const credentialDirectory = process.env.CREDENTIALS_DIRECTORY || '';
+loadEnv(credentialDirectory ? `${credentialDirectory}/zenos-runtime.env` : '');
 loadEnv('.env.local');
 loadEnv('.env');
 
@@ -33,11 +35,11 @@ const response = await fetch(`${baseUrl}/api/runtime/run`, {
     'idempotency-key': idempotencyKey,
   },
   body: JSON.stringify({
-    request: 'Analyze this synthetic, non-mutating production-readiness evidence and return a concise verdict with the strongest remaining risk.',
+    request: 'Benchmark this synthetic, non-mutating production-readiness evidence and return a concise verdict with the strongest remaining risk.',
     context: [
       'Evidence A: the service is loopback-only and runs as a non-root system identity.',
       'Evidence B: the state store uses SQLite WAL with integrity checks and idempotent requests.',
-      'Evidence C: this smoke must independently exercise Host, Worker, Verifier, and Boss.',
+      'Evidence C: this benchmark smoke must independently exercise Host, Worker, Verifier, and Boss.',
       'Constraint: do not call tools, mutate files, or perform a production action.',
     ].join('\n'),
     intent: 'analyze',

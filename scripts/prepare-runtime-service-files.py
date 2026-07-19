@@ -21,6 +21,16 @@ SECRET_FIELD_NAMES = {
     "api_key", "api-key", "apikey", "token", "access_token",
     "password", "password_hash", "secret", "private_key",
 }
+SECRET_LIST_FIELD_NAMES = {"keys", "api_keys", "tokens"}
+CREDENTIAL_POOL_PATH_NAMES = {"credential_pool_strategies", "credential_pools"}
+
+
+def _is_credential_pool_secret_list(path: tuple[str, ...], key: object, value: object) -> bool:
+    return (
+        isinstance(value, list)
+        and str(key).lower() in SECRET_LIST_FIELD_NAMES
+        and any(str(part).lower() in CREDENTIAL_POOL_PATH_NAMES for part in path)
+    )
 
 
 def env_reference(value: str) -> bool:
@@ -43,6 +53,10 @@ def secret_literals(value, path: tuple[str, ...] = ()):
                 and not env_reference(child)
             ):
                 yield child_path, child
+            if _is_credential_pool_secret_list(path, key, child):
+                for index, item in enumerate(child):
+                    if isinstance(item, str) and item.strip() and not env_reference(item):
+                        yield (*child_path, str(index)), item
             yield from secret_literals(child, child_path)
     elif isinstance(value, list):
         for index, child in enumerate(value):
@@ -61,6 +75,13 @@ def replace_secret_literals(value, path: tuple[str, ...] = ()):
                 and not env_reference(child)
             ):
                 result[key] = f"${{{secret_environment_name(child_path)}}}"
+            elif _is_credential_pool_secret_list(path, key, child):
+                result[key] = [
+                    f"${{{secret_environment_name((*child_path, str(index)))}}}"
+                    if isinstance(item, str) and item.strip() and not env_reference(item)
+                    else replace_secret_literals(item, (*child_path, str(index)))
+                    for index, item in enumerate(child)
+                ]
             else:
                 result[key] = replace_secret_literals(child, child_path)
         return result
@@ -292,11 +313,9 @@ def prepare_hermes_config(source: Path, destination: Path) -> None:
                 for model_id in discovered_models
             }
 
-    # Production invariants. Memory compute is cloud-first with Google Drive as
-    # canonical storage; Runtime provides task-aware working sets, while Hermes'
-    # global compressor is only the final safety valve. Failed summaries must
-    # preserve the full transcript instead of replacing coding evidence with a
-    # placeholder marker.
+    # Production invariants. Runtime is a Host-led cognitive task engine: one
+    # session model, native Hermes worker profiles, local-first continuation
+    # capsules, and cloud Memory off the active compression hot path.
     model = data.setdefault("model", {})
     if isinstance(model, dict):
         model["context_length"] = max(int(model.get("context_length") or 0), 1_000_000)
@@ -306,12 +325,13 @@ def prepare_hermes_config(source: Path, destination: Path) -> None:
         data["compression"] = compression
     compression.update({
         "enabled": True,
-        "threshold": 0.20,
-        "target_ratio": 0.25,
+        "threshold": 0.16,
+        "target_ratio": 0.35,
         "protect_first_n": 3,
         "protect_last_n": 12,
         "hygiene_hard_message_limit": 600,
-        "abort_on_summary_failure": True,
+        "abort_on_summary_failure": False,
+        "deterministic_provider_failure_fallback": True,
         "in_place": True,
     })
     runtime = data.setdefault("zenos_runtime", {})
@@ -323,17 +343,52 @@ def prepare_hermes_config(source: Path, destination: Path) -> None:
         "url": "http://127.0.0.1:3090",
         "fail_open": True,
         "max_history_chars": 64_000,
-        "context_soft_limit_tokens": 192_000,
+        "context_soft_limit_tokens": 160_000,
         "handoff_history_chars": 240_000,
         "handoff_max_messages": 300,
         "disable_streaming_when_verified": True,
         "report_failures": True,
+        "authoritative_host": True,
+        "enforce_host_token_budget": False,
+        "enforce_host_working_set_limit": False,
     })
+    delegation = data.setdefault("delegation", {})
+    if not isinstance(delegation, dict):
+        delegation = {}
+        data["delegation"] = delegation
+    delegation.update({
+        "model": "",
+        "provider": "",
+        "inherit_mcp_toolsets": True,
+        "max_iterations": max(15, int(delegation.get("max_iterations") or 15)),
+        "child_timeout_seconds": max(600, int(delegation.get("child_timeout_seconds") or 600)),
+        "max_concurrent_children": 3,
+        "max_spawn_depth": 1,
+        "orchestrator_enabled": True,
+        "subagent_auto_approve": False,
+    })
+    tools = data.setdefault("tools", {})
+    if not isinstance(tools, dict):
+        tools = {}
+        data["tools"] = tools
+    tool_search = tools.setdefault("tool_search", {})
+    if not isinstance(tool_search, dict):
+        tool_search = {}
+        tools["tool_search"] = tool_search
+    always_visible = tool_search.get("always_visible") if isinstance(tool_search.get("always_visible"), list) else []
+    tool_search["always_visible"] = list(dict.fromkeys([*always_visible, "delegate_task"]))
     terminal = data.setdefault("terminal", {})
     if not isinstance(terminal, dict):
         terminal = {}
         data["terminal"] = terminal
-    terminal["cwd"] = "/srv/etla/workspaces"
+    terminal["cwd"] = "/root/openclaw-projects"
+    approvals = data.setdefault("approvals", {})
+    if not isinstance(approvals, dict):
+        approvals = {}
+        data["approvals"] = approvals
+    approvals["mode"] = "off"
+    approvals["cron_mode"] = "approve"
+    data["hooks_auto_accept"] = True
 
     sanitized = replace_secret_literals(deepcopy(data))
     destination.write_text(yaml.safe_dump(sanitized, sort_keys=False, allow_unicode=True), encoding="utf-8")
@@ -389,7 +444,7 @@ def prepare_model_slots(source: Path, destination: Path) -> None:
         "verifierModel", "verifierProvider", "verifierBaseUrl",
     }
     sanitized = {key: value for key, value in data.items() if key in allowed and isinstance(value, str) and value.strip()}
-    sanitized["verifierModel"] = "ag/gemini-3.5-flash-low"
+    sanitized["verifierModel"] = "verifier-grok43-deepseek"
     sanitized["verifierProvider"] = "etla-router"
     destination.write_text(json.dumps(sanitized, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     destination.chmod(0o600)

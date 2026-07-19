@@ -210,13 +210,22 @@ export function createTokenBudgetPlan(
       : 1;
   const retryPressure = 1 + Math.min(Math.max(options.priorFailures || 0, 0), 3) * 0.08;
   const highAssurance = decision.risk === 'high' || decision.risk === 'critical';
-  const orchestrationFloor = decision.useWorker && decision.useVerifier && decision.useBoss
-    ? highAssurance ? 18_000 : 15_000
-    : decision.useWorker && decision.useVerifier
-      ? highAssurance ? 9_000 : 8_000
-      : decision.useBoss
-        ? highAssurance ? 7_000 : 6_000
-      : 2_500;
+  const bossEnabled = decision.useBoss || decision.allowEscalation;
+  // The global governor accounts provider framing/reasoning tokens in addition
+  // to the bounded textual packets. These floors are ceilings, not spend
+  // targets: they keep mandatory later roles from being denied after an
+  // efficient Host call while actual usage remains pay-for-what-ran.
+  const orchestrationFloor = decision.useWorker && decision.useVerifier && bossEnabled
+    ? highAssurance ? 32_000 : 26_000
+    : decision.useVerifier && bossEnabled
+      ? highAssurance ? 24_000 : 20_000
+      : decision.useWorker && decision.useVerifier
+        ? highAssurance ? 20_000 : 16_000
+        : bossEnabled
+          ? highAssurance ? 16_000 : 13_000
+          : decision.useVerifier
+            ? highAssurance ? 14_000 : 11_000
+            : 9_000;
   const totalTokens = bounded(
     Math.max(
       taskBase(decision.taskType) * riskMultiplier(decision.risk) * priorityMultiplier * sourcePressure * retryPressure,
@@ -226,7 +235,6 @@ export function createTokenBudgetPlan(
     48_000,
   );
 
-  const bossEnabled = decision.useBoss || decision.allowEscalation;
   const workerShare = decision.useWorker ? (decision.taskType === 'summarization' ? 0.42 : 0.34) : 0.05;
   const verifierShare = decision.useVerifier ? 0.16 : 0.03;
   const bossShare = bossEnabled ? (decision.risk === 'critical' ? 0.09 : 0.055) : 0.015;
@@ -276,7 +284,7 @@ export function createTokenBudgetPlan(
     ),
     host: roleBudget(hostShare, 0.35, hostCallLimit(decision), 0, 120_000, 10_000, 3_200, 1_600),
     verifier: roleBudget(verifierShare, 0.45, decision.useVerifier ? 1 + Math.min(1, decision.maxRevisionAttempts) : 0, 0, 90_000, 5_000, 2_600, decision.useVerifier ? 2_200 : 64),
-    boss: roleBudget(bossShare, 0.45, bossEnabled ? 1 : 0, 0, 120_000, 2_500, 1_400, bossEnabled ? 900 : 64, bossEnabled ? 1_500 : 128),
+    boss: roleBudget(bossShare, 0.55, bossEnabled ? 1 : 0, 0, 120_000, 3_500, 3_200, bossEnabled ? 1_800 : 64, bossEnabled ? 1_500 : 128),
     reserveTokens: bounded(totalTokens * reserveShare, 0, 12_000),
     reasons: [
       `task:${decision.taskType}`,

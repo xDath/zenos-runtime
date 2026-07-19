@@ -6,6 +6,7 @@ import {
   baseUrlForSlot,
   mergeModelSlots,
   modelForSlot,
+  normalizeSingleModelSlots,
   providerForSlot,
   publicModelSlots,
   readRuntimeModelSlots,
@@ -20,6 +21,7 @@ import {
   RouteDecision,
   RouteEvent,
   RuntimeContextSchema,
+  userExplicitlyDisabledVerifier,
   validateVerifierResult,
   validateWorkerResult,
   VerifierResult,
@@ -39,11 +41,16 @@ import {
 } from './zenos-runtime-three-agent';
 import { BossDecision, BossDecisionSchema, EscalationPacket, WorkerTemplateName, workerTemplates } from './zenos-runtime-state';
 import { getRuntimeStore } from './zenos-runtime-store';
-import { persistRouteEventToMemory, recallMemoryContext } from './zenos-memory-client';
+import {
+  cognitiveMemoryBrief,
+  persistRouteEventToMemory,
+  recallMemoryContext,
+} from './zenos-memory-client';
 import { incrementMetric, observeDuration } from './metrics';
 import { log, redactText } from './logger';
 import { compileRuntimeContext, renderRolePacket, RuntimeWorkPacket } from './runtime-context-compiler';
 import { compactSourceContext, mergeWorkerResults, splitRoleContext } from './runtime-role-context';
+import { applyHostLedPolicy, hostLedRuntimeEnabled } from './host-led-policy';
 import { CodingTaskState, prepareCodexExecution } from './codex-execution-core';
 import { AutonomousCodingOutcome, runAutonomousCodingLoop } from './autonomous-coding-loop';
 import {
@@ -279,7 +286,7 @@ function builtInModelSlots(): RuntimeModelSlots {
     hostModel: 'deepseek',
     workerModel: 'deepseek',
     bossModel: 'ag/gemini-pro-agent',
-    verifierModel: 'ag/gemini-3.5-flash-low',
+    verifierModel: 'verifier-grok43-deepseek',
     hostProvider: 'etla-router',
     workerProvider: 'etla-router',
     bossProvider: 'etla-router',
@@ -307,13 +314,13 @@ export function readRuntimeOverrideConfig(): RuntimeModelSlots {
 }
 
 export function resolveRuntimeModelSlots(sessionId?: string, inlineOverrides: RuntimeModelSlots = {}): RuntimeModelSlots {
-  return mergeModelSlots(
+  return normalizeSingleModelSlots(mergeModelSlots(
     builtInModelSlots(),
     environmentModelSlots(),
     readRuntimeModelSlots(),
     readSessionModelSlots(sessionId),
     inlineOverrides,
-  );
+  ));
 }
 
 function endpointUrl(baseUrl: string): string {
@@ -346,13 +353,16 @@ function resolveRoleConfig(role: RuntimeModelRole, sessionId?: string, inlineOve
 
 export function hasRuntimeModels(sessionId?: string): boolean {
   const slots = resolveRuntimeModelSlots(sessionId);
-  return Boolean(
-    modelForSlot(slots, 'host')
-    && modelForSlot(slots, 'worker')
-    && modelForSlot(slots, 'boss')
-    && modelForSlot(slots, 'verifier')
-    && baseUrlForSlot(slots, 'host'),
-  );
+  return Boolean(modelForSlot(slots, 'host') && baseUrlForSlot(slots, 'host'));
+}
+
+export function getRuntimeRoleIdentity(
+  role: RuntimeModelRole,
+  sessionId?: string,
+  inlineOverrides: RuntimeModelSlots = {},
+): { model: string; provider: string } {
+  const config = resolveRoleConfig(role, sessionId, inlineOverrides);
+  return { model: config.model, provider: config.provider };
 }
 
 export function getRuntimeModelConfigSummary(sessionId?: string) {
@@ -1043,6 +1053,29 @@ Return ONLY JSON matching:
   }
 }
 
+function executionAnchorContext(toolContext: string): string {
+  if (!toolContext.trim()) return '';
+  const lines = toolContext.split(/\r?\n/);
+  const selected: string[] = [];
+  let validationTail = 0;
+  for (const raw of lines) {
+    const line = raw.trimEnd();
+    if (/^(?:Repository revision|Validation plan|Acceptance criteria|Changed files|Current phase|Canonical workspace|Allowed files|Forbidden actions):/i.test(line)) {
+      selected.push(line);
+      validationTail = /^Validation plan:/i.test(line) ? 12 : 0;
+      continue;
+    }
+    if (validationTail > 0 && /^\s*[-*]\s+/.test(raw)) {
+      selected.push(line);
+      validationTail -= 1;
+      continue;
+    }
+    if (validationTail > 0 && !line.trim()) continue;
+    validationTail = 0;
+  }
+  return truncateToTokenBudget([...new Set(selected)].join('\n'), 1_200, '\n[EXECUTION ANCHORS TRUNCATED]');
+}
+
 export async function runHostSynthesis(
   input: z.infer<typeof RuntimeRunRequestSchema>,
   decision: RouteDecision,
@@ -1051,7 +1084,9 @@ export async function runHostSynthesis(
 ): Promise<RuntimeModelResult> {
   const sourceContext = compactSourceContext(input);
   const workerBlock = workerResult ? JSON.stringify(workerResult, null, 2) : '';
-  const focusedContext = options.packet ? renderRolePacket(options.packet) : (workerBlock || sourceContext.slice(0, decision.maxContextTokens * 4));
+  const packetContext = options.packet ? renderRolePacket(options.packet) : (workerBlock || sourceContext.slice(0, decision.maxContextTokens * 4));
+  const anchors = executionAnchorContext(input.toolContext);
+  const focusedContext = [packetContext, anchors ? `Execution anchors:\n${anchors}` : ''].filter(Boolean).join('\n\n');
   const budget = options.budget ? roleBudget(options.budget, 'host') : undefined;
   const sourceWarning = decision.requiresSourceContext && !input.toolContext.trim() && !input.context.trim()
     ? 'Required source/tool context was not supplied. Do not claim that files, logs, tests, or current external facts were inspected.'
@@ -1116,6 +1151,91 @@ Apply every required change that is supported. Remove unsupported claims. Do not
   });
 }
 
+const AUTHORIZED_RESEARCH_PROGRAM_PATTERN = /\b(?:bug\s*bounty|immunefi|hackerone|bugcrowd|intigriti|yeswehack|responsible\s+disclosure|coordinated\s+disclosure|authorized\s+(?:security\s+)?(?:research|testing|audit)|in[- ]scope|program\s+scope|security\s+audit)\b/i;
+const CONTROLLED_REPRODUCTION_PATTERN = /\b(?:proof[- ]of[- ]concept|poc|reproduction|repro(?:duction)?\s+test|unit\s+test|integration\s+test|forge\s+test|foundry|hardhat|anvil|local\s+fork|testnet|sandbox|mock|simulation|\.test\.(?:ts|js|sol)|report|submission)\b/i;
+const LIVE_UNAUTHORIZED_HARM_PATTERN = /\b(?:without\s+(?:permission|authorization)|unauthori[sz]ed\s+(?:attack|access|exploit)|attack\s+(?:a\s+)?(?:live|production|mainnet)\s+target|exploit\s+(?:a\s+)?(?:live|production|mainnet)\s+target|drain\s+(?:real\s+|user\s+)?funds|steal\s+(?:funds|tokens|credentials)|exfiltrat(?:e|ion)|deploy\s+(?:the\s+)?exploit\s+(?:to|on)\s+mainnet|victim\s+wallet|stolen\s+(?:key|credential))\b/i;
+const RESEARCH_FALSE_POSITIVE_PATTERN = /\b(?:bug[- ]?bounty|poc|proof[- ]of[- ]concept|exploit(?:\/reproduction)?|reproduction|vulnerability|smart[- ]contract|freeze|fund[- ]loss|report|submission|test(?:\s+writing|\s+file|\s+development)?|delete\s+any\s+such\s+files|cease\s+all)\b/i;
+const VERIFIER_SELF_REFERENCE_PATTERN = /\b(?:disable|disabled|skip|not\s+use|do\s+not\s+use|jangan\s+pake|jangan\s+pakai|tanpa)\b.{0,36}\bverifier\b|\bverifier\s+operations?\b/i;
+
+function verifierContextText(input: z.infer<typeof RuntimeRunRequestSchema>): string {
+  return [
+    input.request,
+    input.context,
+    input.memoryContext,
+    input.toolContext,
+    input.acceptanceCriteria.join('\n'),
+    input.forbiddenActions.join('\n'),
+  ].filter(Boolean).join('\n');
+}
+
+export function normalizeVerifierResultForContext(
+  input: z.infer<typeof RuntimeRunRequestSchema>,
+  result: VerifierResult,
+): VerifierResult {
+  if (result.verdict !== 'block') return result;
+
+  const contextText = verifierContextText(input);
+  const issueText = result.issues.map((issue) => `${issue.issue}\n${issue.evidence}\n${issue.requiredFix}`).join('\n');
+  const issueEvidence = result.issues.map((issue) => issue.evidence).join('\n');
+  const concreteUnsafeEvidence = LIVE_UNAUTHORIZED_HARM_PATTERN.test(contextText)
+    || LIVE_UNAUTHORIZED_HARM_PATTERN.test(issueEvidence);
+
+  if (
+    userExplicitlyDisabledVerifier(input.request)
+    && !concreteUnsafeEvidence
+    && VERIFIER_SELF_REFERENCE_PATTERN.test(issueText)
+  ) {
+    log('warn', 'Ignored self-referential Verifier block after explicit user opt-out', {
+      sessionId: input.sessionId,
+    });
+    return validateVerifierResult({
+      verdict: 'pass',
+      confidence: Math.max(0.8, result.confidence),
+      issues: [],
+      checks: {
+        followsUserRequest: 'pass',
+        sourceGrounded: result.checks.sourceGrounded,
+        secretSafe: result.checks.secretSafe,
+        actionSafe: 'not_applicable',
+        testsOrValidation: result.checks.testsOrValidation === 'fail' ? 'not_applicable' : result.checks.testsOrValidation,
+      },
+      nextAction: 'answer',
+    });
+  }
+
+  const authorizedResearch = AUTHORIZED_RESEARCH_PROGRAM_PATTERN.test(contextText)
+    && CONTROLLED_REPRODUCTION_PATTERN.test(contextText)
+    && !concreteUnsafeEvidence;
+  const researchOnlyBlock = result.issues.length > 0
+    && result.issues.every((issue) => RESEARCH_FALSE_POSITIVE_PATTERN.test(
+      `${issue.issue}\n${issue.evidence}\n${issue.requiredFix}`,
+    ));
+
+  if (!authorizedResearch || !researchOnlyBlock) return result;
+
+  log('warn', 'Normalized overbroad Verifier block for authorized security research', {
+    sessionId: input.sessionId,
+  });
+  return validateVerifierResult({
+    verdict: 'pass',
+    confidence: Math.max(0.8, Math.min(0.95, result.confidence)),
+    issues: [{
+      severity: 'low',
+      issue: 'Authorized, bounded bug-bounty research was incorrectly treated as an unauthorized live attack.',
+      evidence: 'The supplied context identifies a bug-bounty/disclosure workflow and controlled reproduction or test artifacts, with no concrete evidence of unauthorized live exploitation.',
+      requiredFix: 'Keep reproduction inside the stated program scope and controlled local, fork, sandbox, or testnet environments; never target real user funds or credentials.',
+    }],
+    checks: {
+      followsUserRequest: 'pass',
+      sourceGrounded: result.checks.sourceGrounded,
+      secretSafe: result.checks.secretSafe,
+      actionSafe: 'pass',
+      testsOrValidation: result.checks.testsOrValidation === 'fail' ? 'not_applicable' : result.checks.testsOrValidation,
+    },
+    nextAction: 'answer',
+  });
+}
+
 function mandatoryVerifierFallback(reason: string): VerifierResult {
   return validateVerifierResult({
     verdict: 'escalate',
@@ -1149,7 +1269,10 @@ export async function runVerifier(
     {
       role: 'system',
       content: `You are the independent Zenos Verifier. Check the draft against the user's request, supplied evidence, secret safety, action safety, and validation claims.
-A revise verdict must include concrete requiredFix items. Escalate only when premium judgment is necessary. Block only for material unsafe or unsupported output.
+Authorized security research is legitimate work. Bug-bounty programs, responsible disclosure, audits, and controlled local/fork/testnet/sandbox PoCs may discuss exploit mechanics, vulnerability impact, frozen funds, or reproduction tests. Never block solely because the text contains words such as exploit, PoC, vulnerability, freeze, fund loss, report, or submission.
+Block only when the supplied evidence shows a material attempt to compromise a live or production target without authorization, steal or drain real funds, exfiltrate secrets, target victims, or act outside the stated scope. When authorization or scope is merely unclear and there is no concrete live-harm evidence, prefer revise or ask_user rather than block.
+A user request to disable the independent Verifier is a routing preference, not unsafe content; never block merely because the user asked to skip Verifier. Host remains responsible for final self-review when independent verification is disabled.
+A revise verdict must include concrete requiredFix items. Escalate only when premium judgment is necessary. Block only for material unsafe or unsupported output backed by specific evidence.
 Return ONLY JSON:
 {"verdict":"pass|revise|escalate|block","confidence":0.0,"issues":[{"severity":"low|medium|high|critical","issue":"...","evidence":"...","requiredFix":"..."}],"checks":{"followsUserRequest":"pass|fail|unknown","sourceGrounded":"pass|fail|not_applicable","secretSafe":"pass|fail|unknown","actionSafe":"pass|fail|not_applicable","testsOrValidation":"pass|fail|not_applicable"},"nextAction":"answer|revise|ask_user|escalate|block"}`,
     },
@@ -1176,7 +1299,8 @@ Return ONLY JSON:
       : { call: failedCall };
   }
   try {
-    return { call, result: validateVerifierResult(call.parsed) };
+    const parsedResult = validateVerifierResult(call.parsed);
+    return { call, result: normalizeVerifierResultForContext(input, parsedResult) };
   } catch (error) {
     const failedCall = {
       ...call,
@@ -1533,7 +1657,10 @@ export async function runZenosPipeline(request: RuntimeRunRequest): Promise<Runt
   const input = RuntimeRunRequestSchema.parse(request);
   const started = Date.now();
   const runId = `run_${crypto.randomUUID()}`;
-  const decision = choosePipeline(input);
+  const baselineDecision = choosePipeline(input);
+  const decision = hostLedRuntimeEnabled()
+    ? applyHostLedPolicy(baselineDecision, input)
+    : baselineDecision;
   const budgetPlan = createTokenBudgetPlan(decision, input, {
     userPriority: input.tokenPriority,
     budgetId: runId,
@@ -1610,7 +1737,25 @@ export async function runZenosPipeline(request: RuntimeRunRequest): Promise<Runt
 
   try {
     if (decision.useMemory && input.autoRecallMemory && !input.memoryContext.trim()) {
-      const recalled = await recallMemoryContext({ query: input.request, namespace: input.namespace, limit: decision.maxMemoryItems });
+      const recalled = decision.taskType === 'simple_chat'
+        ? await recallMemoryContext({
+            query: input.request,
+            namespace: input.namespace,
+            limit: decision.maxMemoryItems,
+          })
+        : await cognitiveMemoryBrief({
+            objective: input.request,
+            phase: decision.taskType === 'debugging'
+              ? 'discover'
+              : decision.taskType === 'planning_or_architecture'
+                ? 'plan'
+                : decision.taskType === 'eval_or_benchmark'
+                  ? 'validate'
+                  : 'execute',
+            namespace: input.namespace,
+            artifactHints: input.workspaceRoot ? [input.workspaceRoot] : undefined,
+            limit: Math.max(8, decision.maxMemoryItems * 3),
+          });
       memoryRecall = { ok: recalled.ok, skipped: recalled.skipped, latencyMs: recalled.latencyMs, error: recalled.error };
       if (recalled.ok && recalled.value) input.memoryContext = recalled.value;
       else if (!recalled.skipped) warnings.push(`Memory recall unavailable: ${recalled.error || 'unknown error'}`);

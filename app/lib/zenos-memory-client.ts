@@ -41,6 +41,19 @@ const BootstrapResponseSchema = z.object({
   count: z.number().int().nonnegative().optional().default(0),
 }).passthrough();
 
+const CognitiveBriefResponseSchema = z.object({
+  success: z.boolean().optional(),
+  brief: z.object({
+    version: z.string(),
+    objective: z.string(),
+    phase: z.string(),
+    namespaces: z.array(z.string()).default([]),
+    content: z.string().default(''),
+    unknowns: z.array(z.string()).optional().default([]),
+    retrieval: z.record(z.string(), z.unknown()).optional(),
+  }).passthrough(),
+}).passthrough();
+
 const AuthResponseSchema = z.object({
   success: z.boolean().optional(),
   token: z.string().min(16),
@@ -110,7 +123,7 @@ function scopesKey(scopes: MemoryScope[]): string {
 }
 
 function timeoutValue(candidate?: number): number {
-  return Math.max(2_000, Math.min(candidate || Number(process.env.ZENOS_MEMORY_TIMEOUT_MS || 12_000), 90_000));
+  return Math.max(2_000, Math.min(candidate || Number(process.env.ZENOS_MEMORY_TIMEOUT_MS || 20_000), 90_000));
 }
 
 function checkCircuit(): string | null {
@@ -398,6 +411,68 @@ function memoryBriefRank(item: MemoryItem): number {
   return score * 3 + confidence + importance - statusPenalty;
 }
 
+export async function cognitiveMemoryBrief(input: {
+  objective: string;
+  phase?: string;
+  latestError?: string;
+  namespace?: string;
+  sharedNamespace?: string;
+  artifactHints?: string[];
+  limit?: number;
+  maxChars?: number;
+}): Promise<MemoryClientResult<string>> {
+  const namespace = input.namespace || process.env.ZENOS_MEMORY_NAMESPACE || 'zenos';
+  const maxChars = Math.min(Math.max(input.maxChars || 8_000, 1_500), 24_000);
+  const limit = Math.min(Math.max(input.limit || 24, 4), 60);
+  const revision = await currentNamespaceRevision(namespace);
+  const cache = getRuntimeCache();
+  const cacheKey = runtimeCacheKey('memory', {
+    kind: 'cognitive-brief',
+    objective: input.objective,
+    phase: input.phase || '',
+    latestError: input.latestError || '',
+    namespace,
+    sharedNamespace: input.sharedNamespace || '',
+    artifactHints: input.artifactHints || [],
+    limit,
+    maxChars,
+  }, { memory: revision });
+  const cached = cache.get<string>(cacheKey, { memory: revision });
+  if (cached !== undefined) {
+    return { ok: true, skipped: false, value: cached, cacheHit: true, latencyMs: 0 };
+  }
+  const result = await memoryFetch<z.infer<typeof CognitiveBriefResponseSchema>>('/api/memory/cognitive-brief', {
+    objective: input.objective,
+    phase: input.phase,
+    latest_error: input.latestError,
+    namespace,
+    shared_namespace: input.sharedNamespace,
+    artifact_hints: input.artifactHints,
+    limit,
+    max_chars: maxChars,
+  }, {
+    scopes: ['memory:read'],
+    parser: CognitiveBriefResponseSchema,
+    timeoutMs: Math.min(30_000, timeoutValue()),
+  });
+  if (!result.ok || !result.value) {
+    return {
+      ok: false,
+      skipped: result.skipped,
+      status: result.status,
+      error: result.error,
+      latencyMs: result.latencyMs,
+      degraded: result.degraded,
+    };
+  }
+  const value = redactText(result.value.brief.content).slice(0, maxChars);
+  cache.set(cacheKey, value, {
+    ttlMs: Math.max(15_000, Number(process.env.ZENOS_MEMORY_COGNITIVE_BRIEF_CACHE_MS || 90_000)),
+    revisions: { memory: revision },
+  });
+  return { ...result, value };
+}
+
 export async function recallMemoryContext(input: {
   query: string;
   namespace?: string;
@@ -635,6 +710,96 @@ export async function bootstrapMemoryContext(input: {
   return { ...result, value };
 }
 
+export async function persistCognitiveOutcome(input: {
+  namespace?: string;
+  runId: string;
+  sessionId: string;
+  objective: string;
+  taskType: string;
+  verdict: 'success' | 'failed' | 'blocked' | 'revised';
+  phase?: string;
+  model?: string;
+  provider?: string;
+  toolSummary?: string;
+  deterministicValidation?: 'passed' | 'failed' | 'unknown';
+  decisions?: string[];
+  failures?: string[];
+  artifacts?: string[];
+  tokenUsage?: { input: number; output: number; calls: number };
+}): Promise<MemoryClientResult<unknown>> {
+  if (process.env.ZENOS_RUNTIME_DISABLE_OUTCOME_LEARNING === 'true') {
+    return { ok: false, skipped: true, error: 'Cognitive outcome learning is disabled' };
+  }
+  const namespace = input.namespace || process.env.ZENOS_MEMORY_LEARNING_NAMESPACE || 'runtime.learning';
+  const successful = input.verdict === 'success'
+    && (input.deterministicValidation === 'passed' || input.deterministicValidation === 'unknown');
+  const memoryType = successful ? 'procedure' : 'insight';
+  const boundedToolSummary = redactText(input.toolSummary || '').replace(/\s+/g, ' ').trim().slice(0, 3_000);
+  const lines = [
+    `Objective: ${redactText(input.objective).slice(0, 2_000)}`,
+    `Task type: ${input.taskType}`,
+    `Outcome: ${input.verdict}`,
+    input.phase ? `Final phase: ${input.phase}` : '',
+    input.deterministicValidation ? `Deterministic validation: ${input.deterministicValidation}` : '',
+    input.model ? `Model: ${input.model}${input.provider ? ` via ${input.provider}` : ''}` : '',
+    boundedToolSummary ? `Validated execution evidence: ${boundedToolSummary}` : '',
+    ...(input.decisions || []).slice(0, 12).map(value => `Decision: ${redactText(value).slice(0, 800)}`),
+    ...(input.failures || []).slice(0, 12).map(value => `Failure or pitfall: ${redactText(value).slice(0, 800)}`),
+    ...(input.artifacts || []).slice(0, 20).map(value => `Artifact: ${redactText(value).slice(0, 1_000)}`),
+    input.tokenUsage
+      ? `Efficiency: calls=${input.tokenUsage.calls}; input=${input.tokenUsage.input}; output=${input.tokenUsage.output}`
+      : '',
+  ].filter(Boolean);
+  const content = lines.join('\n').slice(0, 12_000);
+  const procedureSignature = successful
+    ? crypto.createHash('sha256').update([
+        input.taskType,
+        (boundedToolSummary || input.objective)
+          .toLowerCase()
+          .replace(/[a-f0-9]{8,}/g, '<id>')
+          .replace(/\b\d+\b/g, '<n>')
+          .replace(/\s+/g, ' ')
+          .slice(0, 2_000),
+      ].join('\n')).digest('hex')
+    : undefined;
+  const result = await memoryFetch('/api/memory/remember', {
+    content,
+    namespace,
+    type: memoryType,
+    metadata: {
+      confidence: successful ? 0.92 : 0.86,
+      importance: successful ? 9 : 8,
+      tags: [
+        'zenos-cognitive-outcome',
+        successful ? 'validated-procedure-candidate' : 'failure-memory',
+        input.taskType,
+        input.verdict,
+        input.deterministicValidation || 'validation-unknown',
+      ],
+      entities: ['Zenos Runtime', 'Hermes', input.taskType, input.model || 'unknown-model'],
+      provenance: {
+        created_by: 'zenos-cognitive-runtime-v1',
+        run_id: input.runId,
+        session_id: input.sessionId,
+      },
+      procedure_success_count: successful ? 1 : 0,
+      procedure_promotion_status: successful ? 'candidate' : undefined,
+      procedure_signature: procedureSignature,
+    },
+    idempotency_key: `cognitive-outcome:${input.runId}`,
+  }, { scopes: ['memory:read', 'memory:write'], timeoutMs: 30_000 });
+  if (result.ok) bumpNamespaceRevision(namespace, input.runId);
+  else if (!result.skipped) {
+    log('warn', 'Failed to persist cognitive Runtime outcome', {
+      runId: input.runId,
+      sessionId: input.sessionId,
+      status: result.status,
+      error: result.error,
+    });
+  }
+  return result;
+}
+
 export async function persistRouteEventToMemory(input: {
   namespace?: string;
   event: RouteEvent;
@@ -708,7 +873,7 @@ export async function memoryDependencyHealth(): Promise<{
   const started = Date.now();
   const dependencyTimeoutMs = /^(?:https?:\/\/)?(?:127\.0\.0\.1|localhost)(?::|\/|$)/i.test(memoryBaseUrl())
     ? 20_000
-    : 8_000;
+    : Math.max(10_000, Math.min(Number(process.env.ZENOS_MEMORY_HEALTH_TIMEOUT_MS || 25_000), 90_000));
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), dependencyTimeoutMs);
   try {

@@ -2,7 +2,7 @@
   "name": "zenos-runtime",
   "version": "0.7.0",
   "private": true,
-  "description": "Production-grade Zenos orchestration control plane with Host, Worker, Verifier, Boss, durable sessions, and policy-driven model routing.",
+  "description": "Host-led cognitive runtime for Hermes with native parallel workers, durable continuation capsules, evidence-led execution, and cognitive memory.",
   "scripts": {
     "dev": "next dev -p 3090",
     "build": "next build",
@@ -20,7 +20,6 @@
     "runtime:watch": "node --experimental-sqlite scripts/zenos-runtime-watch.mjs",
     "start:local": "node scripts/load-env-and-start.mjs",
     "runtime:local": "node scripts/zenos-runtime-local-client.mjs",
-    "wmodel": "node scripts/wmodel.mjs",
     "deploy:local": "bash scripts/install-control-plane-service.sh",
     "deploy:runtime-only": "ZENOS_DEPLOY_RESTART_HERMES=false bash scripts/install-control-plane-service.sh"
   },

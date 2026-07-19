@@ -27,7 +27,7 @@ function roleModels(config) {
   return {
     host: config.hostModel || process.env.ZENOS_HOST_MODEL || 'deepseek',
     worker: config.workerModel || process.env.ZENOS_WORKER_MODEL || 'deepseek',
-    verifier: config.verifierModel || process.env.ZENOS_VERIFIER_MODEL || 'ag/gemini-3.5-flash-low',
+    verifier: config.verifierModel || process.env.ZENOS_VERIFIER_MODEL || 'verifier-grok43-deepseek',
     boss: config.bossModel || process.env.ZENOS_BOSS_MODEL || config.hostModel || 'ag/gemini-pro-agent',
   };
 }

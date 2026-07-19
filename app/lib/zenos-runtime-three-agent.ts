@@ -425,12 +425,22 @@ export function updateSessionModelOverrides(sessionId: string, update: z.input<t
 
 export function getRuntimeModels() {
   return {
-    architecture: 'host-worker-boss-verifier',
+    architecture: 'host-led-cognitive-runtime-v1',
+    orchestrationMode: 'host-led',
+    modelPolicy: 'single-session-model-inherited-by-all-roles',
     roles: [
-      { role: 'host', tier: 'standard|premium', purpose: 'user-facing judgment, supervision, revision, and synthesis' },
-      { role: 'worker', tier: 'cheap|standard', purpose: 'bounded evidence extraction, compression, and tool-context preparation' },
-      { role: 'verifier', tier: 'cheap|premium', purpose: 'independent quality, grounding, safety, and validation gate' },
-      { role: 'boss', tier: 'premium', purpose: 'rare escalation judgment for critical risk or unresolved ambiguity' },
+      { role: 'host', tier: 'session-model', purpose: 'sole orchestrator, tool-loop owner, final judgment, and user-facing synthesis' },
+      { role: 'worker', tier: 'session-model', purpose: 'native Hermes subagent for bounded browser, repository, coding, validation, operations, or extraction work' },
+      { role: 'verifier', tier: 'session-model', purpose: 'explicit-only independent review; disabled for ordinary execution' },
+      { role: 'boss', tier: 'session-model', purpose: 'rare explicit, approval-boundary, or critical-risk authority' },
+    ],
+    nativeWorkerProfiles: [
+      'browser-research',
+      'repo-inspector',
+      'coding-worker',
+      'validation-worker',
+      'ops-observer',
+      'data-extractor',
     ],
     workerTemplates,
   };

@@ -1,18 +1,19 @@
 [Unit]
 Description=Hermes Agent Gateway - Zenos Profile
-After=network-online.target zenos-runtime.service srv-etla-workspaces.mount etla-ops-broker.service
-Wants=network-online.target zenos-runtime.service srv-etla-workspaces.mount etla-ops-broker.service
+After=network-online.target zenos-runtime.service srv-etla-workspaces.mount
+Wants=network-online.target zenos-runtime.service srv-etla-workspaces.mount
 StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-User=hermes
-Group=hermes
-SupplementaryGroups=etla-ops
-WorkingDirectory=/usr/local/lib/hermes-agent
-Environment=HOME=/var/lib/hermes
-Environment=USER=hermes
-Environment=LOGNAME=hermes
+# The operator explicitly requires Hermes to own the complete VPS control plane.
+# Keep this root-authoritative across restarts and Runtime redeployments.
+User=root
+Group=root
+WorkingDirectory=/root
+Environment=HOME=/root
+Environment=USER=root
+Environment=LOGNAME=root
 Environment=PATH=/usr/local/lib/hermes-agent/venv/bin:/usr/local/lib/hermes-agent/node_modules/.bin:/usr/local/bin:/usr/bin:/bin
 Environment=VIRTUAL_ENV=/usr/local/lib/hermes-agent/venv
 Environment=PYTHONPATH=/usr/local/lib/hermes-agent/venv/lib/python3.11/site-packages:/usr/local/lib/hermes-agent
@@ -29,29 +30,25 @@ ExecReload=/bin/kill -USR1 $MAINPID
 ExecStopPost=-/usr/local/lib/hermes-python/bin/python3.11 -m gateway.cgroup_cleanup
 TimeoutStopSec=210
 UMask=0077
-NoNewPrivileges=true
-CapabilityBoundingSet=
-AmbientCapabilities=
-PrivateTmp=true
-PrivateDevices=true
-ProtectSystem=strict
-ProtectHome=true
-ReadOnlyPaths=/usr/local/lib/hermes-agent /usr/local/lib/hermes-python /opt/zenos-runtime/current
-ReadWritePaths=/var/lib/hermes /srv/etla/workspaces
-ProtectHostname=true
-ProtectClock=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectKernelLogs=true
-ProtectControlGroups=true
-ProtectProc=invisible
+# Root-authoritative host mode: do not hide /root, remount the host read-only,
+# remove capabilities, isolate devices, or block kernel/service administration.
+NoNewPrivileges=false
+PrivateTmp=false
+PrivateDevices=false
+ProtectSystem=off
+ProtectHome=false
+ProtectHostname=false
+ProtectClock=false
+ProtectKernelTunables=false
+ProtectKernelModules=false
+ProtectKernelLogs=false
+ProtectControlGroups=false
+ProtectProc=default
 ProcSubset=all
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-RestrictNamespaces=true
-RestrictSUIDSGID=true
-LockPersonality=true
-RestrictRealtime=true
-SystemCallArchitectures=native
+RestrictNamespaces=false
+RestrictSUIDSGID=false
+LockPersonality=false
+RestrictRealtime=false
 LimitNOFILE=65536
 StandardOutput=journal
 StandardError=journal

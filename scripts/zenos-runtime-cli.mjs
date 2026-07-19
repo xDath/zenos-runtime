@@ -11,14 +11,11 @@ const defaultConfigPath = fs.existsSync('/root/.hermes/profiles/zenos')
 const configPath = process.env.ZENOS_RUNTIME_CONFIG_PATH || defaultConfigPath;
 const [, , rawCommand, ...args] = process.argv;
 const command = rawCommand || 'show';
-const roles = ['host', 'worker', 'verifier', 'boss'];
+const roles = ['host'];
 const builtIns = {
   baseUrl: '',
   provider: 'etla-router',
   hostModel: 'deepseek',
-  workerModel: 'deepseek',
-  verifierModel: 'ag/gemini-3.5-flash-low',
-  bossModel: 'ag/gemini-pro-agent',
 };
 
 function readConfig() {
@@ -51,12 +48,10 @@ function hasAnyKey(config) {
   );
 }
 
-function effective(config, role, suffix) {
-  const dedicated = config[`${role}${suffix}`];
-  if (dedicated) return dedicated;
-  if (suffix === 'Model') return config[`${role}Model`] || builtIns[`${role}Model`];
+function effective(config, _role, suffix) {
+  if (suffix === 'Model') return config.hostModel || builtIns.hostModel;
   if (suffix === 'Provider') return config.hostProvider || builtIns.provider;
-  if (suffix === 'BaseUrl') return config.baseUrl || process.env.ZENOS_LLM_BASE_URL || '(Hermes CLI transport)';
+  if (suffix === 'BaseUrl') return config.hostBaseUrl || config.baseUrl || process.env.ZENOS_LLM_BASE_URL || '(Hermes CLI transport)';
   return '';
 }
 
@@ -76,7 +71,8 @@ function printConfig(config) {
     sharedBaseUrl: config.baseUrl || process.env.ZENOS_LLM_BASE_URL || '(not set)',
     sharedProvider: config.hostProvider || builtIns.provider,
     hasApiKey: hasAnyKey(config),
-    roles: Object.fromEntries(roles.map((role) => [role, roleView(config, role)])),
+    model: roleView(config, 'host'),
+    inheritance: 'native Hermes workers and explicit review cycles inherit the Host model',
     precedence: ['built-in', 'environment', 'global config', 'session config', 'inline request override'],
   }, null, 2));
 }
@@ -119,22 +115,20 @@ async function wizard() {
     return answer || fallback || '';
   };
   try {
-    console.log('\nEtla Runtime model setup');
-    console.log('Host = user-facing synthesis, Worker = coding/tool work, Verifier = independent quality gate, Boss = rare premium judgment.');
+    console.log('\nEtla Cognitive Runtime model setup');
+    console.log('One session model powers Hermes Host and every native delegated worker.');
     console.log('API keys are not requested by this wizard. Keep using your existing Hermes/9Router credentials or set them separately.\n');
     const provider = await ask('Shared provider', current.hostProvider || builtIns.provider);
     const baseUrl = await ask('Shared OpenAI-compatible base URL', current.baseUrl || process.env.ZENOS_LLM_BASE_URL || '');
     const next = { ...current };
-    if (provider) {
-      next.hostProvider = provider;
-      next.workerProvider = provider;
-      next.verifierProvider = provider;
-      next.bossProvider = provider;
-    }
+    if (provider) next.hostProvider = provider;
     if (baseUrl) next.baseUrl = baseUrl;
-    for (const role of roles) {
-      next[`${role}Model`] = await ask(`${role[0].toUpperCase()}${role.slice(1)} model`, current[`${role}Model`] || builtIns[`${role}Model`]);
-    }
+    next.hostModel = await ask('Session model', current.hostModel || builtIns.hostModel);
+    for (const legacyKey of [
+      'workerModel', 'workerProvider', 'workerBaseUrl', 'workerApiKey',
+      'verifierModel', 'verifierProvider', 'verifierBaseUrl', 'verifierApiKey',
+      'bossModel', 'bossProvider', 'bossBaseUrl', 'bossApiKey',
+    ]) delete next[legacyKey];
     writeConfig(next);
     console.log('\nSaved model configuration. Restart zenos-runtime.service only when changing service-level environment; file model changes are read on new runs.\n');
     printConfig(next);
@@ -145,9 +139,7 @@ async function wizard() {
 
 function doctor(config) {
   const problems = [];
-  for (const role of roles) {
-    if (!effective(config, role, 'Model')) problems.push(`${role} model is missing`);
-  }
+  if (!effective(config, 'host', 'Model')) problems.push('session model is missing');
   if (hasAnyKey(config) && !(config.baseUrl || process.env.ZENOS_LLM_BASE_URL || process.env.MEMORY_LLM_BASE_URL)) {
     problems.push('HTTP credentials exist but no shared/dedicated base URL is configured');
   }
@@ -164,7 +156,7 @@ function doctor(config) {
     problems,
     nextCommands: [
       'npm run runtime:setup',
-      'npm run runtime:config -- role worker build --provider etla-router',
+      'npm run runtime:config -- model deepseek --provider etla-router',
       'npm run runtime:config -- show',
     ],
   }, null, 2));
@@ -172,10 +164,8 @@ function doctor(config) {
 }
 
 const aliases = {
+  '/model': 'hostModel', model: 'hostModel',
   '/hmodel': 'hostModel', hmodel: 'hostModel',
-  '/wmodel': 'workerModel', wmodel: 'workerModel',
-  '/bmodel': 'bossModel', bmodel: 'bossModel',
-  '/vmodel': 'verifierModel', vmodel: 'verifierModel',
   '/runtime-base-url': 'baseUrl', 'runtime-base-url': 'baseUrl',
   '/runtime-api-key': 'apiKey', 'runtime-api-key': 'apiKey',
 };
@@ -192,9 +182,11 @@ try {
     fs.chmodSync(configPath, 0o600);
     console.log(`Secured ${configPath} to mode 0600.`);
     doctor(readConfig());
-  } else if (command === 'role') {
+  } else if (command === 'role' || command === 'model') {
     const { positional, flags } = parseFlags(args);
-    const [role, model] = positional;
+    const [first, second] = positional;
+    const role = command === 'role' ? first : 'host';
+    const model = command === 'role' ? second : first;
     const config = setRole(readConfig(), role, model, flags);
     writeConfig(config);
     printConfig(config);
@@ -218,12 +210,10 @@ try {
   npm run runtime:config -- show
   npm run runtime:config -- doctor
   npm run runtime:config -- secure
+  npm run runtime:config -- model MODEL [--provider PROVIDER] [--base-url URL]
   npm run runtime:config -- role host MODEL [--provider PROVIDER] [--base-url URL]
-  npm run runtime:config -- role worker MODEL
-  npm run runtime:config -- role verifier MODEL
-  npm run runtime:config -- role boss MODEL
-  npm run runtime:config -- clear-role ROLE
-  npm run runtime:config -- /hmodel MODEL | /wmodel MODEL | /vmodel MODEL | /bmodel MODEL`);
+  npm run runtime:config -- clear-role host
+  npm run runtime:config -- /model MODEL | /hmodel MODEL`);
     process.exitCode = 2;
   }
 } catch (error) {

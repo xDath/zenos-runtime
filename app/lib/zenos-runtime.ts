@@ -1,6 +1,6 @@
 import { z } from 'zod';
 
-export const RUNTIME_POLICY_VERSION = '2026.07.13-v4-personal-economy';
+export const RUNTIME_POLICY_VERSION = '2026.07.19-v5-contextual-verification';
 
 export const TaskTypeSchema = z.enum([
   'simple_chat',
@@ -203,9 +203,19 @@ const MEMORY_PATTERN = /\b(remember|memory|recall|bootstrap|compact|previous|seb
 const ARCH_PATTERN = /\b(architecture|arsitektur|roadmap|design|desain|strategy|strategi|rfc|spec(?:ification)?|rancang|rencana|planning|plan)\b/i;
 const DEBUG_PATTERN = /\b(debug|error|exception|stack trace|traceback|crash|gagal|nggak jalan|tidak jalan|bug|race condition|deadlock|memory leak|segfault|panic)\b/i;
 const CODE_PATTERN = /\b(patch|implement|implementation|refactor|typescript|javascript|python|golang|go code|rust|java|kotlin|php|repository|repo|source(?: code)?|kode|coding|ngoding|function|fungsi|class|module|package|lint|unit test|integration test|test terkait|api|endpoint|route|handler|controller|service|schema|database|migration|migrasi|table|kolom|column|query|sql|frontend|backend|component|hook|build|compile)\b/i;
+const OPERATIONAL_TOOL_PATTERN = /\b(tool|tools|skill|skills|workspace|terminal|script|file|folder|project|proyek|live check|cek live|status live)\b/i;
 const DESTRUCTIVE_PATTERN = /\b(rm\s+-rf|drop\s+(?:table|database)|truncate\s+table|reset\s+--hard|force\s+push|git\s+push\s+--force|wipe|destroy|hapus\s+semua|delete\s+all|format\s+disk)\b/i;
 const DEPLOY_ACTION_PATTERN = /(?:\b(deploy|release|rollback|publish|push)\b.{0,30}\b(prod|production|sekarang|now|live)\b)|(?:\b(prod|production|live)\b.{0,30}\b(deploy|release|rollback|publish|push)\b)/i;
 const MUTATION_PATTERN = /\b(edit|ubah|change|fix|perbaiki|benerin|betulin|buat|bikin|tambahkan?|tambah|create|generate|delete|hapus|implement(?:asi)?|refactor|deploy|release|restart|install|update|upgrade|migrate|migrasi|replace|ganti)\b/i;
+const KEEP_VERIFIER_PATTERN = /\b(?:do not|don't|jangan)\s+(?:disable|turn off|matikan|nonaktifkan)\s+(?:the\s+)?verifier\b/i;
+const VERIFIER_OPT_OUT_PATTERN = /(?:\b(?:jangan|tanpa|without|skip|disable|matikan|nonaktifkan|off|ga\s+usah|gak\s+usah|nggak\s+usah|tidak\s+usah|do\s+not|don't)\b.{0,36}\bverifier\b)|(?:\bverifier\b.{0,28}\b(?:off|disable|disabled|mati|skip|jangan\s+dipakai|jangan\s+dipake|ga\s+usah|gak\s+usah|nggak\s+usah|tidak\s+usah)\b)|(?:\bhost\b.{0,24}\b(?:sebagai|as|jadi|jadiin)\b.{0,16}\bverifier\b)/i;
+
+export function userExplicitlyDisabledVerifier(request: string): boolean {
+  const text = String(request || '').trim();
+  if (!text || !/\bverifier\b/i.test(text)) return false;
+  if (KEEP_VERIFIER_PATTERN.test(text)) return false;
+  return VERIFIER_OPT_OUT_PATTERN.test(text);
+}
 
 function sizeBucket(tokens: number): RouteEvent['inputSizeBucket'] {
   if (tokens < 1_500) return 'small';
@@ -246,7 +256,8 @@ export function classifyTask(input: RuntimeContext): TaskType {
   if (hasSummaryIntent(text)) return 'summarization';
   if (MEMORY_PATTERN.test(text)) return 'memory_question';
   if (ARCH_PATTERN.test(text)) return 'planning_or_architecture';
-  if (CODE_PATTERN.test(text) || context.hasFiles || context.hasLogs) {
+  const operationalToolRequest = context.intent !== 'explain' && OPERATIONAL_TOOL_PATTERN.test(text);
+  if (CODE_PATTERN.test(text) || operationalToolRequest || context.hasFiles || context.hasLogs) {
     if (context.intent === 'execute' || context.intent === 'mutate' || MUTATION_PATTERN.test(text)) return 'coding_change';
     return 'repo_question';
   }
@@ -260,7 +271,7 @@ export function assessRisk(taskType: TaskType, input: RuntimeContext): RiskLevel
   if (taskType === 'deploy_or_destructive_action') return context.intent === 'execute' || context.intent === 'mutate' ? 'critical' : 'high';
   if (taskType === 'security_or_secret') return 'high';
   if (context.containsUntrustedInput && (taskType === 'coding_change' || taskType === 'repo_question')) return 'high';
-  if (context.userRequestedVerification) return 'high';
+  if (context.userRequestedVerification && !userExplicitlyDisabledVerifier(context.request)) return 'high';
   if (taskType === 'coding_change' || taskType === 'debugging' || taskType === 'planning_or_architecture') return 'medium';
   return 'low';
 }
@@ -366,7 +377,7 @@ export function choosePipeline(input: RuntimeContext): RouteDecision {
     reasons.push(lowConfidence ? 'low confidence permits Boss escalation' : 'risk requires verifier and escalation policy');
   }
 
-  if (context.userRequestedVerification) {
+  if (context.userRequestedVerification && !userExplicitlyDisabledVerifier(context.request)) {
     useVerifier = true;
     verifierTier = verifierTier === 'none' ? 'cheap' : verifierTier;
     maxRevisionAttempts = Math.max(maxRevisionAttempts, 1);
@@ -393,6 +404,20 @@ export function choosePipeline(input: RuntimeContext): RouteDecision {
     useTools = true;
     requiresSourceContext = true;
     reasons.push('fresh external data is required');
+  }
+
+  if (userExplicitlyDisabledVerifier(context.request)) {
+    useVerifier = false;
+    verifierTier = 'none';
+    maxRevisionAttempts = 0;
+    if (!useBoss) {
+      pipelineMode = useWorker
+        ? 'worker_compression_path'
+        : useTools || useMemory
+          ? 'grounded_path'
+          : 'direct_fast_path';
+    }
+    reasons.push('user explicitly disabled the independent Verifier; Host retains final self-review');
   }
 
   return RouteDecisionSchema.parse({
@@ -465,6 +490,7 @@ const baseRuntimeEvalCases: RuntimeEvalCase[] = [
   { name: 'low confidence escalates', input: { request: 'jawab pertanyaan ambigu ini', confidence: 0.2 }, expect: { useVerifier: true, useBoss: true, pipelineMode: 'escalated_deep_path' } },
   { name: 'user verification enables verifier', input: { request: 'jawab ini', userRequestedVerification: true }, expect: { useVerifier: true } },
   { name: 'fresh data requires tools', input: { request: 'cek informasi terbaru', requiresFreshData: true }, expect: { useTools: true } },
+  { name: 'operational tool inspection is repository-grounded', input: { request: 'coba cari skill atau tools yang tersedia', intent: 'analyze' }, expect: { taskType: 'repo_question', useTools: true } },
   { name: 'untrusted code input raises risk', input: { request: 'review source code ini', hasFiles: true, containsUntrustedInput: true }, expect: { risk: 'high', useVerifier: true } },
   { name: 'small summary stays with Host', input: { request: 'summarize catatan ini', estimatedContextTokens: 500 }, expect: { taskType: 'summarization', useWorker: false } },
   { name: 'natural Indonesian endpoint creation is coding', input: { request: 'tolong bikin endpoint login baru di project ini', intent: 'mutate' }, expect: { taskType: 'coding_change', useTools: true, useWorker: true } },

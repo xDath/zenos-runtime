@@ -20,10 +20,14 @@ Environment=PORT=3090
 Environment=ZENOS_BIND_HOST=127.0.0.1
 Environment=ZENOS_RUNTIME_DB_PATH=/var/lib/zenos-runtime/runtime.db
 Environment=ZENOS_MEMORY_BASE_URL=https://zenos-memory.vercel.app
+Environment=ZENOS_MEMORY_TIMEOUT_MS=20000
+Environment=ZENOS_MEMORY_HEALTH_TIMEOUT_MS=25000
+Environment=ZENOS_RUNTIME_AUTHORITATIVE_HOST=true
+Environment=ZENOS_ORCHESTRATION_MODE=host-led
+Environment=ZENOS_COGNITIVE_MAX_CONTINUATIONS=6
+Environment=ZENOS_COGNITIVE_COMPACT_AT_TOKENS=160000
 Environment=ZENOS_RUNTIME_LEGACY_STORE_PATH=/var/lib/zenos-runtime/legacy-sessions.json
 Environment=ZENOS_RUNTIME_CONFIG_PATH=/var/lib/zenos-runtime/models.json
-Environment=ZENOS_VERIFIER_MODEL=ag/gemini-3.5-flash-low
-Environment=ZENOS_VERIFIER_PROVIDER=etla-router
 Environment=ZENOS_RUNTIME_SESSION_MODEL_DIR=/var/lib/zenos-runtime/session-models
 Environment=ZENOS_RUNTIME_REPOSITORY_INDEX_DIR=/var/cache/zenos-runtime/repository-index
 Environment=ZENOS_RUNTIME_CODING_CHECKPOINT_DIR=/var/lib/zenos-runtime/coding-checkpoints
