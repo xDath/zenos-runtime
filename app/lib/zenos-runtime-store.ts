@@ -1398,11 +1398,17 @@ export class RuntimeStore {
         SET status = 'cancelled', lease_owner = NULL, lease_token_hash = NULL,
             lease_expires_at = NULL, lease_heartbeat_at = NULL,
             completed_at = ?, updated_at = ?
-        WHERE status IN ('queued', 'leased') AND (
+        WHERE (
+          status = 'queued'
+          OR (
+            status = 'leased'
+            AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+          )
+        ) AND (
           NOT EXISTS (SELECT 1 FROM cognitive_tasks t WHERE t.task_id = continuation_queue.task_id AND t.status = 'active')
           OR NOT EXISTS (SELECT 1 FROM sessions s WHERE s.session_id = continuation_queue.session_id AND s.status = 'working')
         )
-      `).run(nowIso, nowIso);
+      `).run(nowIso, nowIso, nowIso);
 
       const orphanTasks = this.db.prepare(`
         SELECT t.* FROM cognitive_tasks t

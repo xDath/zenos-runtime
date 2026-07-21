@@ -473,7 +473,9 @@ test('continuation janitor cancels terminal-session leases and orphan cognitive 
     status: 'cancelled',
     updatedAt: new Date().toISOString(),
   });
-  const reconciled = store.reconcileContinuationState();
+  const reconciled = store.reconcileContinuationState(
+    new Date(Date.parse(leased?.leaseExpiresAt || timestamp) + 1).toISOString(),
+  );
 
   assert.equal(reconciled.cancelled, 1);
   assert.equal(reconciled.tasksCancelled, 1);
@@ -482,6 +484,65 @@ test('continuation janitor cancels terminal-session leases and orphan cognitive 
   const records = store.cancelContinuationsForRun('run-continuation-janitor');
   assert.equal(records[0]?.status, 'cancelled');
   assert.ok(records[0]?.completedAt);
+  store.close();
+});
+
+test('continuation janitor preserves a valid terminal-task lease until token-bound acknowledgement', () => {
+  const store = new RuntimeStore(':memory:');
+  const timestamp = new Date(Date.now() - 5_000).toISOString();
+  seedActiveContinuationParents(store, {
+    sessionId: 'session-terminal-awaiting-ack',
+    taskId: 'cognitive-terminal-awaiting-ack',
+    runId: 'run-terminal-awaiting-ack',
+    timestamp,
+  });
+  store.enqueueContinuation({
+    continuationId: 'continuation-terminal-awaiting-ack',
+    taskId: 'cognitive-terminal-awaiting-ack',
+    runId: 'run-terminal-awaiting-ack',
+    sessionId: 'session-terminal-awaiting-ack',
+    status: 'queued',
+    prompt: 'Continue the root task.',
+    reason: 'ack race regression',
+    attempt: 1,
+    maxAttempts: 6,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  });
+  const leased = store.claimContinuationForSession('session-terminal-awaiting-ack');
+  assert.ok(leased?.leaseToken);
+  const task = store.getCognitiveTask('cognitive-terminal-awaiting-ack');
+  const session = store.getSession('session-terminal-awaiting-ack');
+  assert.ok(task);
+  assert.ok(session);
+  store.saveCognitiveTask({
+    ...task!,
+    status: 'completed',
+    phase: 'complete',
+    capsule: { ...(task!.capsule as Record<string, unknown>), status: 'completed' },
+    updatedAt: new Date().toISOString(),
+  });
+  store.saveSession({
+    ...session!,
+    status: 'done',
+    activeRunId: undefined,
+    updatedAt: new Date().toISOString(),
+  });
+
+  const reconciled = store.reconcileContinuationState();
+  assert.equal(reconciled.cancelled, 0);
+  assert.equal(reconciled.tasksCancelled, 0);
+  assert.equal(reconciled.sessionsTerminalized, 0);
+  const stillLeased = store.claimContinuationForSession('session-terminal-awaiting-ack');
+  assert.equal(stillLeased, undefined, 'an unexpired lease remains owned and cannot be reclaimed');
+  const acknowledged = store.completeContinuation(
+    'continuation-terminal-awaiting-ack',
+    false,
+    leased?.leaseToken,
+  );
+  assert.equal(acknowledged?.status, 'completed');
+  assert.equal(store.getCognitiveTask('cognitive-terminal-awaiting-ack')?.status, 'completed');
+  assert.equal(store.getSession('session-terminal-awaiting-ack')?.status, 'done');
   store.close();
 });
 
