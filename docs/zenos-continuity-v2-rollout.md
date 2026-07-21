@@ -33,13 +33,14 @@ ZENOS_RUNTIME_COMMAND_JOBS_ENABLED=true
 ZENOS_RUNTIME_EVIDENCE_FAITHFULNESS_ENABLED=true
 ```
 
-Memory production setting:
+Memory production settings:
 
 ```env
 ZENOS_MEMORY_EVIDENCE_FAITHFULNESS_ENABLED=true
+ZENOS_MEMORY_CONTINUITY_LLM_ENABLED=false
 ```
 
-The Runtime evidence flag requires an explicit `checkpoint_validated=true` receipt before persisting coordinator state. The Memory evidence flag controls the claim-to-evidence gate itself.
+The Runtime evidence flag requires an explicit `checkpoint_validated=true` receipt before persisting coordinator state. The Memory evidence flag controls the claim-to-evidence gate itself. Continuity packets are deterministic-first by default so packet validation, Drive persistence, and checkpoint chaining stay inside the serverless write deadline; LLM continuity compaction is an explicit shadow-only opt-in.
 
 Hermes profile settings:
 
@@ -55,9 +56,10 @@ Rollback order:
 1. Disable `ZENOS_RUNTIME_COMMAND_JOBS_ENABLED` to return to cognitive-task-only continuation without removing schema v12 tables.
 2. Disable `ZENOS_RUNTIME_CONTINUITY_COORDINATOR_ENABLED` to return to legacy pressure-triggered Memory compaction.
 3. Set `continuity_packet_v2: false` in Hermes only if the Runtime/Memory packet contract itself must be bypassed. Legacy `handoffMessages` remains available.
-4. Keep `fail_closed_mutations: true` unless an operator intentionally accepts unverified mutation during a Runtime outage.
-5. Runtime release rollback remains the immutable `/opt/zenos-runtime/previous` symlink managed by `scripts/install-control-plane-service.sh`.
-6. Memory rollback uses the prior Vercel production deployment. Continuity v2 checkpoints remain audit data and do not need deletion.
+4. Keep `ZENOS_MEMORY_CONTINUITY_LLM_ENABLED=false` unless a measured shadow deployment proves the LLM path fits the function deadline and preserves checkpoint parity.
+5. Keep `fail_closed_mutations: true` unless an operator intentionally accepts unverified mutation during a Runtime outage.
+6. Runtime release rollback remains the immutable `/opt/zenos-runtime/previous` symlink managed by `scripts/install-control-plane-service.sh`.
+7. Memory rollback uses the prior Vercel production deployment. Continuity v2 checkpoints remain audit data and do not need deletion.
 
 Do not downgrade the SQLite schema manually. Old releases ignore the additive tables.
 
