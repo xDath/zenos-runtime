@@ -254,6 +254,96 @@ test('cognitive brief local mirror survives a Runtime restart and preserves evid
   }
 });
 
+test('failed hot-path cognitive brief seeds the persistent mirror asynchronously', async () => {
+  const originalFetch = globalThis.fetch;
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zenos-brief-async-seed-'));
+  const mirrorPath = path.join(directory, 'brief-cache.json');
+  const previous = {
+    baseUrl: process.env.ZENOS_MEMORY_BASE_URL,
+    apiKey: process.env.ZENOS_MEMORY_API_KEY,
+    disabled: process.env.ZENOS_RUNTIME_DISABLE_MEMORY,
+    mirrorPath: process.env.ZENOS_MEMORY_BRIEF_CACHE_PATH,
+    seedTimeout: process.env.ZENOS_MEMORY_COGNITIVE_BRIEF_SEED_TIMEOUT_MS,
+  };
+  process.env.ZENOS_MEMORY_BASE_URL = 'http://memory.test';
+  process.env.ZENOS_MEMORY_API_KEY = 'test-memory-key';
+  process.env.ZENOS_MEMORY_BRIEF_CACHE_PATH = mirrorPath;
+  process.env.ZENOS_MEMORY_COGNITIVE_BRIEF_SEED_TIMEOUT_MS = '15000';
+  delete process.env.ZENOS_RUNTIME_DISABLE_MEMORY;
+  let cloudBriefCalls = 0;
+  globalThis.fetch = async (input: string | URL | Request) => {
+    if (String(input) === 'http://memory.test/api/memory/revision') {
+      return Response.json({ success: true, namespace: 'project', revision: 'revision-async-seed-0001' });
+    }
+    assert.equal(String(input), 'http://memory.test/api/memory/cognitive-brief');
+    cloudBriefCalls += 1;
+    if (cloudBriefCalls === 1) {
+      return Response.json({ success: false, error: 'cold Drive materialization still warming' }, { status: 503 });
+    }
+    return Response.json({
+      success: true,
+      brief: {
+        version: 'zenos-cognitive-brief-v1',
+        objective: 'repair cold-start continuity',
+        phase: 'repair',
+        namespaces: ['project'],
+        sections: {
+          current_state: [{ id: 'memory-async-seed-1', namespace: 'project', content: 'state' }],
+        },
+        unknowns: [],
+        retrieval: {},
+        content: '# ZENOS COGNITIVE BRIEF\nSeeded after the hot-path request returned.',
+      },
+    });
+  };
+
+  try {
+    const hotPath = await cognitiveMemoryBrief({
+      objective: 'repair cold-start continuity',
+      phase: 'repair',
+      namespace: 'project',
+    });
+    assert.equal(hotPath.ok, false);
+    assert.equal(hotPath.status, 503);
+
+    for (let attempt = 0; attempt < 50 && cloudBriefCalls < 2; attempt += 1) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.equal(cloudBriefCalls, 2);
+    await new Promise(resolve => setTimeout(resolve, 20));
+
+    resetMemoryClientForTests();
+    globalThis.fetch = async () => {
+      throw new Error('cloud unavailable after asynchronous seed');
+    };
+    const mirrored = await cognitiveMemoryBrief({
+      objective: 'repair cold-start continuity',
+      phase: 'repair',
+      namespace: 'project',
+    });
+    assert.equal(mirrored.ok, true);
+    assert.equal(mirrored.cacheHit, true);
+    assert.equal(mirrored.latencyMs, 0);
+    assert.match(mirrored.value || '', /Seeded after the hot-path request returned/);
+    assert.deepEqual(mirrored.evidenceRefs, [
+      { id: 'memory-async-seed-1', namespace: 'project' },
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (previous.baseUrl === undefined) delete process.env.ZENOS_MEMORY_BASE_URL;
+    else process.env.ZENOS_MEMORY_BASE_URL = previous.baseUrl;
+    if (previous.apiKey === undefined) delete process.env.ZENOS_MEMORY_API_KEY;
+    else process.env.ZENOS_MEMORY_API_KEY = previous.apiKey;
+    if (previous.disabled === undefined) delete process.env.ZENOS_RUNTIME_DISABLE_MEMORY;
+    else process.env.ZENOS_RUNTIME_DISABLE_MEMORY = previous.disabled;
+    if (previous.mirrorPath === undefined) delete process.env.ZENOS_MEMORY_BRIEF_CACHE_PATH;
+    else process.env.ZENOS_MEMORY_BRIEF_CACHE_PATH = previous.mirrorPath;
+    if (previous.seedTimeout === undefined) delete process.env.ZENOS_MEMORY_COGNITIVE_BRIEF_SEED_TIMEOUT_MS;
+    else process.env.ZENOS_MEMORY_COGNITIVE_BRIEF_SEED_TIMEOUT_MS = previous.seedTimeout;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('Runtime recall feedback groups evidence by namespace and uses idempotent outcomes', async () => {
   const originalFetch = globalThis.fetch;
   const previous = {

@@ -120,6 +120,7 @@ let circuit: CircuitState = { failures: 0, openUntil: 0 };
 const inFlightTokens = new Map<string, Promise<string>>();
 const namespaceRevisions = new Map<string, { revision: string; expiresAt: number }>();
 const inFlightRevisions = new Map<string, Promise<string>>();
+const inFlightBriefSeeds = new Map<string, Promise<void>>();
 type PersistentBriefRecord = {
   value: string;
   evidenceRefs: MemoryEvidenceRef[];
@@ -373,10 +374,11 @@ async function memoryFetch<T>(
     parser?: z.ZodType<T, z.ZodTypeDef, unknown>;
     retry401?: boolean;
     idempotencyKey?: string;
+    bypassCircuit?: boolean;
   } = {},
 ): Promise<MemoryClientResult<T>> {
   if (!memoryEnabled()) return { ok: false, skipped: true, error: 'Zenos Memory integration is disabled', degraded: true };
-  const circuitError = checkCircuit();
+  const circuitError = options.bypassCircuit ? null : checkCircuit();
   if (circuitError) return { ok: false, skipped: true, error: circuitError, degraded: true };
   const started = Date.now();
   const scopes = options.scopes || ['memory:read'];
@@ -627,7 +629,11 @@ export async function cognitiveMemoryBrief(input: {
     Math.min(Number(process.env.ZENOS_MEMORY_COGNITIVE_BRIEF_MAX_STALE_MS || 24 * 60 * 60 * 1_000), 7 * 24 * 60 * 60 * 1_000),
   );
   const phase = input.phase || '';
-  const fetchBrief = () => memoryFetch<z.infer<typeof CognitiveBriefResponseSchema>>('/api/memory/cognitive-brief', {
+  const hotTimeoutMs = Math.max(
+    2_000,
+    Math.min(Number(process.env.ZENOS_MEMORY_COGNITIVE_BRIEF_TIMEOUT_MS || 6_000), 12_000),
+  );
+  const fetchBrief = (timeoutMs = hotTimeoutMs, bypassCircuit = false) => memoryFetch<z.infer<typeof CognitiveBriefResponseSchema>>('/api/memory/cognitive-brief', {
     objective: input.objective,
     phase: input.phase,
     latest_error: input.latestError,
@@ -640,7 +646,8 @@ export async function cognitiveMemoryBrief(input: {
   }, {
     scopes: ['memory:read'],
     parser: CognitiveBriefResponseSchema,
-    timeoutMs: Math.max(2_000, Math.min(Number(process.env.ZENOS_MEMORY_COGNITIVE_BRIEF_TIMEOUT_MS || 6_000), 12_000)),
+    timeoutMs,
+    bypassCircuit,
   });
   const storeFreshBrief = (
     result: MemoryClientResult<z.infer<typeof CognitiveBriefResponseSchema>>,
@@ -665,6 +672,32 @@ export async function cognitiveMemoryBrief(input: {
     return cachedValue;
   };
 
+  const seedBriefMirror = (): void => {
+    if (inFlightBriefSeeds.has(staleKey)) return;
+    const backgroundTimeoutMs = Math.max(
+      15_000,
+      Math.min(Number(process.env.ZENOS_MEMORY_COGNITIVE_BRIEF_SEED_TIMEOUT_MS || 60_000), 90_000),
+    );
+    const seed = fetchBrief(backgroundTimeoutMs, true)
+      .then((result) => {
+        if (storeFreshBrief(result)) {
+          incrementMetric('memory_cognitive_brief_seed_total', { result: 'success' });
+        } else {
+          incrementMetric('memory_cognitive_brief_seed_total', { result: 'failed' });
+        }
+      })
+      .catch((error) => {
+        incrementMetric('memory_cognitive_brief_seed_total', { result: 'failed' });
+        log('warn', 'Background Memory brief seed failed', {
+          error: error instanceof Error ? redactText(error.message) : redactText(String(error)),
+        });
+      })
+      .finally(() => {
+        inFlightBriefSeeds.delete(staleKey);
+      });
+    inFlightBriefSeeds.set(staleKey, seed);
+  };
+
   const localMirror = bestPersistentBrief({
     exactKey: staleKey,
     objective: input.objective,
@@ -675,7 +708,7 @@ export async function cognitiveMemoryBrief(input: {
   if (localMirror) {
     // Local mirror is authoritative for latency, while cloud refresh is
     // best-effort and never blocks the Host turn.
-    void fetchBrief().then(storeFreshBrief).catch(() => undefined);
+    seedBriefMirror();
     incrementMetric('memory_cognitive_brief_local_mirror_total');
     return {
       ok: true,
@@ -693,6 +726,7 @@ export async function cognitiveMemoryBrief(input: {
   if (stored !== undefined) {
     return { ...result, value: stored.value, evidenceRefs: stored.evidenceRefs };
   }
+  seedBriefMirror();
   return {
     ok: false,
     skipped: result.skipped,
@@ -1257,6 +1291,7 @@ export function resetMemoryClientForTests(): void {
   inFlightTokens.clear();
   namespaceRevisions.clear();
   inFlightRevisions.clear();
+  inFlightBriefSeeds.clear();
   lastKnownCognitiveBriefs.clear();
   persistentBriefsLoaded = false;
   circuit = { failures: 0, openUntil: 0 };

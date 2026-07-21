@@ -186,7 +186,12 @@ export class RuntimeStore {
       log('warn', 'Recovered orphaned coding tasks after process restart', { recoveredCodingTasks });
     }
     const continuationRecovery = this.reconcileContinuationState();
-    if (continuationRecovery.requeued || continuationRecovery.cancelled || continuationRecovery.tasksCancelled) {
+    if (
+      continuationRecovery.requeued
+      || continuationRecovery.cancelled
+      || continuationRecovery.tasksCancelled
+      || continuationRecovery.sessionsTerminalized
+    ) {
       log('warn', 'Reconciled durable continuation state after process restart', continuationRecovery);
     }
   }
@@ -1376,6 +1381,7 @@ export class RuntimeStore {
     requeued: number;
     cancelled: number;
     tasksCancelled: number;
+    sessionsTerminalized: number;
   } {
     return this.transaction(() => {
       const requeued = this.db.prepare(`
@@ -1424,10 +1430,94 @@ export class RuntimeStore {
         const result = updateTask.run(json(nextCapsule), nowIso, asString(row.task_id));
         tasksCancelled += Number(result.changes || 0);
       }
+
+      // A crashed or explicitly cancelled continuation can leave the parent
+      // session marked `working` even after every child saga is terminal. Such
+      // rows are operationally misleading and can suppress future recovery.
+      // Terminalize only when there is no live run, cognitive task, or queued
+      // continuation left for the session.
+      const strandedSessions = this.db.prepare(`
+        SELECT s.*
+        FROM sessions s
+        WHERE s.status = 'working'
+          AND NOT EXISTS (
+            SELECT 1 FROM runtime_runs r
+            WHERE r.session_id = s.session_id
+              AND r.status IN ('queued', 'running', 'revising', 'escalated')
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM cognitive_tasks t
+            WHERE t.session_id = s.session_id AND t.status = 'active'
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM continuation_queue q
+            WHERE q.session_id = s.session_id AND q.status IN ('queued', 'leased')
+          )
+          AND (
+            EXISTS (SELECT 1 FROM cognitive_tasks t WHERE t.session_id = s.session_id)
+            OR EXISTS (SELECT 1 FROM continuation_queue q WHERE q.session_id = s.session_id)
+          )
+      `).all();
+      const latestTaskStatus = this.db.prepare(`
+        SELECT status FROM cognitive_tasks
+        WHERE session_id = ?
+        ORDER BY updated_at DESC, created_at DESC LIMIT 1
+      `);
+      const latestContinuationStatus = this.db.prepare(`
+        SELECT status FROM continuation_queue
+        WHERE session_id = ?
+        ORDER BY updated_at DESC, created_at DESC LIMIT 1
+      `);
+      const updateSession = this.db.prepare(`
+        UPDATE sessions
+        SET status = ?, active_run_id = NULL, last_error = ?, metadata_json = ?,
+            version = version + 1, updated_at = ?
+        WHERE session_id = ? AND status = 'working'
+      `);
+      let sessionsTerminalized = 0;
+      for (const row of strandedSessions) {
+        const sessionId = asString(row.session_id);
+        const taskStatus = asString(latestTaskStatus.get(sessionId)?.status);
+        const continuationStatus = asString(latestContinuationStatus.get(sessionId)?.status);
+        const status = taskStatus === 'completed'
+          ? 'done'
+          : taskStatus === 'failed'
+            ? 'failed'
+            : taskStatus === 'cancelled'
+              ? 'cancelled'
+              : continuationStatus === 'completed'
+                ? 'done'
+                : 'cancelled';
+        const metadata = parseJson<Record<string, unknown>>(row.metadata_json, {});
+        const reason = status === 'done'
+          ? 'All continuation work reached a terminal completed state.'
+          : status === 'failed'
+            ? 'The root cognitive task failed and no live continuation remains.'
+            : 'The root cognitive task was cancelled and no live continuation remains.';
+        const lastError = status === 'done'
+          ? (row.last_error ? asString(row.last_error) : null)
+          : (row.last_error ? asString(row.last_error) : reason);
+        const result = updateSession.run(
+          status,
+          lastError,
+          json({
+            ...metadata,
+            continuationJanitor: {
+              terminalizedAt: nowIso,
+              terminalStatus: status,
+              reason,
+            },
+          }),
+          nowIso,
+          sessionId,
+        );
+        sessionsTerminalized += Number(result.changes || 0);
+      }
       return {
         requeued: Number(requeued.changes || 0),
         cancelled: Number(cancelled.changes || 0),
         tasksCancelled,
+        sessionsTerminalized,
       };
     });
   }

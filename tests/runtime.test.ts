@@ -477,10 +477,98 @@ test('continuation janitor cancels terminal-session leases and orphan cognitive 
 
   assert.equal(reconciled.cancelled, 1);
   assert.equal(reconciled.tasksCancelled, 1);
+  assert.equal(reconciled.sessionsTerminalized, 0);
   assert.equal(store.getCognitiveTask('cognitive-continuation-janitor')?.status, 'cancelled');
   const records = store.cancelContinuationsForRun('run-continuation-janitor');
   assert.equal(records[0]?.status, 'cancelled');
   assert.ok(records[0]?.completedAt);
+  store.close();
+});
+
+test('continuation janitor terminalizes stranded working sessions after child sagas end', () => {
+  const store = new RuntimeStore(':memory:');
+  const timestamp = new Date(Date.now() - 5_000).toISOString();
+  seedActiveContinuationParents(store, {
+    sessionId: 'session-stranded-continuation',
+    taskId: 'cognitive-stranded-continuation',
+    runId: 'run-stranded-continuation',
+    timestamp,
+  });
+  store.saveCognitiveTask({
+    taskId: 'cognitive-older-completed',
+    rootRunId: 'run-older-completed',
+    activeRunId: undefined,
+    sessionId: 'session-stranded-continuation',
+    status: 'completed',
+    phase: 'complete',
+    capsule: { status: 'completed', updatedAt: new Date(Date.parse(timestamp) - 5_000).toISOString() },
+    createdAt: new Date(Date.parse(timestamp) - 5_000).toISOString(),
+    updatedAt: new Date(Date.parse(timestamp) - 5_000).toISOString(),
+  });
+  store.enqueueContinuation({
+    continuationId: 'continuation-stranded',
+    taskId: 'cognitive-stranded-continuation',
+    runId: 'run-stranded-continuation',
+    sessionId: 'session-stranded-continuation',
+    status: 'queued',
+    prompt: 'Continue the root task.',
+    reason: 'stranded session regression',
+    attempt: 1,
+    maxAttempts: 6,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  });
+  const task = store.getCognitiveTask('cognitive-stranded-continuation');
+  assert.ok(task);
+  store.saveCognitiveTask({
+    ...task!,
+    status: 'cancelled',
+    phase: 'execute',
+    capsule: { ...(task!.capsule as Record<string, unknown>), status: 'cancelled' },
+    updatedAt: new Date().toISOString(),
+  });
+  store.cancelContinuationsForRun('run-stranded-continuation');
+
+  const reconciled = store.reconcileContinuationState();
+  const session = store.getSession('session-stranded-continuation');
+
+  assert.equal(reconciled.sessionsTerminalized, 1);
+  assert.equal(session?.status, 'cancelled');
+  assert.equal(session?.activeRunId, undefined);
+  assert.match(session?.lastError || '', /no live continuation remains/i);
+  assert.equal(
+    (session?.metadata.continuationJanitor as { terminalStatus?: string } | undefined)?.terminalStatus,
+    'cancelled',
+  );
+  assert.equal(store.reconcileContinuationState().sessionsTerminalized, 0);
+  store.close();
+});
+
+test('continuation janitor marks stranded sessions done when any root task completed', () => {
+  const store = new RuntimeStore(':memory:');
+  const timestamp = new Date(Date.now() - 5_000).toISOString();
+  seedActiveContinuationParents(store, {
+    sessionId: 'session-completed-continuation',
+    taskId: 'cognitive-completed-continuation',
+    runId: 'run-completed-continuation',
+    timestamp,
+  });
+  const task = store.getCognitiveTask('cognitive-completed-continuation');
+  assert.ok(task);
+  store.saveCognitiveTask({
+    ...task!,
+    status: 'completed',
+    phase: 'complete',
+    capsule: { ...(task!.capsule as Record<string, unknown>), status: 'completed' },
+    updatedAt: new Date().toISOString(),
+  });
+
+  const reconciled = store.reconcileContinuationState();
+  const session = store.getSession('session-completed-continuation');
+
+  assert.equal(reconciled.sessionsTerminalized, 1);
+  assert.equal(session?.status, 'done');
+  assert.equal(session?.lastError, undefined);
   store.close();
 });
 
