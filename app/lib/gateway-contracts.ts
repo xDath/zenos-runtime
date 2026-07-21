@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { ContinuityPacketV2Schema } from './continuity-packet';
 import { normalizeWorkspacePath } from './execution-boundary';
 import { LatencyBudgetPlanSchema, LatencyObservationSchema } from './latency-budget';
 import { RouteDecision, RuntimeContextSchema, WorkerResultSchema } from './zenos-runtime';
@@ -60,6 +61,7 @@ export const GatewayTurnPreflightRequestSchema = RuntimeContextSchema.extend({
   host: GatewayModelIdentitySchema,
   context: z.string().max(120_000).optional().default(''),
   handoffMessages: z.array(GatewayContextMessageSchema).max(400).optional().default([]),
+  continuityPacket: ContinuityPacketV2Schema.optional(),
   workspaceRoot: GatewayWorkspaceRootSchema.optional(),
   workspaceState: GatewayWorkspaceStateSchema.nullish().transform((value) => value ?? undefined),
   approvalGranted: z.boolean().optional().default(false),
@@ -132,6 +134,9 @@ export type GatewayMemoryBrief = {
   degraded?: boolean;
   cacheHit?: boolean;
   latencyMs?: number;
+  checkpointId?: string;
+  sourceCursor?: string;
+  previousCheckpointId?: string;
 };
 
 export const StoredGatewayPreflightSchema = z.object({
@@ -143,6 +148,8 @@ export const StoredGatewayPreflightSchema = z.object({
   hostPlan: GatewayHostPlanSchema.optional(),
   cognitivePacket: z.unknown().optional(),
   cognitiveTaskId: z.string().optional(),
+  commandJobId: z.string().optional(),
+  commandActiveStepId: z.string().optional(),
   continuationCapsule: z.unknown().optional(),
   hostPlanCall: z.unknown().optional(),
   workerResult: WorkerResultSchema.optional(),
@@ -156,6 +163,9 @@ export const StoredGatewayPreflightSchema = z.object({
     namespace: z.string().trim().min(1).max(120),
   })).max(60).optional().default([]),
   memoryCoverage: z.number().min(0).max(1).optional(),
+  memoryCheckpointId: z.string().trim().min(1).max(220).optional(),
+  memorySourceCursor: z.string().trim().min(1).max(500).optional(),
+  memoryPreviousCheckpointId: z.string().trim().min(1).max(500).optional(),
   latencyPlan: LatencyBudgetPlanSchema.optional(),
   preflightLatency: z.array(LatencyObservationSchema).default([]),
   turnStartedAtMs: z.number().int().nonnegative().optional(),

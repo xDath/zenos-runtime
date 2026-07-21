@@ -364,7 +364,7 @@ test('Runtime store quarantines legacy overspent token governors while preservin
     assert.equal(Number(row?.anomaly_count), 1);
     assert.equal(Number(row?.invalid_samples), 1);
     assert.equal(String(row?.status), 'expired');
-    assert.equal(String(version?.value), '10');
+    assert.equal(String(version?.value), '12');
     verified.close();
   } finally {
     rmSync(directory, { recursive: true, force: true });

@@ -2,6 +2,12 @@ import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { z } from 'zod';
+import {
+  ContinuityPacketV2,
+  continuityPacketToCompactMessages,
+  parseContinuityPacketV2,
+} from './continuity-packet';
+import { buildRuntimeLearningCard, renderLearningCard } from './learning-cards';
 import { log, redactText } from './logger';
 import { incrementMetric, observeDuration, setGauge } from './metrics';
 import { getRuntimeCache, runtimeCacheKey } from './runtime-cache';
@@ -35,6 +41,10 @@ const CompactResponseSchema = z.object({
   compact: MemoryResultSchema,
   coverage: MemoryCoverageSchema.optional(),
   strategy: z.string().optional(),
+  source_cursor: z.string().optional(),
+  previous_checkpoint_id: z.string().optional(),
+  checkpoint_validated: z.boolean().optional(),
+  faithfulness: z.record(z.string(), z.unknown()).optional(),
 }).passthrough();
 
 const BootstrapResponseSchema = z.object({
@@ -836,7 +846,8 @@ export function continuityFingerprint(
 }
 
 export async function compactMemoryHandoff(input: {
-  messages: Array<{ role: string; content: unknown; name?: string; tool_call_id?: string }>;
+  messages?: Array<{ role: string; content: unknown; name?: string; tool_call_id?: string }>;
+  packet?: ContinuityPacketV2;
   namespace?: string;
   sessionId: string;
   conversationId?: string;
@@ -849,6 +860,10 @@ export async function compactMemoryHandoff(input: {
   coverage?: MemoryCoverage;
   strategy?: string;
   memoryId?: string;
+  sourceCursor?: string;
+  previousCheckpointId?: string;
+  checkpointValidated?: boolean;
+  faithfulness?: Record<string, unknown>;
 }>> {
   if (process.env.ZENOS_RUNTIME_DISABLE_MEMORY_HANDOFF === 'true') {
     return { ok: false, skipped: true, error: 'Automatic Memory handoff is disabled', degraded: true };
@@ -856,10 +871,19 @@ export async function compactMemoryHandoff(input: {
   const namespace = input.namespace || process.env.ZENOS_MEMORY_NAMESPACE || 'zenos';
   const maxChars = Math.min(Math.max(input.maxChars || 10_000, 1_000), 24_000);
   const inputMaxChars = Math.min(Math.max(input.inputMaxChars || 180_000, 20_000), 500_000);
-  const boundedMessages = input.messages.length <= 400
-    ? input.messages
-    : [...input.messages.slice(0, 8), ...input.messages.slice(-392)];
-  const fullFingerprint = continuityFingerprint(boundedMessages);
+  const packet = input.packet ? parseContinuityPacketV2(input.packet) : undefined;
+  const sourceMessages = packet
+    ? continuityPacketToCompactMessages(packet, inputMaxChars)
+    : (input.messages || []);
+  if (!sourceMessages.length) {
+    return { ok: false, skipped: true, error: 'Memory handoff requires messages or a ContinuityPacket v2', degraded: true };
+  }
+  const boundedMessages = packet
+    ? sourceMessages
+    : sourceMessages.length <= 400
+      ? sourceMessages
+      : [...sourceMessages.slice(0, 8), ...sourceMessages.slice(-392)];
+  const fullFingerprint = packet?.contentHash || continuityFingerprint(boundedMessages);
   const idempotencyDigest = crypto.createHash('sha256')
     .update(`${namespace}\n${fullFingerprint}`)
     .digest('hex');
@@ -879,6 +903,10 @@ export async function compactMemoryHandoff(input: {
     coverage?: MemoryCoverage;
     strategy?: string;
     memoryId?: string;
+    sourceCursor?: string;
+    previousCheckpointId?: string;
+    checkpointValidated?: boolean;
+    faithfulness?: Record<string, unknown>;
   }>(cacheKey, { memory: revision });
   if (cached) return { ok: true, skipped: false, value: cached, cacheHit: true, latencyMs: 0 };
 
@@ -892,6 +920,9 @@ export async function compactMemoryHandoff(input: {
     max_chars: maxChars,
     input_max_chars: inputMaxChars,
     mode: 'dag',
+    continuity_packet: packet,
+    source_cursor: packet?.sourceCursor,
+    previous_checkpoint_id: packet?.previousCheckpointId,
   }, {
     scopes: ['memory:read', 'memory:write'],
     parser: CompactResponseSchema,
@@ -913,6 +944,10 @@ export async function compactMemoryHandoff(input: {
     coverage: result.value.coverage,
     strategy: result.value.strategy,
     memoryId: result.value.compact.id,
+    sourceCursor: result.value.source_cursor || packet?.sourceCursor,
+    previousCheckpointId: result.value.previous_checkpoint_id || packet?.previousCheckpointId,
+    checkpointValidated: result.value.checkpoint_validated,
+    faithfulness: result.value.faithfulness,
   };
   const postWriteRevision = bumpNamespaceRevision(namespace, result.value.compact.id || fingerprint);
   const postWriteKey = runtimeCacheKey('memory', { kind: 'handoff',
@@ -1044,13 +1079,28 @@ export async function persistCognitiveOutcome(input: {
   }
   const namespace = input.namespace || process.env.ZENOS_MEMORY_LEARNING_NAMESPACE || 'runtime.learning';
   // Only deterministic execution evidence may graduate into procedural
-  // memory. A persuasive Host answer or validation=unknown remains an episode,
-  // never a reusable "validated" procedure.
-  const successful = input.verdict === 'success'
-    && input.deterministicValidation === 'passed';
-  const memoryType = successful ? 'procedure' : 'insight';
+  // memory. A persuasive Host answer or validation=unknown remains a cold
+  // candidate, never a reusable "validated" procedure.
   const boundedToolSummary = redactText(input.toolSummary || '').replace(/\s+/g, ' ').trim().slice(0, 3_000);
+  const safeDecisions = (input.decisions || []).slice(0, 12).map(value => redactText(value).slice(0, 800));
+  const safeFailures = (input.failures || []).slice(0, 12).map(value => redactText(value).slice(0, 800));
+  const safeArtifacts = (input.artifacts || []).slice(0, 20).map(value => redactText(value).slice(0, 1_000));
+  const learningCard = buildRuntimeLearningCard({
+    runId: input.runId,
+    objective: redactText(input.objective).slice(0, 2_000),
+    taskType: input.taskType,
+    verdict: input.verdict,
+    deterministicValidation: input.deterministicValidation,
+    toolSummary: boundedToolSummary,
+    decisions: safeDecisions,
+    failures: safeFailures,
+    artifacts: safeArtifacts,
+  });
+  const successful = learningCard.type === 'procedure' && learningCard.verification === 'test_passed';
+  const hotRecallEligible = learningCard.verification !== 'unverified';
+  const memoryType = successful ? 'procedure' : 'insight';
   const lines = [
+    renderLearningCard(learningCard),
     `Objective: ${redactText(input.objective).slice(0, 2_000)}`,
     `Task type: ${input.taskType}`,
     `Outcome: ${input.verdict}`,
@@ -1058,35 +1108,41 @@ export async function persistCognitiveOutcome(input: {
     input.deterministicValidation ? `Deterministic validation: ${input.deterministicValidation}` : '',
     input.model ? `Model: ${input.model}${input.provider ? ` via ${input.provider}` : ''}` : '',
     boundedToolSummary ? `Validated execution evidence: ${boundedToolSummary}` : '',
-    ...(input.decisions || []).slice(0, 12).map(value => `Decision: ${redactText(value).slice(0, 800)}`),
-    ...(input.failures || []).slice(0, 12).map(value => `Failure or pitfall: ${redactText(value).slice(0, 800)}`),
-    ...(input.artifacts || []).slice(0, 20).map(value => `Artifact: ${redactText(value).slice(0, 1_000)}`),
+    ...safeDecisions.map(value => `Decision: ${value}`),
+    ...safeFailures.map(value => `Failure or pitfall: ${value}`),
+    ...safeArtifacts.map(value => `Artifact: ${value}`),
     input.tokenUsage
       ? `Efficiency: calls=${input.tokenUsage.calls}; input=${input.tokenUsage.input}; output=${input.tokenUsage.output}`
       : '',
   ].filter(Boolean);
   const content = lines.join('\n').slice(0, 12_000);
-  const procedureSignature = successful
-    ? crypto.createHash('sha256').update([
-        input.taskType,
-        (boundedToolSummary || input.objective)
-          .toLowerCase()
-          .replace(/[a-f0-9]{8,}/g, '<id>')
-          .replace(/\b\d+\b/g, '<n>')
-          .replace(/\s+/g, ' ')
-          .slice(0, 2_000),
-      ].join('\n')).digest('hex')
-    : undefined;
+  const procedureSignatureCandidate = crypto.createHash('sha256').update([
+    input.taskType,
+    (boundedToolSummary || input.objective)
+      .toLowerCase()
+      .replace(/[a-f0-9]{8,}/g, '<id>')
+      .replace(/\b\d+\b/g, '<n>')
+      .replace(/\s+/g, ' ')
+      .slice(0, 2_000),
+  ].join('\n')).digest('hex');
+  const procedureSignature = successful ? procedureSignatureCandidate : undefined;
   const result = await memoryFetch('/api/memory/remember', {
     content,
     namespace,
     type: memoryType,
     metadata: {
-      confidence: successful ? 0.92 : 0.86,
-      importance: successful ? 9 : 8,
+      confidence: learningCard.confidence,
+      importance: successful ? 9 : hotRecallEligible ? 8 : 4,
       tags: [
         'zenos-cognitive-outcome',
-        successful ? 'validated-procedure-candidate' : 'failure-memory',
+        'learning-card',
+        `learning-card-${learningCard.type}`,
+        `verification-${learningCard.verification}`,
+        successful
+          ? 'validated-procedure-candidate'
+          : hotRecallEligible
+            ? 'evidence-backed-learning'
+            : 'cold-learning-candidate',
         input.taskType,
         input.verdict,
         input.deterministicValidation || 'validation-unknown',
@@ -1098,6 +1154,11 @@ export async function persistCognitiveOutcome(input: {
         session_id: input.sessionId,
       },
       deterministic_validation: input.deterministicValidation || 'unknown',
+      learning_card: learningCard,
+      hot_recall_eligible: hotRecallEligible,
+      invalidates_procedure_signature: learningCard.type === 'failure'
+        ? procedureSignatureCandidate
+        : undefined,
       procedure_success_count: successful ? 1 : 0,
       procedure_success_sessions: successful ? [input.sessionId] : undefined,
       procedure_promotion_status: successful ? 'candidate' : undefined,

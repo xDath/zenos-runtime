@@ -14,7 +14,7 @@ import {
 } from './zenos-runtime-state';
 import { log } from './logger';
 
-const SCHEMA_VERSION = 10;
+const SCHEMA_VERSION = 12;
 
 function defaultDatabasePath(): string {
   if (process.env.ZENOS_RUNTIME_DB_PATH) return process.env.ZENOS_RUNTIME_DB_PATH;
@@ -135,6 +135,102 @@ function continuationRecordFromRow(row: Record<string, unknown>): ContinuationQu
     updatedAt: asString(row.updated_at),
   };
 }
+
+function continuityCheckpointFromRow(row: Record<string, unknown>): ContinuityCheckpointRecord {
+  return {
+    sessionId: asString(row.session_id),
+    sourceCursor: asString(row.source_cursor),
+    packetHash: asString(row.packet_hash),
+    signalHash: asString(row.signal_hash),
+    checkpointId: asString(row.checkpoint_id),
+    previousCheckpointId: row.previous_checkpoint_id ? asString(row.previous_checkpoint_id) : undefined,
+    pressureLevel: asString(row.pressure_level) as ContinuityCheckpointRecord['pressureLevel'],
+    estimatedTokens: asNumber(row.estimated_tokens),
+    strategy: row.strategy ? asString(row.strategy) : undefined,
+    coverage: row.coverage_json ? parseJson(row.coverage_json, undefined) : undefined,
+    context: asString(row.context),
+    createdAt: asString(row.created_at),
+    updatedAt: asString(row.updated_at),
+  };
+}
+
+function commandJobFromRow(row: Record<string, unknown>): CommandJobRecord {
+  return {
+    jobId: asString(row.job_id),
+    sessionId: asString(row.session_id),
+    userTurnId: asString(row.user_turn_id),
+    requestHash: asString(row.request_hash),
+    taskContract: parseJson(row.task_contract_json, null),
+    status: asString(row.status) as CommandJobRecord['status'],
+    checkpointId: row.checkpoint_id ? asString(row.checkpoint_id) : undefined,
+    activeStepId: row.active_step_id ? asString(row.active_step_id) : undefined,
+    budget: parseJson(row.budget_json, {}),
+    cognitiveTaskId: row.cognitive_task_id ? asString(row.cognitive_task_id) : undefined,
+    createdAt: asString(row.created_at),
+    updatedAt: asString(row.updated_at),
+  };
+}
+
+function commandStepFromRow(row: Record<string, unknown>): CommandStepRecord {
+  return {
+    stepId: asString(row.step_id),
+    jobId: asString(row.job_id),
+    ordinal: asNumber(row.ordinal),
+    kind: asString(row.kind) as CommandStepRecord['kind'],
+    inputHash: asString(row.input_hash),
+    status: asString(row.status) as CommandStepRecord['status'],
+    resultRef: row.result_ref ? asString(row.result_ref) : undefined,
+    retryCount: asNumber(row.retry_count),
+    metadata: parseJson(row.metadata_json, {}),
+    createdAt: asString(row.created_at),
+    updatedAt: asString(row.updated_at),
+  };
+}
+
+export type ContinuityCheckpointRecord = {
+  sessionId: string;
+  sourceCursor: string;
+  packetHash: string;
+  signalHash: string;
+  checkpointId: string;
+  previousCheckpointId?: string;
+  pressureLevel: 'observe' | 'checkpoint' | 'compression' | 'emergency';
+  estimatedTokens: number;
+  strategy?: string;
+  coverage?: unknown;
+  context: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type CommandJobRecord = {
+  jobId: string;
+  sessionId: string;
+  userTurnId: string;
+  requestHash: string;
+  taskContract: unknown;
+  status: 'queued' | 'running' | 'paused_for_compaction' | 'waiting_for_approval' | 'retry_pending' | 'completed' | 'failed' | 'cancelled';
+  checkpointId?: string;
+  activeStepId?: string;
+  budget: unknown;
+  cognitiveTaskId?: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type CommandStepRecord = {
+  stepId: string;
+  jobId: string;
+  ordinal: number;
+  kind: 'route' | 'inspect' | 'plan' | 'patch' | 'validate' | 'verify' | 'deliver';
+  inputHash: string;
+  status: 'queued' | 'running' | 'done' | 'retry_pending' | 'blocked' | 'failed';
+  resultRef?: string;
+  retryCount: number;
+  metadata: unknown;
+  createdAt: string;
+  updatedAt: string;
+};
 
 export type OutcomeLedgerRecord = {
   outcomeId: string;
@@ -371,6 +467,66 @@ export class RuntimeStore {
 
       CREATE INDEX IF NOT EXISTS idx_continuation_queue_session ON continuation_queue(session_id, status, updated_at);
       CREATE INDEX IF NOT EXISTS idx_continuation_queue_lease ON continuation_queue(status, lease_expires_at);
+
+      CREATE TABLE IF NOT EXISTS continuity_checkpoints (
+        session_id TEXT NOT NULL,
+        source_cursor TEXT NOT NULL,
+        packet_hash TEXT NOT NULL,
+        signal_hash TEXT NOT NULL,
+        checkpoint_id TEXT NOT NULL,
+        previous_checkpoint_id TEXT,
+        pressure_level TEXT NOT NULL,
+        estimated_tokens INTEGER NOT NULL,
+        strategy TEXT,
+        coverage_json TEXT,
+        context TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(session_id, source_cursor)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_continuity_checkpoints_session
+        ON continuity_checkpoints(session_id, updated_at DESC);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_continuity_checkpoints_id
+        ON continuity_checkpoints(checkpoint_id);
+
+      CREATE TABLE IF NOT EXISTS command_jobs (
+        job_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        user_turn_id TEXT NOT NULL,
+        request_hash TEXT NOT NULL,
+        task_contract_json TEXT NOT NULL,
+        status TEXT NOT NULL,
+        checkpoint_id TEXT,
+        active_step_id TEXT,
+        budget_json TEXT NOT NULL,
+        cognitive_task_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(session_id, user_turn_id, request_hash)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_command_jobs_session ON command_jobs(session_id, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_command_jobs_status ON command_jobs(status, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_command_jobs_cognitive ON command_jobs(cognitive_task_id, updated_at DESC);
+
+      CREATE TABLE IF NOT EXISTS command_steps (
+        step_id TEXT PRIMARY KEY,
+        job_id TEXT NOT NULL REFERENCES command_jobs(job_id) ON DELETE CASCADE,
+        ordinal INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        input_hash TEXT NOT NULL,
+        status TEXT NOT NULL,
+        result_ref TEXT,
+        retry_count INTEGER NOT NULL,
+        metadata_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(job_id, ordinal)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_command_steps_job ON command_steps(job_id, ordinal);
+      CREATE INDEX IF NOT EXISTS idx_command_steps_status ON command_steps(status, updated_at DESC);
 
       CREATE TABLE IF NOT EXISTS outcome_ledger (
         outcome_id TEXT PRIMARY KEY,
@@ -1540,6 +1696,171 @@ export class RuntimeStore {
     return this.db.prepare(`
       SELECT * FROM continuation_queue WHERE run_id = ? ORDER BY created_at ASC
     `).all(runId).map(continuationRecordFromRow);
+  }
+
+  saveContinuityCheckpoint(input: ContinuityCheckpointRecord): ContinuityCheckpointRecord {
+    this.db.prepare(`
+      INSERT INTO continuity_checkpoints(
+        session_id, source_cursor, packet_hash, signal_hash, checkpoint_id,
+        previous_checkpoint_id, pressure_level, estimated_tokens, strategy,
+        coverage_json, context, created_at, updated_at
+      ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(session_id, source_cursor) DO UPDATE SET
+        packet_hash = excluded.packet_hash,
+        signal_hash = excluded.signal_hash,
+        checkpoint_id = excluded.checkpoint_id,
+        previous_checkpoint_id = excluded.previous_checkpoint_id,
+        pressure_level = excluded.pressure_level,
+        estimated_tokens = excluded.estimated_tokens,
+        strategy = excluded.strategy,
+        coverage_json = excluded.coverage_json,
+        context = excluded.context,
+        updated_at = excluded.updated_at
+    `).run(
+      input.sessionId,
+      input.sourceCursor,
+      input.packetHash,
+      input.signalHash,
+      input.checkpointId,
+      input.previousCheckpointId || null,
+      input.pressureLevel,
+      input.estimatedTokens,
+      input.strategy || null,
+      input.coverage === undefined ? null : json(input.coverage),
+      input.context,
+      input.createdAt,
+      input.updatedAt,
+    );
+    return input;
+  }
+
+  getContinuityCheckpoint(sessionId: string, sourceCursor: string): ContinuityCheckpointRecord | undefined {
+    const row = this.db.prepare(`
+      SELECT * FROM continuity_checkpoints WHERE session_id = ? AND source_cursor = ?
+    `).get(sessionId, sourceCursor);
+    return row ? continuityCheckpointFromRow(row) : undefined;
+  }
+
+  getLatestContinuityCheckpoint(sessionId: string): ContinuityCheckpointRecord | undefined {
+    const row = this.db.prepare(`
+      SELECT * FROM continuity_checkpoints
+      WHERE session_id = ?
+      ORDER BY updated_at DESC, created_at DESC LIMIT 1
+    `).get(sessionId);
+    return row ? continuityCheckpointFromRow(row) : undefined;
+  }
+
+  saveCommandJob(input: CommandJobRecord): CommandJobRecord {
+    this.db.prepare(`
+      INSERT INTO command_jobs(
+        job_id, session_id, user_turn_id, request_hash, task_contract_json,
+        status, checkpoint_id, active_step_id, budget_json, cognitive_task_id,
+        created_at, updated_at
+      ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(job_id) DO UPDATE SET
+        task_contract_json = excluded.task_contract_json,
+        status = excluded.status,
+        checkpoint_id = excluded.checkpoint_id,
+        active_step_id = excluded.active_step_id,
+        budget_json = excluded.budget_json,
+        cognitive_task_id = excluded.cognitive_task_id,
+        updated_at = excluded.updated_at
+    `).run(
+      input.jobId,
+      input.sessionId,
+      input.userTurnId,
+      input.requestHash,
+      json(input.taskContract),
+      input.status,
+      input.checkpointId || null,
+      input.activeStepId || null,
+      json(input.budget),
+      input.cognitiveTaskId || null,
+      input.createdAt,
+      input.updatedAt,
+    );
+    return input;
+  }
+
+  getCommandJob(jobId: string): CommandJobRecord | undefined {
+    const row = this.db.prepare('SELECT * FROM command_jobs WHERE job_id = ?').get(jobId);
+    return row ? commandJobFromRow(row) : undefined;
+  }
+
+  findCommandJob(sessionId: string, userTurnId: string, requestHash: string): CommandJobRecord | undefined {
+    const row = this.db.prepare(`
+      SELECT * FROM command_jobs
+      WHERE session_id = ? AND user_turn_id = ? AND request_hash = ?
+      LIMIT 1
+    `).get(sessionId, userTurnId, requestHash);
+    return row ? commandJobFromRow(row) : undefined;
+  }
+
+  findCommandJobByCognitiveTask(cognitiveTaskId: string): CommandJobRecord | undefined {
+    const row = this.db.prepare(`
+      SELECT * FROM command_jobs
+      WHERE cognitive_task_id = ?
+      ORDER BY updated_at DESC LIMIT 1
+    `).get(cognitiveTaskId);
+    return row ? commandJobFromRow(row) : undefined;
+  }
+
+  findActiveCommandJobBySession(sessionId: string): CommandJobRecord | undefined {
+    const row = this.db.prepare(`
+      SELECT * FROM command_jobs
+      WHERE session_id = ?
+        AND status IN ('queued', 'running', 'paused_for_compaction', 'waiting_for_approval', 'retry_pending')
+      ORDER BY updated_at DESC LIMIT 1
+    `).get(sessionId);
+    return row ? commandJobFromRow(row) : undefined;
+  }
+
+  listCommandJobs(limit = 100, status?: string): CommandJobRecord[] {
+    const safeLimit = Math.min(Math.max(limit, 1), 500);
+    const rows = status
+      ? this.db.prepare('SELECT * FROM command_jobs WHERE status = ? ORDER BY updated_at DESC LIMIT ?').all(status, safeLimit)
+      : this.db.prepare('SELECT * FROM command_jobs ORDER BY updated_at DESC LIMIT ?').all(safeLimit);
+    return rows.map(commandJobFromRow);
+  }
+
+  saveCommandStep(input: CommandStepRecord): CommandStepRecord {
+    this.db.prepare(`
+      INSERT INTO command_steps(
+        step_id, job_id, ordinal, kind, input_hash, status, result_ref,
+        retry_count, metadata_json, created_at, updated_at
+      ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(step_id) DO UPDATE SET
+        input_hash = excluded.input_hash,
+        status = excluded.status,
+        result_ref = excluded.result_ref,
+        retry_count = excluded.retry_count,
+        metadata_json = excluded.metadata_json,
+        updated_at = excluded.updated_at
+    `).run(
+      input.stepId,
+      input.jobId,
+      input.ordinal,
+      input.kind,
+      input.inputHash,
+      input.status,
+      input.resultRef || null,
+      input.retryCount,
+      json(input.metadata),
+      input.createdAt,
+      input.updatedAt,
+    );
+    return input;
+  }
+
+  getCommandStep(stepId: string): CommandStepRecord | undefined {
+    const row = this.db.prepare('SELECT * FROM command_steps WHERE step_id = ?').get(stepId);
+    return row ? commandStepFromRow(row) : undefined;
+  }
+
+  listCommandSteps(jobId: string): CommandStepRecord[] {
+    return this.db.prepare(`
+      SELECT * FROM command_steps WHERE job_id = ? ORDER BY ordinal ASC
+    `).all(jobId).map(commandStepFromRow);
   }
 
   claimIdempotency(key: string, scope: string, requestHash: string, ttlSeconds = 86_400): { state: 'claimed' | 'replay' | 'conflict' | 'running'; record?: IdempotencyRecord } {

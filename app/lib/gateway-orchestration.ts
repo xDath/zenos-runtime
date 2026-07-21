@@ -40,6 +40,7 @@ import {
   StoredGatewayPreflightSchema,
 } from './gateway-contracts';
 import { accountGatewayModelUsage, callIdentity, gatewayHostCallCount } from './gateway-accounting';
+import { RuntimeFeatureFlags } from './feature-flags';
 import { hostWorkingSetForDecision, prepareGatewayContexts } from './gateway-continuity';
 import {
   compactHostPlan,
@@ -47,6 +48,12 @@ import {
   hostLedRuntimeEnabled,
   runGatewayHostPlanning,
 } from './gateway-planning';
+import {
+  ensureCommandJob,
+  failCommandJob,
+  synchronizeCommandJobPostflight,
+  synchronizeCommandJobPreflight,
+} from './command-job';
 import { compileCognitivePacket, renderCognitivePacket } from './cognitive-kernel';
 import { persistCognitiveOutcome, persistRecallFeedback } from './zenos-memory-client';
 import {
@@ -828,6 +835,52 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
     );
   }
 
+  const commandRequestHash = hashRequest({
+    objective: cognitiveCapsule.rootObjective,
+    workspaceRoot: request.workspaceRoot,
+    acceptanceCriteria: cognitiveCapsule.acceptanceCriteria,
+    constraints: cognitiveCapsule.constraints,
+  });
+  const commandJobsEnabled = RuntimeFeatureFlags.commandJobs();
+  const commandJobPrepared = commandJobsEnabled
+    ? ensureCommandJob({
+        sessionId: request.sessionId,
+        userTurnId: request.turnId,
+        requestHash: commandRequestHash,
+        capsule: cognitiveCapsule,
+        decision,
+        workspaceRoot: request.workspaceRoot,
+        checkpointId: memoryBrief.checkpointId,
+        budget: {
+          maxCycles: cognitiveCapsule.maxCycles,
+          maxModelCalls: budget.host.maxCalls
+            + budget.worker.maxCalls
+            + budget.verifier.maxCalls
+            + budget.boss.maxCalls,
+          maxTokens: budget.totalTokens,
+          deadlineMs: latencyPlan.totalMs,
+        },
+        store,
+      })
+    : undefined;
+  const commandJob = commandJobPrepared
+    ? synchronizeCommandJobPreflight({
+        jobId: commandJobPrepared.job.jobId,
+        routeRef: `runtime-run:${runId}`,
+        repositoryContext,
+        planRef: hostPlan
+          ? `host-plan:${runId}`
+          : workerResult
+            ? `worker-plan:${runId}`
+            : decision.taskType === 'simple_chat'
+              ? undefined
+              : `deterministic-plan:${runId}`,
+        mutationExpected: Boolean(codingTask) && ['coding_change', 'deploy_or_destructive_action'].includes(decision.taskType),
+        approvalRequired: decision.requiresApproval && request.approvalGranted !== true,
+        store,
+      })
+    : undefined;
+
   recordActivity(
     request.sessionId,
     'host',
@@ -856,6 +909,8 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
     hostPlan,
     cognitivePacket,
     cognitiveTaskId: cognitiveCapsule.taskId,
+    commandJobId: commandJob?.jobId,
+    commandActiveStepId: commandJob?.activeStepId,
     continuationCapsule: cognitiveCapsule,
     hostPlanCall,
     workerResult,
@@ -866,6 +921,9 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
     memorySource: memoryBrief.source,
     memoryEvidenceRefs: memoryBrief.evidenceRefs || [],
     memoryCoverage: memoryCoverageScore(memoryBrief),
+    memoryCheckpointId: memoryBrief.checkpointId,
+    memorySourceCursor: memoryBrief.sourceCursor,
+    memoryPreviousCheckpointId: memoryBrief.previousCheckpointId,
     latencyPlan,
     preflightLatency,
     turnStartedAtMs,
@@ -896,6 +954,12 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
     hostOverride: request.host,
     cognitiveTaskId: cognitiveCapsule.taskId,
     cognitivePhase: cognitiveCapsule.phase,
+    commandJobId: commandJob?.jobId,
+    commandJobStatus: commandJob?.status,
+    commandActiveStepId: commandJob?.activeStepId,
+    memoryCheckpointId: memoryBrief.checkpointId,
+    memorySourceCursor: memoryBrief.sourceCursor,
+    memoryPreviousCheckpointId: memoryBrief.previousCheckpointId,
     codingTaskId: codingTask?.taskId,
     codingPhase: codingTask?.currentPhase,
     hostContext: [
@@ -1192,6 +1256,13 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
         runId: request.runId,
         status: 'failed',
         failures: ['Hermes Host reported a failed internal cycle.'],
+        store,
+      });
+    }
+    if (stored.commandJobId) {
+      failCommandJob({
+        jobId: stored.commandJobId,
+        reason: 'Hermes Host reported a failed internal cycle.',
         store,
       });
     }
@@ -1726,6 +1797,25 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
     }
   }
 
+  const commandJobState = stored.commandJobId
+    ? synchronizeCommandJobPostflight({
+        jobId: stored.commandJobId,
+        mutationObserved: observedCoding.mutated,
+        deterministicValidation,
+        verifierVerdict: verifierResult?.verdict,
+        bossVerdict: bossDecision?.verdict,
+        continuationReason,
+        waitingForUser: genuineUserBlocker,
+        terminalFailure,
+        blocked: bossDecision?.verdict === 'block' || verifierResult?.verdict === 'block',
+        resultRef: request.workspaceState?.dirtyDiffSha256
+          ? `workspace:${request.workspaceState.dirtyDiffSha256}`
+          : `runtime-run:${request.runId}`,
+        checkpointId: stored.memoryCheckpointId,
+        store,
+      })
+    : undefined;
+
   const receipt: GatewayTurnReceipt = {
     pipeline: decision.pipelineMode,
     host: {
@@ -1770,6 +1860,7 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
         : undefined,
       continuation,
       cognitiveCapsule,
+      commandJob: commandJobState,
     },
     errors: terminalCodingFailure
       ? ['Code mutation did not pass deterministic validation']
@@ -1906,5 +1997,8 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
     continuation,
     cognitiveTaskId: cognitiveCapsule?.taskId,
     cognitivePhase: cognitiveCapsule?.phase,
+    commandJobId: commandJobState?.jobId || stored.commandJobId,
+    commandJobStatus: commandJobState?.status,
+    commandActiveStepId: commandJobState?.activeStepId,
   };
 }

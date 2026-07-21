@@ -1,6 +1,13 @@
 import * as crypto from 'node:crypto';
 import path from 'node:path';
 import { evaluateExecutionBoundary } from './execution-boundary';
+import {
+  ContinuityCheckpointDecision,
+  decideContinuityCheckpoint,
+  evaluateContinuityPressure,
+  recordContinuityCheckpoint,
+} from './continuity-coordinator';
+import { RuntimeFeatureFlags } from './feature-flags';
 import { GatewayMemoryBrief, GatewayTurnPreflightRequest } from './gateway-contracts';
 import { LatencyBudgetPlan, LatencyObservation, observeLatency } from './latency-budget';
 import {
@@ -176,12 +183,44 @@ export async function gatewayMemoryContextFor(
   const memoryQuery = projectName
     ? `Active project ${projectName}. ${request.request}`
     : request.request;
-  const underPressure = request.estimatedContextTokens >= softLimit;
-  const hasHandoffSource = request.handoffMessages.length >= 4;
+  const coordinatorEnabled = RuntimeFeatureFlags.continuityCoordinator();
+  const continuityDecision: ContinuityCheckpointDecision = coordinatorEnabled
+    ? decideContinuityCheckpoint({
+        sessionId: request.sessionId,
+        packet: request.continuityPacket,
+        estimatedTokens: request.estimatedContextTokens,
+        checkpointSoftLimitTokens: softLimit,
+      })
+    : {
+        action: 'checkpoint',
+        reason: 'ContinuityCoordinator disabled by rollback flag; using legacy compact behavior',
+        pressure: evaluateContinuityPressure(request.estimatedContextTokens, softLimit),
+      };
+  const underPressure = continuityDecision.pressure.shouldCheckpoint;
+  const hasHandoffSource = Boolean(request.continuityPacket) || request.handoffMessages.length >= 4;
 
-  if (underPressure && hasHandoffSource) {
+  if (underPressure && hasHandoffSource && continuityDecision.action === 'reuse' && continuityDecision.latest?.context) {
+    return {
+      context: truncateToTokenBudget(
+        continuityDecision.latest.context,
+        contextBudget,
+        '\n[MEMORY BRIEF TRUNCATED]',
+      ),
+      source: 'handoff',
+      coverage: continuityDecision.latest.coverage as GatewayMemoryBrief['coverage'],
+      degraded: false,
+      cacheHit: true,
+      latencyMs: 0,
+      checkpointId: continuityDecision.latest.checkpointId,
+      sourceCursor: continuityDecision.latest.sourceCursor,
+      previousCheckpointId: continuityDecision.latest.previousCheckpointId,
+    };
+  }
+
+  if (underPressure && hasHandoffSource && continuityDecision.action === 'checkpoint') {
     const compact = await compactMemoryHandoff({
       messages: request.handoffMessages,
+      packet: request.continuityPacket,
       namespace: namespaces.primary,
       sessionId: request.sessionId,
       conversationId: request.turnId,
@@ -192,6 +231,27 @@ export async function gatewayMemoryContextFor(
     });
     if (compact.ok && compact.value?.context) {
       let context = compact.value.context;
+      const evidenceReceiptAccepted = RuntimeFeatureFlags.evidenceFaithfulness()
+        ? compact.value.checkpointValidated === true
+        : compact.value.checkpointValidated !== false;
+      if (
+        coordinatorEnabled
+        && request.continuityPacket
+        && compact.value.memoryId
+        && evidenceReceiptAccepted
+      ) {
+        recordContinuityCheckpoint({
+          sessionId: request.sessionId,
+          packet: request.continuityPacket,
+          checkpointId: compact.value.memoryId,
+          previousCheckpointId: compact.value.previousCheckpointId,
+          pressure: continuityDecision.pressure,
+          strategy: compact.value.strategy,
+          coverage: compact.value.coverage,
+          context: compact.value.context,
+          signalHash: continuityDecision.signalHash,
+        });
+      }
       if (decision.taskType === 'memory_question') {
         const recalled = await recallAcrossNamespaces({
           query: memoryQuery,
@@ -209,6 +269,9 @@ export async function gatewayMemoryContextFor(
         degraded: compact.degraded,
         cacheHit: compact.cacheHit,
         latencyMs: compact.latencyMs,
+        checkpointId: compact.value.memoryId,
+        sourceCursor: compact.value.sourceCursor,
+        previousCheckpointId: compact.value.previousCheckpointId,
       };
     }
   }

@@ -124,7 +124,10 @@ const dryRun = await runZenosPipeline({
 });
 assert.equal(dryRun.ok, true);
 assert.equal(dryRun.status, 'dry_run');
-assert.equal(dryRun.decision.useWorker, true);
+assert.equal(dryRun.decision.taskType, 'summarization');
+// Runtime no longer burns a legacy preflight Worker call. Hermes Host owns
+// native delegation while Runtime supplies routing, context, and durability.
+assert.equal(dryRun.decision.useWorker, false);
 
 const store = runtimeStoreInfo();
 assert.equal(store.ok, true);
@@ -132,9 +135,10 @@ assert.equal(store.integrity, 'ok');
 assert.equal(store.engine, 'sqlite-wal');
 
 const models = getRuntimeModelConfigSummary();
-assert.ok(models.hostModel, 'Host model must resolve');
-assert.ok(models.workerModel, 'Worker model must resolve');
-assert.ok(models.bossModel, 'Boss model must resolve');
-assert.ok(models.verifierModel, 'Verifier model must resolve');
+assert.ok(models.hostModel, 'Authoritative Host model must resolve');
+for (const role of ['host', 'worker', 'boss', 'verifier']) {
+  assert.ok(models.roles?.[role]?.model, `${role} execution identity must inherit the authoritative Host model`);
+  assert.equal(models.roles[role].model, models.hostModel);
+}
 
-console.log(`Zenos Runtime v${runtimeVersion} smoke passed: ${report.total} routing cases, SQLite WAL state, canonical non-root control-plane boundary, latency budgets, Outcome Passports, Memory continuity, dry-run pipeline, route integration, and four role model slots.`);
+console.log(`Zenos Runtime v${runtimeVersion} smoke passed: ${report.total} routing cases, SQLite WAL state, canonical non-root control-plane boundary, latency budgets, Outcome Passports, Memory continuity, dry-run pipeline, route integration, and one authoritative Host model inherited by all execution identities.`);
