@@ -362,6 +362,9 @@ test('hidden continuation cycles share one root token governor', async () => {
     });
 
     assert.equal(second.cognitiveTaskId, first.cognitiveTaskId);
+    assert.equal(second.decision.useVerifier, false);
+    assert.equal(second.decision.useBoss, false);
+    assert.equal(second.decision.pipelineMode, 'grounded_path');
     assert.equal(second.hostBudget.budgetId, first.hostBudget.budgetId);
     assert.equal(second.hostBudget.budgetId, first.runId);
   } finally {

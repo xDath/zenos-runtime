@@ -289,7 +289,8 @@ function preserveUnfinishedCodingContinuity(
       workspaceRoot: inferredWorkspaceRoot,
       hasFiles: true,
       hasCodeChangeIntent: true,
-      userRequestedVerification: true,
+      userRequestedVerification: request.userRequestedVerification
+        || previous?.routeDecision?.useVerifier === true,
       intent: request.intent === 'execute' ? 'execute' : 'mutate',
       confidence: Math.max(request.confidence, 0.9),
     }),
@@ -499,11 +500,17 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
   }
   const activeCodingRecord = store.findActiveCodingTaskBySession(request.sessionId);
   if (activeCodingRecord && request.workspaceRoot) {
+    const activeSession = getRuntimeSession(request.sessionId);
+    const rootRequestedVerification = request.userRequestedVerification
+      || activeSession?.routeDecision?.useVerifier === true;
     request = GatewayTurnPreflightRequestSchema.parse({
       ...request,
       hasFiles: true,
       hasCodeChangeIntent: true,
-      userRequestedVerification: true,
+      // Internal continuation text frequently mentions "validation" because it
+      // carries acceptance criteria. That is not a new user request for an LLM
+      // Verifier. Preserve only the root turn's explicit authority choice.
+      userRequestedVerification: rootRequestedVerification,
       intent: request.intent === 'execute' ? 'execute' : 'mutate',
       confidence: Math.max(request.confidence, 0.95),
     });
