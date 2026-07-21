@@ -69,7 +69,13 @@ export function hostWorkingSetForDecision(decision: RouteDecision): number {
   };
   const baseline = byTask[decision.taskType];
   const riskFactor = decision.risk === 'critical' ? 0.8 : decision.risk === 'high' ? 0.9 : 1;
-  return Math.max(24_000, Math.min(256_000, Math.round(baseline * riskFactor)));
+  const adaptive = Math.max(24_000, Math.min(256_000, Math.round(baseline * riskFactor)));
+  // Runtime owns the earlier logical checkpoint. Hermes' native compressor is
+  // the later physical safety boundary, so a configured cap must constrain
+  // every adaptive task class instead of only the legacy fixed-limit mode.
+  return Number.isFinite(configured) && configured > 0
+    ? Math.min(adaptive, Math.max(24_000, Math.min(configured, 256_000)))
+    : adaptive;
 }
 
 function cognitivePhaseForDecision(decision: RouteDecision): string {
@@ -218,6 +224,7 @@ export async function gatewayMemoryContextFor(
       phase: cognitivePhaseForDecision(decision),
       namespace: namespaces.primary,
       sharedNamespace: namespaces.shared,
+      additionalNamespaces: [process.env.ZENOS_MEMORY_LEARNING_NAMESPACE || 'runtime.learning'],
       artifactHints: request.workspaceRoot ? [request.workspaceRoot, projectName] : undefined,
       limit: Math.max(8, decision.maxMemoryItems * 3),
       maxChars: Math.ceil(contextBudget * 3.4),
@@ -226,6 +233,7 @@ export async function gatewayMemoryContextFor(
       return {
         context: truncateToTokenBudget(cognitive.value, contextBudget, '\n[COGNITIVE BRIEF TRUNCATED]'),
         source: existingSession ? 'recall' : 'bootstrap',
+        evidenceRefs: cognitive.evidenceRefs,
         degraded: cognitive.degraded,
         cacheHit: cognitive.cacheHit,
         latencyMs: cognitive.latencyMs,

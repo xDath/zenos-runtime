@@ -2,7 +2,10 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { GET as healthGet } from '../app/api/health/route';
 import { POST as abortPost } from '../app/api/runtime/gateway/abort/route';
-import { GET as continuationGet } from '../app/api/runtime/gateway/continuation/route';
+import {
+  GET as continuationGet,
+  POST as continuationPost,
+} from '../app/api/runtime/gateway/continuation/route';
 import { POST as routePost } from '../app/api/runtime/route/route';
 import { GET as sessionGet, POST as sessionPost } from '../app/api/runtime/session/route';
 import { POST as runPost } from '../app/api/runtime/run/route';
@@ -12,8 +15,37 @@ import { choosePipeline } from '../app/lib/zenos-runtime';
 import { createRuntimeSession } from '../app/lib/zenos-runtime-three-agent';
 import { RuntimeRunRequestSchema } from '../app/lib/zenos-runtime-executor';
 import { getRuntimeStore, resetRuntimeStoreForTests } from '../app/lib/zenos-runtime-store';
+import { RuntimeSessionStateSchema } from '../app/lib/zenos-runtime-state';
 
 const apiKey = 'runtime-route-contract-key';
+
+function seedActiveContinuationParents(input: {
+  sessionId: string;
+  taskId: string;
+  runId: string;
+  timestamp: string;
+}): void {
+  const store = getRuntimeStore();
+  store.saveSession(RuntimeSessionStateSchema.parse({
+    sessionId: input.sessionId,
+    userGoal: 'Continue the active root task.',
+    status: 'working',
+    hostModel: 'test-host',
+    createdAt: input.timestamp,
+    updatedAt: input.timestamp,
+  }));
+  store.saveCognitiveTask({
+    taskId: input.taskId,
+    rootRunId: input.runId,
+    activeRunId: input.runId,
+    sessionId: input.sessionId,
+    status: 'active',
+    phase: 'execute',
+    capsule: { status: 'active', updatedAt: input.timestamp },
+    createdAt: input.timestamp,
+    updatedAt: input.timestamp,
+  });
+}
 
 function request(
   pathname: string,
@@ -146,6 +178,12 @@ test('session route persists through the HTTP boundary', async () => {
 test('continuation recovery endpoint reclaims only pre-start leased work', async () => {
   const store = getRuntimeStore();
   const createdAt = new Date(Date.now() - 5_000).toISOString();
+  seedActiveContinuationParents({
+    sessionId: 'session-route-recovery',
+    taskId: 'cognitive-route-recovery',
+    runId: 'run-route-recovery',
+    timestamp: createdAt,
+  });
   store.enqueueContinuation({
     continuationId: 'continuation-route-recovery',
     taskId: 'cognitive-route-recovery',
@@ -167,11 +205,47 @@ test('continuation recovery endpoint reclaims only pre-start leased work', async
     `/api/runtime/gateway/continuation?sessionId=session-route-recovery&recoverLeasedBefore=${encodeURIComponent(cutoff)}`,
     { authenticated: true },
   ));
-  const body = await response.json() as { ok: boolean; continuation?: { continuationId: string; status: string } };
+  const body = await response.json() as {
+    ok: boolean;
+    continuation?: { continuationId: string; status: string; leaseToken: string };
+  };
   assert.equal(response.status, 200);
   assert.equal(body.ok, true);
   assert.equal(body.continuation?.continuationId, 'continuation-route-recovery');
   assert.equal(body.continuation?.status, 'leased');
+  assert.ok(body.continuation?.leaseToken);
+
+  const rejectedAck = await continuationPost(request('/api/runtime/gateway/continuation', {
+    authenticated: true,
+    body: {
+      continuationId: 'continuation-route-recovery',
+      leaseToken: 'wrong-token-that-is-long-enough',
+      action: 'complete',
+    },
+  }));
+  assert.equal(rejectedAck.status, 409);
+
+  const heartbeat = await continuationPost(request('/api/runtime/gateway/continuation', {
+    authenticated: true,
+    body: {
+      continuationId: 'continuation-route-recovery',
+      leaseToken: body.continuation?.leaseToken,
+      action: 'heartbeat',
+    },
+  }));
+  assert.equal(heartbeat.status, 200);
+
+  const completed = await continuationPost(request('/api/runtime/gateway/continuation', {
+    authenticated: true,
+    body: {
+      continuationId: 'continuation-route-recovery',
+      leaseToken: body.continuation?.leaseToken,
+      action: 'complete',
+    },
+  }));
+  const completedBody = await completed.json() as { continuation?: { status: string } };
+  assert.equal(completed.status, 200);
+  assert.equal(completedBody.continuation?.status, 'completed');
 
   const invalid = await continuationGet(request(
     '/api/runtime/gateway/continuation?sessionId=session-route-recovery&recoverLeasedBefore=not-a-date',

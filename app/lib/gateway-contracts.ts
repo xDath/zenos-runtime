@@ -35,6 +35,24 @@ export const GatewayWorkspaceStateSchema = z.object({
   capturedAt: z.string().datetime(),
 });
 
+export const GatewayExecutionReceiptSchema = z.object({
+  receiptId: z.string().trim().min(1).max(500),
+  kind: z.enum(['tool', 'validation', 'workspace', 'artifact']),
+  tool: z.string().trim().min(1).max(200).optional(),
+  status: z.enum(['passed', 'failed', 'blocked', 'unknown']),
+  command: z.string().trim().max(4_000).optional(),
+  exitCode: z.number().int().min(-1).max(255).nullable().optional(),
+  validationKind: z.enum(['test', 'typecheck', 'lint', 'build', 'compile', 'syntax', 'smoke', 'other']).optional(),
+  summary: z.string().trim().max(4_000).default(''),
+  startedAt: z.string().datetime().optional(),
+  completedAt: z.string().datetime().optional(),
+  changedFiles: z.array(z.string().trim().min(1).max(4_096)).max(200).default([]),
+  artifactIds: z.array(z.string().trim().min(1).max(500)).max(100).default([]),
+  workspaceRevisionBefore: z.string().trim().max(500).optional(),
+  workspaceRevisionAfter: z.string().trim().max(500).optional(),
+  metadata: z.record(z.string(), z.unknown()).optional().default({}),
+});
+
 export const GatewayTurnPreflightRequestSchema = RuntimeContextSchema.extend({
   sessionId: z.string().trim().min(1).max(220),
   turnId: z.string().trim().min(1).max(220),
@@ -66,6 +84,7 @@ export const GatewayTurnPostflightRequestSchema = z.object({
   draft: z.string().max(200_000),
   host: GatewayModelIdentitySchema,
   toolSummary: z.string().max(80_000).optional().default(''),
+  executionReceipts: z.array(GatewayExecutionReceiptSchema).max(200).optional().default([]),
   workspaceState: GatewayWorkspaceStateSchema.nullish().transform((value) => value ?? undefined),
   failed: z.boolean().optional().default(false),
   hostUsage: z.object({
@@ -108,6 +127,7 @@ export type GatewayHostPlan = z.infer<typeof GatewayHostPlanSchema>;
 export type GatewayMemoryBrief = {
   context: string;
   source: 'none' | 'handoff' | 'recall' | 'bootstrap';
+  evidenceRefs?: Array<{ id: string; namespace: string }>;
   coverage?: MemoryCoverage;
   degraded?: boolean;
   cacheHit?: boolean;
@@ -131,6 +151,10 @@ export const StoredGatewayPreflightSchema = z.object({
   bossCall: z.unknown().optional(),
   repositoryContext: z.string().optional(),
   memorySource: z.string().optional(),
+  memoryEvidenceRefs: z.array(z.object({
+    id: z.string().trim().min(1).max(220),
+    namespace: z.string().trim().min(1).max(120),
+  })).max(60).optional().default([]),
   memoryCoverage: z.number().min(0).max(1).optional(),
   latencyPlan: LatencyBudgetPlanSchema.optional(),
   preflightLatency: z.array(LatencyObservationSchema).default([]),
@@ -144,6 +168,7 @@ export const StoredGatewayPreflightSchema = z.object({
 export type GatewayTurnPreflightRequest = z.output<typeof GatewayTurnPreflightRequestSchema>;
 export type GatewayTurnPreflightInput = z.input<typeof GatewayTurnPreflightRequestSchema>;
 export type GatewayTurnPostflightInput = z.input<typeof GatewayTurnPostflightRequestSchema>;
+export type GatewayExecutionReceipt = z.infer<typeof GatewayExecutionReceiptSchema>;
 export type StoredGatewayPreflight = z.infer<typeof StoredGatewayPreflightSchema>;
 
 export type GatewayTurnReceipt = {

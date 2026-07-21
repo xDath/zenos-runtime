@@ -33,6 +33,19 @@ export const EvidenceReferenceSchema = z.object({
   confidence: z.number().min(0).max(1).default(0.8),
 });
 
+export const AcceptanceCheckSchema = z.object({
+  id: z.string().trim().min(1).max(220),
+  criterion: BoundedString,
+  kind: z.enum(['implementation', 'validation', 'artifact', 'response', 'general']),
+  status: z.enum(['pending', 'passed', 'failed', 'blocked']),
+  required: z.boolean().default(true),
+  evidenceIds: z.array(z.string().trim().min(1).max(500)).max(100).default([]),
+  detail: z.string().trim().max(4_000).optional(),
+  updatedAt: z.string().datetime(),
+});
+
+export type AcceptanceCheck = z.infer<typeof AcceptanceCheckSchema>;
+
 export const ContinuationCapsuleSchema = z.object({
   version: z.literal('zenos-continuation-capsule-v1'),
   taskId: z.string().trim().min(1).max(220),
@@ -43,6 +56,7 @@ export const ContinuationCapsuleSchema = z.object({
   phase: CognitivePhaseSchema,
   status: z.enum(['active', 'waiting_for_user', 'completed', 'failed', 'cancelled']),
   acceptanceCriteria: z.array(BoundedString).max(20),
+  acceptanceChecks: z.array(AcceptanceCheckSchema).max(20).default([]),
   constraints: z.array(BoundedString).max(20),
   completed: z.array(BoundedString).max(80),
   pending: z.array(BoundedString).max(80),
@@ -91,6 +105,38 @@ function fingerprint(value: unknown): string {
   return crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
 }
 
+function acceptanceKind(criterion: string): AcceptanceCheck['kind'] {
+  if (/\b(?:test|tests|lint|typecheck|build|compile|validation|validate|syntax|smoke)\b/i.test(criterion)) return 'validation';
+  if (/\b(?:artifact|file|document|report|output|deliverable|exists|created)\b/i.test(criterion)) return 'artifact';
+  if (/\b(?:implement|behavior|change|fix|repair|modify|mutation|requested)\b/i.test(criterion)) return 'implementation';
+  if (/\b(?:answer|response|explain|summary|recommendation)\b/i.test(criterion)) return 'response';
+  return 'general';
+}
+
+function mergeAcceptanceChecks(
+  criteria: string[],
+  existing: AcceptanceCheck[],
+  timestamp: string,
+): AcceptanceCheck[] {
+  const byCriterion = new Map(
+    existing.map(check => [check.criterion.toLowerCase().replace(/\s+/g, ' ').trim(), check]),
+  );
+  return uniqueBounded(criteria, 20).map((criterion) => {
+    const key = criterion.toLowerCase().replace(/\s+/g, ' ').trim();
+    const current = byCriterion.get(key);
+    if (current) return AcceptanceCheckSchema.parse(current);
+    return AcceptanceCheckSchema.parse({
+      id: `acceptance_${fingerprint(criterion).slice(0, 24)}`,
+      criterion,
+      kind: acceptanceKind(criterion),
+      status: 'pending',
+      required: true,
+      evidenceIds: [],
+      updatedAt: timestamp,
+    });
+  });
+}
+
 function recordFromCapsule(capsule: ContinuationCapsule): CognitiveTaskRecord {
   return {
     taskId: capsule.taskId,
@@ -121,6 +167,7 @@ export function prepareCognitiveTask(input: {
   const timestamp = now();
   if (existing?.success && (input.reuseActive || existing.data.status === 'waiting_for_user')) {
     const previous = existing.data;
+    const acceptanceCriteria = uniqueBounded([...previous.acceptanceCriteria, ...input.packet.acceptanceCriteria], 20);
     const capsule = ContinuationCapsuleSchema.parse({
       ...previous,
       activeRunId: input.runId,
@@ -130,7 +177,8 @@ export function prepareCognitiveTask(input: {
       status: previous.status === 'waiting_for_user' && !input.packet.fields.some((field) => field.status === 'blocking')
         ? 'active'
         : previous.status,
-      acceptanceCriteria: uniqueBounded([...previous.acceptanceCriteria, ...input.packet.acceptanceCriteria], 20),
+      acceptanceCriteria,
+      acceptanceChecks: mergeAcceptanceChecks(acceptanceCriteria, previous.acceptanceChecks, timestamp),
       constraints: uniqueBounded([...previous.constraints, ...input.packet.constraints], 20),
       fields: input.packet.fields,
       nextAction: input.packet.nextAction,
@@ -171,6 +219,7 @@ export function prepareCognitiveTask(input: {
     phase: input.packet.phase,
     status: input.packet.phase === 'waiting_for_user' ? 'waiting_for_user' : 'active',
     acceptanceCriteria: input.packet.acceptanceCriteria,
+    acceptanceChecks: mergeAcceptanceChecks(input.packet.acceptanceCriteria, [], timestamp),
     constraints: input.packet.constraints,
     completed: [],
     pending,
@@ -225,6 +274,7 @@ export function updateCognitiveTask(input: {
   status?: ContinuationCapsule['status'];
   completed?: string[];
   pending?: string[];
+  acceptanceChecks?: Array<z.input<typeof AcceptanceCheckSchema>>;
   decisions?: string[];
   failures?: string[];
   evidence?: Array<z.input<typeof EvidenceReferenceSchema>>;
@@ -243,6 +293,9 @@ export function updateCognitiveTask(input: {
     ...(input.evidence || []).map((item) => EvidenceReferenceSchema.parse(item)),
   ];
   const dedupedEvidence = [...new Map(evidence.map((item) => [item.id, item])).values()].slice(-200);
+  const acceptanceChecks = input.acceptanceChecks
+    ? input.acceptanceChecks.map(check => AcceptanceCheckSchema.parse(check))
+    : current.acceptanceChecks;
   const capsule = ContinuationCapsuleSchema.parse({
     ...current,
     activeRunId: input.runId,
@@ -250,6 +303,7 @@ export function updateCognitiveTask(input: {
     status: input.status || current.status,
     completed: uniqueBounded([...current.completed, ...(input.completed || [])], 80),
     pending: input.pending ? uniqueBounded(input.pending, 80) : current.pending,
+    acceptanceChecks,
     decisions: uniqueBounded([...current.decisions, ...(input.decisions || [])], 80),
     failures: uniqueBounded([...current.failures, ...(input.failures || [])], 80),
     evidence: dedupedEvidence,
@@ -261,6 +315,7 @@ export function updateCognitiveTask(input: {
       phase: input.phase || current.phase,
       completed: uniqueBounded([...current.completed, ...(input.completed || [])], 80),
       pending: input.pending ? uniqueBounded(input.pending, 80) : current.pending,
+      acceptanceChecks: acceptanceChecks.map(check => ({ id: check.id, status: check.status, evidenceIds: check.evidenceIds })),
       decisions: uniqueBounded([...current.decisions, ...(input.decisions || [])], 80),
       evidence: dedupedEvidence.map((item) => item.id),
       workspaceRevision: input.workspaceRevision || current.workspaceRevision,
@@ -281,7 +336,11 @@ export function renderContinuationCapsule(capsule: ContinuationCapsule, maxChars
     capsule.workspaceRevision ? `Workspace revision: ${capsule.workspaceRevision}` : '',
     '',
     '## Acceptance criteria',
-    ...capsule.acceptanceCriteria.map((item) => `- ${item}`),
+    ...capsule.acceptanceChecks.map((check) => (
+      `- [${check.status}] ${check.criterion}`
+      + `${check.evidenceIds.length ? ` evidence=${check.evidenceIds.join(',')}` : ''}`
+      + `${check.detail ? ` :: ${check.detail}` : ''}`
+    )),
     capsule.completed.length ? `\n## Completed\n${capsule.completed.map((item) => `- ${item}`).join('\n')}` : '',
     capsule.pending.length ? `\n## Pending\n${capsule.pending.map((item) => `- ${item}`).join('\n')}` : '',
     capsule.decisions.length ? `\n## Decisions\n${capsule.decisions.map((item) => `- ${item}`).join('\n')}` : '',

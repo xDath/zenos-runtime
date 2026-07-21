@@ -1,8 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import {
+  cognitiveMemoryBrief,
   compactMemoryHandoff,
   continuityFingerprint,
+  persistRecallFeedback,
   recallMemoryContext,
   resetMemoryClientForTests,
 } from '../app/lib/zenos-memory-client';
@@ -164,6 +169,147 @@ test('Memory recall compiles ranked records into a bounded cognitive brief', asy
     else process.env.ZENOS_RUNTIME_DISABLE_MEMORY = previous.disabled;
     if (previous.recallDisabled === undefined) delete process.env.ZENOS_RUNTIME_DISABLE_MEMORY_AUTO_RECALL;
     else process.env.ZENOS_RUNTIME_DISABLE_MEMORY_AUTO_RECALL = previous.recallDisabled;
+  }
+});
+
+test('cognitive brief local mirror survives a Runtime restart and preserves evidence references', async () => {
+  const originalFetch = globalThis.fetch;
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zenos-brief-mirror-'));
+  const mirrorPath = path.join(directory, 'brief-cache.json');
+  const previous = {
+    baseUrl: process.env.ZENOS_MEMORY_BASE_URL,
+    apiKey: process.env.ZENOS_MEMORY_API_KEY,
+    disabled: process.env.ZENOS_RUNTIME_DISABLE_MEMORY,
+    mirrorPath: process.env.ZENOS_MEMORY_BRIEF_CACHE_PATH,
+  };
+  process.env.ZENOS_MEMORY_BASE_URL = 'http://memory.test';
+  process.env.ZENOS_MEMORY_API_KEY = 'test-memory-key';
+  process.env.ZENOS_MEMORY_BRIEF_CACHE_PATH = mirrorPath;
+  delete process.env.ZENOS_RUNTIME_DISABLE_MEMORY;
+  let cloudBriefCalls = 0;
+  globalThis.fetch = async (input: string | URL | Request) => {
+    if (String(input) === 'http://memory.test/api/memory/revision') {
+      return Response.json({ success: true, namespace: 'project', revision: 'revision-brief-0001' });
+    }
+    assert.equal(String(input), 'http://memory.test/api/memory/cognitive-brief');
+    cloudBriefCalls += 1;
+    return Response.json({
+      success: true,
+      brief: {
+        version: 'zenos-cognitive-brief-v1',
+        objective: 'repair runtime continuation',
+        phase: 'repair',
+        namespaces: ['project', 'runtime.learning'],
+        sections: {
+          current_state: [{ id: 'memory-project-1', namespace: 'project', content: 'state' }],
+          relevant_procedures: [{ id: 'memory-learning-1', namespace: 'runtime.learning', content: 'procedure' }],
+        },
+        unknowns: [],
+        retrieval: {},
+        content: '# ZENOS COGNITIVE BRIEF\nVerified local mirror evidence.',
+      },
+    });
+  };
+
+  try {
+    const first = await cognitiveMemoryBrief({
+      objective: 'repair runtime continuation',
+      phase: 'repair',
+      namespace: 'project',
+      additionalNamespaces: ['runtime.learning'],
+    });
+    assert.equal(first.ok, true);
+    assert.deepEqual(first.evidenceRefs, [
+      { id: 'memory-project-1', namespace: 'project' },
+      { id: 'memory-learning-1', namespace: 'runtime.learning' },
+    ]);
+    assert.equal(cloudBriefCalls, 1);
+
+    resetMemoryClientForTests();
+    globalThis.fetch = async () => {
+      throw new Error('cloud unavailable after restart');
+    };
+    const mirrored = await cognitiveMemoryBrief({
+      objective: 'repair runtime continuation',
+      phase: 'repair',
+      namespace: 'project',
+      additionalNamespaces: ['runtime.learning'],
+    });
+    assert.equal(mirrored.ok, true);
+    assert.equal(mirrored.cacheHit, true);
+    assert.equal(mirrored.latencyMs, 0);
+    assert.match(mirrored.value || '', /Verified local mirror evidence/);
+    assert.equal(mirrored.evidenceRefs?.length, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (previous.baseUrl === undefined) delete process.env.ZENOS_MEMORY_BASE_URL;
+    else process.env.ZENOS_MEMORY_BASE_URL = previous.baseUrl;
+    if (previous.apiKey === undefined) delete process.env.ZENOS_MEMORY_API_KEY;
+    else process.env.ZENOS_MEMORY_API_KEY = previous.apiKey;
+    if (previous.disabled === undefined) delete process.env.ZENOS_RUNTIME_DISABLE_MEMORY;
+    else process.env.ZENOS_RUNTIME_DISABLE_MEMORY = previous.disabled;
+    if (previous.mirrorPath === undefined) delete process.env.ZENOS_MEMORY_BRIEF_CACHE_PATH;
+    else process.env.ZENOS_MEMORY_BRIEF_CACHE_PATH = previous.mirrorPath;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('Runtime recall feedback groups evidence by namespace and uses idempotent outcomes', async () => {
+  const originalFetch = globalThis.fetch;
+  const previous = {
+    baseUrl: process.env.ZENOS_MEMORY_BASE_URL,
+    apiKey: process.env.ZENOS_MEMORY_API_KEY,
+    disabled: process.env.ZENOS_RUNTIME_DISABLE_MEMORY,
+  };
+  process.env.ZENOS_MEMORY_BASE_URL = 'http://memory.test';
+  process.env.ZENOS_MEMORY_API_KEY = 'test-memory-key';
+  delete process.env.ZENOS_RUNTIME_DISABLE_MEMORY;
+  const requests: Array<{ body: Record<string, unknown>; idempotency: string }> = [];
+  globalThis.fetch = async (input: string | URL | Request, init?: RequestInit) => {
+    assert.equal(String(input), 'http://memory.test/api/memory/feedback');
+    const body = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>;
+    const idempotency = new Headers(init?.headers).get('idempotency-key') || '';
+    requests.push({ body, idempotency });
+    return Response.json({
+      success: true,
+      feedback: {
+        feedback_id: body.feedback_id,
+        namespace: body.namespace,
+        outcome: body.outcome,
+        requested: (body.memory_ids as unknown[]).length,
+        updated: (body.memory_ids as unknown[]).length,
+        deduplicated: false,
+      },
+    }, { status: 201 });
+  };
+
+  try {
+    const result = await persistRecallFeedback({
+      runId: 'run-feedback-runtime-1',
+      sessionId: 'session-feedback-runtime-1',
+      outcome: 'helpful',
+      evidenceRefs: [
+        { id: 'project-a', namespace: 'project' },
+        { id: 'project-a', namespace: 'project' },
+        { id: 'project-b', namespace: 'project' },
+        { id: 'learning-a', namespace: 'runtime.learning' },
+      ],
+    });
+
+    assert.equal(result.length, 2);
+    assert.equal(requests.length, 2);
+    const project = requests.find(item => item.body.namespace === 'project');
+    assert.deepEqual(project?.body.memory_ids, ['project-a', 'project-b']);
+    assert.equal(project?.body.outcome, 'helpful');
+    assert.match(project?.idempotency || '', /^recall-feedback:run-feedback-runtime-1:/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (previous.baseUrl === undefined) delete process.env.ZENOS_MEMORY_BASE_URL;
+    else process.env.ZENOS_MEMORY_BASE_URL = previous.baseUrl;
+    if (previous.apiKey === undefined) delete process.env.ZENOS_MEMORY_API_KEY;
+    else process.env.ZENOS_MEMORY_API_KEY = previous.apiKey;
+    if (previous.disabled === undefined) delete process.env.ZENOS_RUNTIME_DISABLE_MEMORY;
+    else process.env.ZENOS_RUNTIME_DISABLE_MEMORY = previous.disabled;
   }
 });
 

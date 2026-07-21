@@ -28,6 +28,7 @@ import { getRuntimeStore } from './zenos-runtime-store';
 import { createTokenBudgetPlan, estimateTokenCount } from './token-economy';
 import { authorizeTokenSpend, completeTokenBudget, settleTokenSpend, tokenGovernorSnapshot } from './token-governor';
 import {
+  GatewayExecutionReceipt,
   GatewayMemoryBrief,
   GatewayTurnPostflightInput,
   GatewayTurnPostflightRequestSchema,
@@ -47,8 +48,10 @@ import {
   runGatewayHostPlanning,
 } from './gateway-planning';
 import { compileCognitivePacket, renderCognitivePacket } from './cognitive-kernel';
-import { persistCognitiveOutcome } from './zenos-memory-client';
+import { persistCognitiveOutcome, persistRecallFeedback } from './zenos-memory-client';
 import {
+  AcceptanceCheck,
+  ContinuationCapsule,
   ContinuationCapsuleSchema,
   prepareCognitiveTask,
   renderContinuationCapsule,
@@ -166,7 +169,21 @@ function memoryCoverageScore(memory: GatewayMemoryBrief): number | undefined {
   return checks.filter(Boolean).length / checks.length;
 }
 
-function deterministicValidationState(toolSummary: string): 'passed' | 'failed' | 'unknown' {
+function deterministicValidationState(
+  toolSummary: string,
+  receipts: GatewayExecutionReceipt[] = [],
+): 'passed' | 'failed' | 'unknown' {
+  const validationReceipts = receipts.filter(receipt => (
+    receipt.kind === 'validation' || Boolean(receipt.validationKind)
+  ));
+  if (validationReceipts.length) {
+    if (validationReceipts.some(receipt => receipt.status === 'failed' || receipt.status === 'blocked')) return 'failed';
+    if (validationReceipts.every(receipt => receipt.status === 'passed')) return 'passed';
+    return 'unknown';
+  }
+
+  // Compatibility fallback for older Hermes gateways. New gateways must send
+  // structured receipts; prose is not authoritative execution evidence.
   const text = String(toolSummary || '').toLowerCase();
   if (!text.trim()) return 'unknown';
   const hasValidation = /\b(test|tests|lint|typecheck|build|compile|validation|pytest|vitest|jest|py_compile)\b/.test(text);
@@ -290,15 +307,133 @@ function workspaceMutationObserved(
     || before.changedFiles.some((file) => !after.changedFiles.some((candidate) => candidate.path === file.path));
 }
 
-function observedCodingState(toolSummary: string): { mutated: boolean; broken: boolean } {
+function observedCodingState(
+  toolSummary: string,
+  receipts: GatewayExecutionReceipt[] = [],
+): { mutated: boolean; broken: boolean } {
   const text = String(toolSummary || '');
   const hasCodeArtifact = CODE_ARTIFACT_PATTERN.test(text);
-  const mutated = MUTATING_TOOL_PATTERN.test(text)
+  const receiptMutation = receipts.some(receipt => (
+    receipt.changedFiles.length > 0
+    || (receipt.kind === 'workspace'
+      && Boolean(receipt.workspaceRevisionBefore)
+      && receipt.workspaceRevisionBefore !== receipt.workspaceRevisionAfter)
+    || receipt.metadata.mutating === true
+  ));
+  const textMutation = MUTATING_TOOL_PATTERN.test(text)
     || (hasCodeArtifact && CODING_MUTATION_PATTERN.test(text));
+  const mutated = receiptMutation || textMutation;
+  const receiptBroken = receipts.some(receipt => (
+    (receipt.kind === 'validation' || receipt.kind === 'workspace')
+    && (receipt.status === 'failed' || receipt.status === 'blocked')
+  ));
   return {
     mutated,
-    broken: mutated && BROKEN_CODE_PATTERN.test(text),
+    broken: mutated && (receiptBroken || BROKEN_CODE_PATTERN.test(text)),
   };
+}
+
+function acceptanceChecksFromEvidence(input: {
+  capsule: ContinuationCapsule;
+  decision: RouteDecision;
+  receipts: GatewayExecutionReceipt[];
+  deterministicValidation: 'passed' | 'failed' | 'unknown';
+  observedCoding: { mutated: boolean; broken: boolean };
+  workspaceMutated: boolean;
+  draft: string;
+  failed: boolean;
+}): AcceptanceCheck[] {
+  const receiptIds = input.receipts.map(receipt => receipt.receiptId);
+  const failedReceipts = input.receipts.filter(receipt => receipt.status === 'failed' || receipt.status === 'blocked');
+  const allReceiptsPassed = input.receipts.length > 0
+    && input.receipts.every(receipt => receipt.status === 'passed');
+  const artifactReceiptIds = input.receipts
+    .filter(receipt => receipt.kind === 'artifact' || receipt.artifactIds.length > 0 || receipt.changedFiles.length > 0)
+    .map(receipt => receipt.receiptId);
+  const validationReceiptIds = input.receipts
+    .filter(receipt => receipt.kind === 'validation' || Boolean(receipt.validationKind))
+    .map(receipt => receipt.receiptId);
+  const mutationReceiptIds = input.receipts
+    .filter(receipt => receipt.changedFiles.length > 0 || receipt.kind === 'workspace' || receipt.metadata.mutating === true)
+    .map(receipt => receipt.receiptId);
+  const codingTask = ['coding_change', 'debugging'].includes(input.decision.taskType);
+  const timestamp = now();
+
+  return input.capsule.acceptanceChecks.map((check) => {
+    let status = check.status;
+    let evidenceIds = check.evidenceIds;
+    let detail = check.detail;
+    if (input.failed) {
+      status = 'failed';
+      detail = 'Hermes Host reported a failed cycle.';
+    } else if (check.kind === 'validation') {
+      status = input.deterministicValidation === 'passed'
+        ? 'passed'
+        : input.deterministicValidation === 'failed'
+          ? 'failed'
+          : 'pending';
+      evidenceIds = [...new Set([...evidenceIds, ...validationReceiptIds])];
+      detail = `deterministic_validation=${input.deterministicValidation}`;
+    } else if (check.kind === 'implementation') {
+      if (input.observedCoding.broken) {
+        status = 'failed';
+        detail = 'Structured or compatibility evidence reports broken code.';
+      } else if (codingTask) {
+        status = input.observedCoding.mutated || input.workspaceMutated ? 'passed' : 'pending';
+        detail = status === 'passed'
+          ? 'Workspace mutation was observed.'
+          : 'No workspace mutation evidence was supplied.';
+      } else if (allReceiptsPassed) {
+        status = 'passed';
+        detail = 'All structured execution receipts passed.';
+      }
+      evidenceIds = [...new Set([...evidenceIds, ...mutationReceiptIds])];
+    } else if (check.kind === 'artifact') {
+      if (artifactReceiptIds.length || input.workspaceMutated) {
+        status = 'passed';
+        evidenceIds = [...new Set([...evidenceIds, ...artifactReceiptIds])];
+        detail = 'Artifact or changed-file evidence was supplied.';
+      } else if (failedReceipts.some(receipt => receipt.kind === 'artifact')) {
+        status = 'failed';
+        detail = 'Artifact production failed.';
+      } else {
+        status = 'pending';
+      }
+    } else if (check.kind === 'response') {
+      status = input.draft.trim() ? 'passed' : 'pending';
+      detail = status === 'passed' ? 'A terminal response candidate exists.' : 'No response candidate exists.';
+    } else if (input.decision.useTools) {
+      if (failedReceipts.length) {
+        status = 'failed';
+        evidenceIds = [...new Set([...evidenceIds, ...failedReceipts.map(receipt => receipt.receiptId)])];
+        detail = 'At least one structured execution receipt failed.';
+      } else if (allReceiptsPassed || (codingTask && input.deterministicValidation === 'passed' && (input.observedCoding.mutated || input.workspaceMutated))) {
+        status = 'passed';
+        evidenceIds = [...new Set([...evidenceIds, ...receiptIds])];
+        detail = allReceiptsPassed
+          ? 'All structured execution receipts passed.'
+          : 'Compatibility workspace and deterministic validation evidence passed.';
+      } else {
+        status = 'pending';
+      }
+    } else {
+      status = input.draft.trim() ? 'passed' : 'pending';
+      detail = status === 'passed' ? 'Direct Host response completed the non-tool criterion.' : detail;
+    }
+    return {
+      ...check,
+      status,
+      evidenceIds: evidenceIds.slice(0, 100),
+      detail,
+      updatedAt: timestamp,
+    };
+  });
+}
+
+function acceptanceCriteriaSatisfied(capsule: ContinuationCapsule | undefined): boolean {
+  if (!capsule) return true;
+  const required = capsule.acceptanceChecks.filter(check => check.required);
+  return required.length === 0 || required.every(check => check.status === 'passed');
 }
 
 function hostStoppedBeforeTerminalWork(draft: string, toolSummary: string): boolean {
@@ -561,7 +696,7 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
   });
   const baseBudget = createTokenBudgetPlan(decision, input, {
     userPriority: input.tokenPriority,
-    budgetId: runId,
+    budgetId: cognitiveCapsule.rootRunId,
   });
   const budget = {
     ...baseBudget,
@@ -722,6 +857,7 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
     bossCall,
     repositoryContext: repositoryContext || undefined,
     memorySource: memoryBrief.source,
+    memoryEvidenceRefs: memoryBrief.evidenceRefs || [],
     memoryCoverage: memoryCoverageScore(memoryBrief),
     latencyPlan,
     preflightLatency,
@@ -808,9 +944,10 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
     storedCognitiveRecord?.capsule || stored.continuationCapsule,
   );
   let cognitiveCapsule = parsedCognitiveCapsule.success ? parsedCognitiveCapsule.data : undefined;
+  const rootBudgetId = cognitiveCapsule?.rootRunId || request.runId;
   const turnStartedAtMs = stored.turnStartedAtMs || Date.parse(run.startedAt) || Date.now();
-  const deterministicValidation = deterministicValidationState(request.toolSummary);
-  const textObservedCoding = observedCodingState(request.toolSummary);
+  const deterministicValidation = deterministicValidationState(request.toolSummary, request.executionReceipts);
+  const textObservedCoding = observedCodingState(request.toolSummary, request.executionReceipts);
   const workspaceMutated = workspaceMutationObserved(stored.workspaceState, request.workspaceState);
   const observedCoding = {
     mutated: textObservedCoding.mutated || workspaceMutated,
@@ -895,7 +1032,7 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
   }
 
   if (cognitiveCapsule) {
-    const evidenceId = `tool:${hashRequest({
+    const fallbackEvidenceId = `tool:${hashRequest({
       runId: request.runId,
       toolSummary: request.toolSummary,
       workspaceRevision: request.workspaceState?.dirtyDiffSha256,
@@ -904,9 +1041,45 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
     const failures: string[] = [];
     if (deterministicValidation === 'passed') completed.push('Relevant deterministic validation passed in this Host cycle.');
     if (observedCoding.broken) failures.push('This cycle produced broken-code evidence; repair before deployment or completion.');
-    if (request.toolSummary.trim()) {
-      completed.push(`Host tool cycle produced bounded evidence: ${request.toolSummary.slice(0, 900)}`);
+    if (request.executionReceipts.length) {
+      completed.push(`Hermes supplied ${request.executionReceipts.length} structured execution receipt(s).`);
     }
+    const receiptEvidence = request.executionReceipts.map((receipt) => ({
+      id: receipt.receiptId,
+      kind: receipt.kind === 'validation'
+        ? 'test' as const
+        : receipt.kind === 'workspace'
+          ? 'workspace' as const
+          : receipt.kind === 'artifact'
+            ? 'file' as const
+            : 'tool' as const,
+      claim: [
+        receipt.tool ? `tool=${receipt.tool}` : '',
+        receipt.command ? `command=${receipt.command}` : '',
+        `status=${receipt.status}`,
+        receipt.exitCode !== undefined && receipt.exitCode !== null ? `exit_code=${receipt.exitCode}` : '',
+        receipt.summary,
+      ].filter(Boolean).join('; ').slice(0, 4_000),
+      confidence: receipt.status === 'passed' || receipt.status === 'failed' ? 0.99 : 0.8,
+    }));
+    const fallbackEvidence = request.executionReceipts.length === 0 && request.toolSummary.trim()
+      ? [{
+          id: fallbackEvidenceId,
+          kind: 'tool' as const,
+          claim: request.toolSummary.slice(0, 4_000),
+          confidence: deterministicValidation === 'passed' ? 0.8 : 0.6,
+        }]
+      : [];
+    const acceptanceChecks = acceptanceChecksFromEvidence({
+      capsule: cognitiveCapsule,
+      decision,
+      receipts: request.executionReceipts,
+      deterministicValidation,
+      observedCoding,
+      workspaceMutated,
+      draft: request.draft,
+      failed: request.failed,
+    });
     cognitiveCapsule = updateCognitiveTask({
       taskId: cognitiveCapsule.taskId,
       runId: request.runId,
@@ -914,19 +1087,13 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
         ? 'repair'
         : unresolvedCodingMutation
           ? 'validate'
-          : request.toolSummary.trim()
+          : request.executionReceipts.length || request.toolSummary.trim()
             ? 'validate'
             : cognitiveCapsule.phase,
       completed,
       failures,
-      evidence: request.toolSummary.trim()
-        ? [{
-            id: evidenceId,
-            kind: 'tool',
-            claim: request.toolSummary.slice(0, 4_000),
-            confidence: deterministicValidation === 'passed' ? 0.95 : 0.75,
-          }]
-        : [],
+      acceptanceChecks,
+      evidence: [...receiptEvidence, ...fallbackEvidence],
       workspaceRevision: request.workspaceState?.dirtyDiffSha256 || cognitiveCapsule.workspaceRevision,
       store,
     });
@@ -937,7 +1104,7 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
     : createLatencyBudgetPlan(decision);
   const baseBudget = createTokenBudgetPlan(decision, input, {
     userPriority: input.tokenPriority,
-    budgetId: request.runId,
+    budgetId: rootBudgetId,
   });
   const budget = {
     ...baseBudget,
@@ -1050,7 +1217,7 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
       completedAt: now(),
     });
     updateRuntimeSession(request.sessionId, { status: 'failed', lastError: 'Hermes Host reported a failed turn', activeRunId: undefined });
-    completeTokenBudget(request.runId);
+    completeTokenBudget(rootBudgetId);
     return {
       ok: false,
       finalAnswer: request.draft,
@@ -1338,11 +1505,19 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
     && !decision.requiresApproval
     && !genuineUserBlocker
     && verifierResult?.verdict !== 'block';
+  const acceptancePending = Boolean(cognitiveCapsule)
+    && cognitiveCapsule?.status === 'active'
+    && !acceptanceCriteriaSatisfied(cognitiveCapsule)
+    && !genuineUserBlocker
+    && verifierResult?.verdict !== 'block'
+    && bossDecision?.verdict !== 'block';
   const continuationReason = unresolvedCodingMutation
     ? 'coding_validation_pending' as const
-    : hostInterrupted
-      ? 'host_interrupted' as const
-      : undefined;
+    : acceptancePending
+      ? 'acceptance_pending' as const
+      : hostInterrupted
+        ? 'host_interrupted' as const
+        : undefined;
   const continuationEligible = Boolean(continuationReason)
     && Boolean(cognitiveCapsule)
     && cognitiveCapsule?.status === 'active'
@@ -1352,7 +1527,8 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
   let continuation: {
     required: true;
     continuationId: string;
-    reason: 'coding_validation_pending' | 'host_interrupted';
+    leaseToken: string;
+    reason: 'coding_validation_pending' | 'acceptance_pending' | 'host_interrupted';
     taskId: string;
     attempt: number;
     maxAttempts: number;
@@ -1376,7 +1552,9 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
   if (continuationEligible && cognitiveCapsule && continuationReason) {
     const continuationSummary = continuationReason === 'coding_validation_pending'
       ? `deterministic validation is ${deterministicValidation}`
-      : 'the Host stopped at a confirmation, context, output, or tool-iteration boundary before the root task completed';
+      : continuationReason === 'acceptance_pending'
+        ? `mandatory acceptance checks remain pending: ${cognitiveCapsule.acceptanceChecks.filter(check => check.required && check.status !== 'passed').map(check => check.criterion).join('; ').slice(0, 2_000)}`
+        : 'the Host stopped at a confirmation, context, output, or tool-iteration boundary before the root task completed';
     if (codingTaskState) {
       const nextCodingAttempt = codingTaskState.continuationAttempts + 1;
       codingTaskState = updateCodingTask(codingTaskState.taskId, {
@@ -1406,16 +1584,23 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
       workspaceRevision: request.workspaceState?.dirtyDiffSha256 || cognitiveCapsule.workspaceRevision,
       store,
     });
-    const queued = scheduleCognitiveContinuation({
+    scheduleCognitiveContinuation({
       capsule: cognitiveCapsule,
       runId: request.runId,
       reason: continuationSummary,
       store,
     });
-    const leased = store.claimContinuationForSession(request.sessionId) || queued;
+    const leased = store.claimContinuationForSession(
+      request.sessionId,
+      30 * 60_000,
+      undefined,
+      'hermes-gateway-inband',
+    );
+    if (!leased?.leaseToken) throw new Error('Durable continuation could not be leased to Hermes');
     continuation = {
       required: true,
       continuationId: leased.continuationId,
+      leaseToken: leased.leaseToken,
       reason: continuationReason,
       taskId: cognitiveCapsule.taskId,
       attempt: leased.attempt,
@@ -1443,6 +1628,7 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
   }
 
   const terminalCodingFailure = unresolvedCodingMutation && !continuation;
+  const terminalAcceptanceFailure = acceptancePending && !continuation;
   const terminalAutonomyFailure = hostInterrupted && !continuation;
   if (terminalCodingFailure) {
     finalAnswer = blockedAnswer(
@@ -1471,9 +1657,11 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
       },
       'failed',
     );
-  } else if (terminalAutonomyFailure) {
+  } else if (terminalAcceptanceFailure || terminalAutonomyFailure) {
     finalAnswer = blockedAnswer(
-      'Hermes berhenti pada batas internal sebelum acceptance criteria selesai, dan batas automatic continuation sudah habis.',
+      terminalAcceptanceFailure
+        ? 'Mandatory acceptance criteria belum memiliki bukti terstruktur yang cukup, dan batas automatic continuation sudah habis.'
+        : 'Hermes berhenti pada batas internal sebelum acceptance criteria selesai, dan batas automatic continuation sudah habis.',
       [
         'Tidak perlu membalas “gas” atau “lanjut”. Runtime harus membuka run baru hanya setelah state task direkonsiliasi.',
         `Automatic continuation limit: ${maxAutoContinuations}.`,
@@ -1483,7 +1671,9 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
     recordActivity(
       request.sessionId,
       'host',
-      'Runtime failed closed after the Host repeatedly stopped at an internal confirmation/tool-limit boundary.',
+      terminalAcceptanceFailure
+        ? 'Runtime failed closed because mandatory acceptance checks remained unresolved after the continuation budget ended.'
+        : 'Runtime failed closed after the Host repeatedly stopped at an internal confirmation/tool-limit boundary.',
       {
         runId: request.runId,
         turnId: request.turnId,
@@ -1494,7 +1684,7 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
     );
   }
 
-  const terminalFailure = terminalCodingFailure || terminalAutonomyFailure;
+  const terminalFailure = terminalCodingFailure || terminalAcceptanceFailure || terminalAutonomyFailure;
 
   if (cognitiveCapsule) {
     if (terminalFailure || bossDecision?.verdict === 'block' || verifierResult?.verdict === 'block') {
@@ -1506,8 +1696,10 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
         failures: [
           terminalCodingFailure
             ? 'Code mutation did not pass deterministic validation before the continuation budget ended.'
-            : terminalAutonomyFailure
-              ? 'Host repeatedly stopped at an internal boundary until the continuation budget ended.'
+            : terminalAcceptanceFailure
+              ? 'Mandatory acceptance checks remained unresolved until the continuation budget ended.'
+              : terminalAutonomyFailure
+                ? 'Host repeatedly stopped at an internal boundary until the continuation budget ended.'
               : bossDecision?.verdict === 'block'
                 ? `Boss blocked completion: ${bossDecision.reasoningSummary}`
                 : 'Verifier blocked completion.',
@@ -1564,6 +1756,8 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
       receipt,
       modelCalls: calls,
       tokenBudget: finalTokenBudget,
+      executionReceipts: request.executionReceipts,
+      acceptanceChecks: cognitiveCapsule?.acceptanceChecks,
       codingValidation: observedCoding.mutated
         ? { deterministic: deterministicValidation, broken: observedCoding.broken }
         : undefined,
@@ -1572,9 +1766,11 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
     },
     errors: terminalCodingFailure
       ? ['Code mutation did not pass deterministic validation']
-      : terminalAutonomyFailure
-        ? ['Host stopped before terminal work and automatic continuation was exhausted']
-        : [],
+      : terminalAcceptanceFailure
+        ? ['Mandatory acceptance checks remained unresolved']
+        : terminalAutonomyFailure
+          ? ['Host stopped before terminal work and automatic continuation was exhausted']
+          : [],
     completedAt: now(),
   });
   accountGatewayModelUsage(request.sessionId, calls, request.hostUsage);
@@ -1636,13 +1832,29 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
     },
   }).catch(() => undefined);
 
+  if (!continuation && stored.memoryEvidenceRefs.length) {
+    const feedbackOutcome = outcomeVerdict === 'success'
+      ? 'helpful' as const
+      : outcomeVerdict === 'failed' || outcomeVerdict === 'blocked'
+        ? 'not_helpful' as const
+        : 'unused' as const;
+    void persistRecallFeedback({
+      runId: request.runId,
+      sessionId: request.sessionId,
+      outcome: feedbackOutcome,
+      evidenceRefs: stored.memoryEvidenceRefs,
+    }).catch(() => undefined);
+  }
+
   if (terminalFailure) {
     updateRuntimeSession(request.sessionId, {
       status: 'failed',
       finalAnswer,
       lastError: terminalCodingFailure
         ? 'Code mutation did not pass deterministic validation'
-        : 'Host stopped before terminal work and automatic continuation was exhausted',
+        : terminalAcceptanceFailure
+          ? 'Mandatory acceptance checks remained unresolved'
+          : 'Host stopped before terminal work and automatic continuation was exhausted',
       activeRunId: undefined,
     });
   } else if (continuation) {
@@ -1673,7 +1885,7 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
   } else {
     completeRuntimeSession(request.sessionId, finalAnswer);
   }
-  completeTokenBudget(request.runId);
+  if (!continuation) completeTokenBudget(rootBudgetId);
 
   return {
     ok: !terminalFailure,

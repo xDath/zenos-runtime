@@ -325,7 +325,7 @@ def prepare_hermes_config(source: Path, destination: Path) -> None:
         data["compression"] = compression
     compression.update({
         "enabled": True,
-        "threshold": 0.16,
+        "threshold": 0.20,
         "target_ratio": 0.35,
         "protect_first_n": 3,
         "protect_last_n": 12,
@@ -343,7 +343,7 @@ def prepare_hermes_config(source: Path, destination: Path) -> None:
         "url": "http://127.0.0.1:3090",
         "fail_open": True,
         "max_history_chars": 64_000,
-        "context_soft_limit_tokens": 160_000,
+        "context_soft_limit_tokens": 140_000,
         "handoff_history_chars": 240_000,
         "handoff_max_messages": 300,
         "disable_streaming_when_verified": True,

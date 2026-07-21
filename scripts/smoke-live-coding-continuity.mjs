@@ -103,7 +103,7 @@ try {
   assert.equal(preflight.holdFinalDelivery, true, JSON.stringify(preflight));
   assert.ok(preflight.codingTaskId, JSON.stringify(preflight));
   assert.equal(preflight.codingPhase, 'inspect', JSON.stringify(preflight));
-  assert.ok(preflight.hostWorkingSetTokens >= 160_000, JSON.stringify(preflight));
+  assert.ok(preflight.hostWorkingSetTokens >= 140_000, JSON.stringify(preflight));
 
   const postflight = await runtimeRequest('/api/runtime/gateway/postflight', {
     sessionId,

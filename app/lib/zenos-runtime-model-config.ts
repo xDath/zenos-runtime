@@ -113,6 +113,7 @@ export function mergeModelSlots(...configs: RuntimeModelSlots[]): RuntimeModelSl
 }
 
 export function providerForSlot(config: RuntimeModelSlots, _slot: RuntimeModelSlot): string {
+  void _slot;
   // Zenos Cognitive Runtime has one session model. Legacy per-role fields are
   // still parsed so old files remain readable, but every auxiliary call and
   // native Hermes worker inherits the current Host provider.
@@ -120,14 +121,17 @@ export function providerForSlot(config: RuntimeModelSlots, _slot: RuntimeModelSl
 }
 
 export function modelForSlot(config: RuntimeModelSlots, _slot: RuntimeModelSlot): string {
+  void _slot;
   return config.hostModel || '';
 }
 
 export function baseUrlForSlot(config: RuntimeModelSlots, _slot: RuntimeModelSlot): string {
+  void _slot;
   return config.hostBaseUrl || config.baseUrl || '';
 }
 
 export function apiKeyForSlot(config: RuntimeModelSlots, _slot: RuntimeModelSlot): string {
+  void _slot;
   return config.hostApiKey || config.apiKey || '';
 }
 

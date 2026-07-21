@@ -44,7 +44,7 @@ zenos_runtime:
   receipt: concise
   timeout_seconds: 180
   max_history_chars: 16000
-  context_soft_limit_tokens: 160000
+  context_soft_limit_tokens: 140000
   handoff_history_chars: 240000
   handoff_max_messages: 300
   disable_streaming_when_verified: true

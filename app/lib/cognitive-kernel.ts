@@ -302,7 +302,7 @@ export function compileCognitivePacket(input: {
   const capabilities = capabilitiesFor(input.request, input.decision);
   const phase = initialPhase(input.request, input.decision, input.repositoryContext);
   const configuredCycles = Number(process.env.ZENOS_COGNITIVE_MAX_CONTINUATIONS || 6);
-  const configuredCompactAt = Number(process.env.ZENOS_COGNITIVE_COMPACT_AT_TOKENS || 160_000);
+  const configuredCompactAt = Number(process.env.ZENOS_COGNITIVE_COMPACT_AT_TOKENS || 140_000);
   return CognitivePacketSchema.parse({
     version: 'zenos-cognitive-packet-v1',
     rootObjective: input.request.request,
@@ -322,7 +322,7 @@ export function compileCognitivePacket(input: {
     continuation: {
       enabled: input.decision.taskType !== 'simple_chat',
       maxCycles: Math.max(1, Math.min(Number.isFinite(configuredCycles) ? configuredCycles : 6, 12)),
-      compactAtTokens: Math.max(8_000, Math.min(Number.isFinite(configuredCompactAt) ? configuredCompactAt : 160_000, 500_000)),
+      compactAtTokens: Math.max(8_000, Math.min(Number.isFinite(configuredCompactAt) ? configuredCompactAt : 140_000, 500_000)),
       preserveRecentMessages: 10,
       askUserOnlyForBlockingFields: true,
       terminalConditions: [

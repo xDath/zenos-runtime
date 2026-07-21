@@ -1,4 +1,6 @@
 import * as crypto from 'node:crypto';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { z } from 'zod';
 import { log, redactText } from './logger';
 import { incrementMetric, observeDuration, setGauge } from './metrics';
@@ -41,6 +43,11 @@ const BootstrapResponseSchema = z.object({
   count: z.number().int().nonnegative().optional().default(0),
 }).passthrough();
 
+const CognitiveBriefItemSchema = z.object({
+  id: z.string().trim().min(1),
+  namespace: z.string().trim().min(1),
+}).passthrough();
+
 const CognitiveBriefResponseSchema = z.object({
   success: z.boolean().optional(),
   brief: z.object({
@@ -48,6 +55,7 @@ const CognitiveBriefResponseSchema = z.object({
     objective: z.string(),
     phase: z.string(),
     namespaces: z.array(z.string()).default([]),
+    sections: z.record(z.string(), z.array(CognitiveBriefItemSchema)).optional().default({}),
     content: z.string().default(''),
     unknowns: z.array(z.string()).optional().default([]),
     retrieval: z.record(z.string(), z.unknown()).optional(),
@@ -75,14 +83,28 @@ const RevisionResponseSchema = z.object({
   revision: z.string().min(8),
 }).passthrough();
 
+const RecallFeedbackResponseSchema = z.object({
+  success: z.boolean(),
+  feedback: z.object({
+    feedback_id: z.string(),
+    namespace: z.string(),
+    outcome: z.enum(['helpful', 'not_helpful', 'unused']),
+    requested: z.number().int().nonnegative(),
+    updated: z.number().int().nonnegative(),
+    deduplicated: z.boolean(),
+  }).passthrough(),
+}).passthrough();
+
 export type MemoryItem = z.infer<typeof MemoryResultSchema>;
 export type MemoryCoverage = z.infer<typeof MemoryCoverageSchema>;
+export type MemoryEvidenceRef = { id: string; namespace: string };
 export type MemoryScope = 'memory:read' | 'memory:write' | 'memory:admin';
 
 export type MemoryClientResult<T> = {
   ok: boolean;
   skipped: boolean;
   value?: T;
+  evidenceRefs?: MemoryEvidenceRef[];
   status?: number;
   error?: string;
   latencyMs?: number;
@@ -98,6 +120,21 @@ let circuit: CircuitState = { failures: 0, openUntil: 0 };
 const inFlightTokens = new Map<string, Promise<string>>();
 const namespaceRevisions = new Map<string, { revision: string; expiresAt: number }>();
 const inFlightRevisions = new Map<string, Promise<string>>();
+type PersistentBriefRecord = {
+  value: string;
+  evidenceRefs: MemoryEvidenceRef[];
+  updatedAt: number;
+  objective: string;
+  namespace: string;
+  phase: string;
+};
+
+type CognitiveBriefCacheRecord = {
+  value: string;
+  evidenceRefs: MemoryEvidenceRef[];
+};
+const lastKnownCognitiveBriefs = new Map<string, PersistentBriefRecord>();
+let persistentBriefsLoaded = false;
 const EMPTY_SHA256 = crypto.createHash('sha256').update('').digest('hex');
 
 function memoryBaseUrl(): string {
@@ -116,6 +153,107 @@ function memorySecret(): string {
 
 function memoryApiKey(): string {
   return process.env.ZENOS_MEMORY_API_KEY || '';
+}
+
+function persistentBriefCachePath(): string {
+  if (process.env.ZENOS_MEMORY_BRIEF_CACHE_PATH) return process.env.ZENOS_MEMORY_BRIEF_CACHE_PATH;
+  return process.env.NODE_ENV === 'production'
+    ? '/var/cache/zenos-runtime/memory-brief-cache.json'
+    : path.join(process.cwd(), '.data', 'memory-brief-cache.json');
+}
+
+function ensurePersistentBriefsLoaded(): void {
+  if (persistentBriefsLoaded) return;
+  persistentBriefsLoaded = true;
+  try {
+    const raw = JSON.parse(fs.readFileSync(persistentBriefCachePath(), 'utf8')) as unknown;
+    if (!Array.isArray(raw)) return;
+    for (const item of raw.slice(-256)) {
+      if (!item || typeof item !== 'object') continue;
+      const record = item as Record<string, unknown>;
+      const key = typeof record.key === 'string' ? record.key : '';
+      const value = typeof record.value === 'string' ? record.value : '';
+      const updatedAt = typeof record.updatedAt === 'number' ? record.updatedAt : 0;
+      if (!key || !value || !updatedAt) continue;
+      const evidenceRefs = Array.isArray(record.evidenceRefs)
+        ? record.evidenceRefs.flatMap((item) => {
+            if (!item || typeof item !== 'object') return [];
+            const ref = item as Record<string, unknown>;
+            const id = typeof ref.id === 'string' ? ref.id.trim() : '';
+            const namespace = typeof ref.namespace === 'string' ? ref.namespace.trim() : '';
+            return id && namespace ? [{ id: id.slice(0, 220), namespace: namespace.slice(0, 120) }] : [];
+          }).slice(0, 60)
+        : [];
+      lastKnownCognitiveBriefs.set(key, {
+        value: value.slice(0, 24_000),
+        evidenceRefs,
+        updatedAt,
+        objective: typeof record.objective === 'string' ? record.objective.slice(0, 12_000) : '',
+        namespace: typeof record.namespace === 'string' ? record.namespace.slice(0, 120) : '',
+        phase: typeof record.phase === 'string' ? record.phase.slice(0, 40) : '',
+      });
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+      log('warn', 'Failed to load persistent Memory brief mirror', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+}
+
+function persistBriefMirror(): void {
+  try {
+    const file = persistentBriefCachePath();
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    const rows = [...lastKnownCognitiveBriefs.entries()]
+      .sort((left, right) => left[1].updatedAt - right[1].updatedAt)
+      .slice(-256)
+      .map(([key, record]) => ({ key, ...record }));
+    const temporary = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(temporary, JSON.stringify(rows), { encoding: 'utf8', mode: 0o600 });
+    fs.renameSync(temporary, file);
+  } catch (error) {
+    log('warn', 'Failed to persist local Memory brief mirror', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+function objectiveSimilarity(left: string, right: string): number {
+  const tokens = (value: string) => new Set(
+    value.toLowerCase().normalize('NFKC').replace(/[^\p{L}\p{N}]+/gu, ' ').split(/\s+/)
+      .filter(token => token.length > 2),
+  );
+  const a = tokens(left);
+  const b = tokens(right);
+  if (!a.size || !b.size) return 0;
+  let intersection = 0;
+  for (const token of a) if (b.has(token)) intersection += 1;
+  return intersection / Math.max(1, Math.min(a.size, b.size));
+}
+
+function bestPersistentBrief(input: {
+  exactKey: string;
+  objective: string;
+  namespace: string;
+  phase: string;
+  maxAgeMs: number;
+}): PersistentBriefRecord | undefined {
+  ensurePersistentBriefsLoaded();
+  const exact = lastKnownCognitiveBriefs.get(input.exactKey);
+  if (exact && Date.now() - exact.updatedAt <= input.maxAgeMs) return exact;
+  return [...lastKnownCognitiveBriefs.values()]
+    .filter(record => (
+      record.namespace === input.namespace
+      && record.phase === input.phase
+      && Date.now() - record.updatedAt <= input.maxAgeMs
+      && objectiveSimilarity(record.objective, input.objective) >= 0.35
+    ))
+    .sort((left, right) => (
+      objectiveSimilarity(right.objective, input.objective) - objectiveSimilarity(left.objective, input.objective)
+      || right.updatedAt - left.updatedAt
+    ))[0];
 }
 
 function scopesKey(scopes: MemoryScope[]): string {
@@ -311,7 +449,7 @@ function fallbackRevision(namespace: string): string {
 function setNamespaceRevision(namespace: string, revision: string, ttlMs?: number): string {
   namespaceRevisions.set(namespace, {
     revision,
-    expiresAt: Date.now() + Math.max(500, ttlMs || Number(process.env.ZENOS_MEMORY_REVISION_CACHE_MS || 2_000)),
+    expiresAt: Date.now() + Math.max(500, ttlMs || Number(process.env.ZENOS_MEMORY_REVISION_CACHE_MS || 300_000)),
   });
   return revision;
 }
@@ -320,29 +458,46 @@ function bumpNamespaceRevision(namespace: string, evidence = ''): string {
   const revision = crypto.createHash('sha256')
     .update(`${namespace}\n${evidence}\n${Date.now()}\n${crypto.randomUUID()}`)
     .digest('hex');
-  return setNamespaceRevision(namespace, revision, 2_000);
+  return setNamespaceRevision(namespace, revision, 300_000);
 }
 
 async function currentNamespaceRevision(namespace: string, force = false): Promise<string> {
   const cached = namespaceRevisions.get(namespace);
   if (!force && cached && Date.now() < cached.expiresAt) return cached.revision;
-  if (!force) {
-    const existing = inFlightRevisions.get(namespace);
-    if (existing) return existing;
-  }
-  const request = (async () => {
+
+  const existing = inFlightRevisions.get(namespace);
+  if (force && existing) return existing;
+
+  const refresh = existing || (async () => {
     const result = await memoryFetch<z.infer<typeof RevisionResponseSchema>>(
       '/api/memory/revision',
       { namespace },
-      { scopes: ['memory:read'], parser: RevisionResponseSchema, timeoutMs: 10_000 },
+      { scopes: ['memory:read'], parser: RevisionResponseSchema, timeoutMs: 3_000 },
     );
     if (!result.ok || !result.value?.revision) {
       return cached?.revision || fallbackRevision(namespace);
     }
     return setNamespaceRevision(namespace, result.value.revision);
   })().finally(() => inFlightRevisions.delete(namespace));
-  inFlightRevisions.set(namespace, request);
-  return request;
+  if (!existing) inFlightRevisions.set(namespace, refresh);
+
+  if (force) return refresh;
+  // Revision discovery must never put Google Drive/Vercel latency on the Host
+  // hot path. Use the last known revision immediately and refresh it in the
+  // background. Local writes still call bumpNamespaceRevision synchronously.
+  const immediate = cached?.revision
+    || setNamespaceRevision(namespace, fallbackRevision(namespace), 30_000);
+  void refresh.catch(() => undefined);
+  return immediate;
+}
+
+async function compositeNamespaceRevision(namespaces: string[]): Promise<string> {
+  const normalized = [...new Set(namespaces.map(value => value.trim()).filter(Boolean))].sort();
+  const revisions = await Promise.all(normalized.map(async namespace => ({
+    namespace,
+    revision: await currentNamespaceRevision(namespace),
+  })));
+  return crypto.createHash('sha256').update(JSON.stringify(revisions)).digest('hex');
 }
 
 export async function recallMemoryItems(input: {
@@ -411,66 +566,141 @@ function memoryBriefRank(item: MemoryItem): number {
   return score * 3 + confidence + importance - statusPenalty;
 }
 
+function cognitiveEvidenceRefs(
+  brief: z.infer<typeof CognitiveBriefResponseSchema>['brief'],
+): MemoryEvidenceRef[] {
+  const refs = Object.values(brief.sections || {}).flat().map(item => ({
+    id: item.id,
+    namespace: item.namespace,
+  }));
+  return [...new Map(refs.map(ref => [`${ref.namespace}:${ref.id}`, ref])).values()].slice(0, 60);
+}
+
 export async function cognitiveMemoryBrief(input: {
   objective: string;
   phase?: string;
   latestError?: string;
   namespace?: string;
   sharedNamespace?: string;
+  additionalNamespaces?: string[];
   artifactHints?: string[];
   limit?: number;
   maxChars?: number;
 }): Promise<MemoryClientResult<string>> {
   const namespace = input.namespace || process.env.ZENOS_MEMORY_NAMESPACE || 'zenos';
+  const additionalNamespaces = [...new Set((input.additionalNamespaces || []).map(value => value.trim()).filter(Boolean))].slice(0, 4);
   const maxChars = Math.min(Math.max(input.maxChars || 8_000, 1_500), 24_000);
   const limit = Math.min(Math.max(input.limit || 24, 4), 60);
-  const revision = await currentNamespaceRevision(namespace);
+  const revision = await compositeNamespaceRevision([
+    namespace,
+    input.sharedNamespace || '',
+    ...additionalNamespaces,
+  ]);
   const cache = getRuntimeCache();
-  const cacheKey = runtimeCacheKey('memory', {
+  const cacheInput = {
     kind: 'cognitive-brief',
     objective: input.objective,
     phase: input.phase || '',
     latestError: input.latestError || '',
     namespace,
     sharedNamespace: input.sharedNamespace || '',
+    additionalNamespaces,
     artifactHints: input.artifactHints || [],
     limit,
     maxChars,
-  }, { memory: revision });
-  const cached = cache.get<string>(cacheKey, { memory: revision });
+  };
+  const cacheKey = runtimeCacheKey('memory', cacheInput, { memory: revision });
+  const staleKey = runtimeCacheKey('memory', { ...cacheInput, kind: 'cognitive-brief-last-known' });
+  const cached = cache.get<CognitiveBriefCacheRecord>(cacheKey, { memory: revision });
   if (cached !== undefined) {
-    return { ok: true, skipped: false, value: cached, cacheHit: true, latencyMs: 0 };
+    return {
+      ok: true,
+      skipped: false,
+      value: cached.value,
+      evidenceRefs: cached.evidenceRefs,
+      cacheHit: true,
+      latencyMs: 0,
+    };
   }
-  const result = await memoryFetch<z.infer<typeof CognitiveBriefResponseSchema>>('/api/memory/cognitive-brief', {
+  const maxStaleMs = Math.max(
+    60_000,
+    Math.min(Number(process.env.ZENOS_MEMORY_COGNITIVE_BRIEF_MAX_STALE_MS || 24 * 60 * 60 * 1_000), 7 * 24 * 60 * 60 * 1_000),
+  );
+  const phase = input.phase || '';
+  const fetchBrief = () => memoryFetch<z.infer<typeof CognitiveBriefResponseSchema>>('/api/memory/cognitive-brief', {
     objective: input.objective,
     phase: input.phase,
     latest_error: input.latestError,
     namespace,
     shared_namespace: input.sharedNamespace,
+    additional_namespaces: additionalNamespaces,
     artifact_hints: input.artifactHints,
     limit,
     max_chars: maxChars,
   }, {
     scopes: ['memory:read'],
     parser: CognitiveBriefResponseSchema,
-    timeoutMs: Math.min(30_000, timeoutValue()),
+    timeoutMs: Math.max(2_000, Math.min(Number(process.env.ZENOS_MEMORY_COGNITIVE_BRIEF_TIMEOUT_MS || 6_000), 12_000)),
   });
-  if (!result.ok || !result.value) {
+  const storeFreshBrief = (
+    result: MemoryClientResult<z.infer<typeof CognitiveBriefResponseSchema>>,
+  ): CognitiveBriefCacheRecord | undefined => {
+    if (!result.ok || !result.value) return undefined;
+    const value = redactText(result.value.brief.content).slice(0, maxChars);
+    const evidenceRefs = cognitiveEvidenceRefs(result.value.brief);
+    const cachedValue = { value, evidenceRefs };
+    lastKnownCognitiveBriefs.set(staleKey, {
+      value,
+      evidenceRefs,
+      updatedAt: Date.now(),
+      objective: input.objective,
+      namespace,
+      phase,
+    });
+    persistBriefMirror();
+    cache.set(cacheKey, cachedValue, {
+      ttlMs: Math.max(15_000, Number(process.env.ZENOS_MEMORY_COGNITIVE_BRIEF_CACHE_MS || 90_000)),
+      revisions: { memory: revision },
+    });
+    return cachedValue;
+  };
+
+  const localMirror = bestPersistentBrief({
+    exactKey: staleKey,
+    objective: input.objective,
+    namespace,
+    phase,
+    maxAgeMs: maxStaleMs,
+  });
+  if (localMirror) {
+    // Local mirror is authoritative for latency, while cloud refresh is
+    // best-effort and never blocks the Host turn.
+    void fetchBrief().then(storeFreshBrief).catch(() => undefined);
+    incrementMetric('memory_cognitive_brief_local_mirror_total');
     return {
-      ok: false,
-      skipped: result.skipped,
-      status: result.status,
-      error: result.error,
-      latencyMs: result.latencyMs,
-      degraded: result.degraded,
+      ok: true,
+      skipped: false,
+      value: localMirror.value.slice(0, maxChars),
+      evidenceRefs: localMirror.evidenceRefs,
+      latencyMs: 0,
+      degraded: true,
+      cacheHit: true,
     };
   }
-  const value = redactText(result.value.brief.content).slice(0, maxChars);
-  cache.set(cacheKey, value, {
-    ttlMs: Math.max(15_000, Number(process.env.ZENOS_MEMORY_COGNITIVE_BRIEF_CACHE_MS || 90_000)),
-    revisions: { memory: revision },
-  });
-  return { ...result, value };
+
+  const result = await fetchBrief();
+  const stored = storeFreshBrief(result);
+  if (stored !== undefined) {
+    return { ...result, value: stored.value, evidenceRefs: stored.evidenceRefs };
+  }
+  return {
+    ok: false,
+    skipped: result.skipped,
+    status: result.status,
+    error: result.error,
+    latencyMs: result.latencyMs,
+    degraded: result.degraded,
+  };
 }
 
 export async function recallMemoryContext(input: {
@@ -710,6 +940,54 @@ export async function bootstrapMemoryContext(input: {
   return { ...result, value };
 }
 
+export async function persistRecallFeedback(input: {
+  runId: string;
+  sessionId: string;
+  outcome: 'helpful' | 'not_helpful' | 'unused';
+  evidenceRefs: MemoryEvidenceRef[];
+}): Promise<Array<MemoryClientResult<z.infer<typeof RecallFeedbackResponseSchema>>>> {
+  if (process.env.ZENOS_RUNTIME_DISABLE_RECALL_FEEDBACK === 'true') return [];
+  const grouped = new Map<string, string[]>();
+  for (const ref of input.evidenceRefs.slice(0, 60)) {
+    const namespace = ref.namespace.trim();
+    const id = ref.id.trim();
+    if (!namespace || !id) continue;
+    const ids = grouped.get(namespace) || [];
+    if (!ids.includes(id)) ids.push(id);
+    grouped.set(namespace, ids);
+  }
+  const results = await Promise.all([...grouped.entries()].map(async ([namespace, memoryIds]) => {
+    const feedbackId = `recall-feedback:${input.runId}:${crypto.createHash('sha256').update(namespace).digest('hex').slice(0, 20)}`;
+    const result = await memoryFetch<z.infer<typeof RecallFeedbackResponseSchema>>('/api/memory/feedback', {
+      feedback_id: feedbackId,
+      namespace,
+      outcome: input.outcome,
+      memory_ids: memoryIds,
+      run_id: input.runId,
+      session_id: input.sessionId,
+      source: 'zenos-runtime-outcome-v1',
+    }, {
+      scopes: ['memory:read', 'memory:write'],
+      parser: RecallFeedbackResponseSchema,
+      timeoutMs: Math.max(2_000, Math.min(Number(process.env.ZENOS_MEMORY_FEEDBACK_TIMEOUT_MS || 8_000), 20_000)),
+      idempotencyKey: feedbackId,
+    });
+    if (result.ok) bumpNamespaceRevision(namespace, feedbackId);
+    else if (!result.skipped) {
+      log('warn', 'Failed to persist recall feedback', {
+        runId: input.runId,
+        sessionId: input.sessionId,
+        namespace,
+        outcome: input.outcome,
+        status: result.status,
+        error: result.error,
+      });
+    }
+    return result;
+  }));
+  return results;
+}
+
 export async function persistCognitiveOutcome(input: {
   namespace?: string;
   runId: string;
@@ -731,8 +1009,11 @@ export async function persistCognitiveOutcome(input: {
     return { ok: false, skipped: true, error: 'Cognitive outcome learning is disabled' };
   }
   const namespace = input.namespace || process.env.ZENOS_MEMORY_LEARNING_NAMESPACE || 'runtime.learning';
+  // Only deterministic execution evidence may graduate into procedural
+  // memory. A persuasive Host answer or validation=unknown remains an episode,
+  // never a reusable "validated" procedure.
   const successful = input.verdict === 'success'
-    && (input.deterministicValidation === 'passed' || input.deterministicValidation === 'unknown');
+    && input.deterministicValidation === 'passed';
   const memoryType = successful ? 'procedure' : 'insight';
   const boundedToolSummary = redactText(input.toolSummary || '').replace(/\s+/g, ' ').trim().slice(0, 3_000);
   const lines = [
@@ -782,7 +1063,9 @@ export async function persistCognitiveOutcome(input: {
         run_id: input.runId,
         session_id: input.sessionId,
       },
+      deterministic_validation: input.deterministicValidation || 'unknown',
       procedure_success_count: successful ? 1 : 0,
+      procedure_success_sessions: successful ? [input.sessionId] : undefined,
       procedure_promotion_status: successful ? 'candidate' : undefined,
       procedure_signature: procedureSignature,
     },
@@ -974,5 +1257,7 @@ export function resetMemoryClientForTests(): void {
   inFlightTokens.clear();
   namespaceRevisions.clear();
   inFlightRevisions.clear();
+  lastKnownCognitiveBriefs.clear();
+  persistentBriefsLoaded = false;
   circuit = { failures: 0, openUntil: 0 };
 }

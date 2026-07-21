@@ -194,9 +194,10 @@ test('unfinished work creates a leased durable continuation and keeps one root c
 
     assert.equal(postflight.ok, true);
     assert.equal(postflight.continuation?.required, true);
-    assert.equal(postflight.continuation?.reason, 'host_interrupted');
+    assert.equal(postflight.continuation?.reason, 'acceptance_pending');
     assert.equal(postflight.continuation?.taskId, preflight.cognitiveTaskId);
     assert.ok(postflight.continuation?.continuationId);
+    assert.ok(postflight.continuation?.leaseToken);
     assert.match(postflight.continuation?.prompt || '', /ZENOS ACTIVE TASK CAPSULE/);
     assert.match(postflight.continuation?.prompt || '', /not a new user request/i);
     assert.equal(getRuntimeSession('cognitive-continuation-session')?.status, 'working');
@@ -223,6 +224,146 @@ test('unfinished work creates a leased durable continuation and keeps one root c
     assert.equal(abortBody.run?.status, 'done');
     assert.equal(abortBody.cognitiveTasks?.[0]?.status, 'cancelled');
     assert.equal(abortBody.continuationRecords?.[0]?.status, 'cancelled');
+  } finally {
+    globalThis.fetch = originalFetch;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('structured mutation and validation receipts complete coding acceptance without a false continuation', async () => {
+  const originalFetch = globalThis.fetch;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zenos-cognitive-receipts-'));
+  fs.mkdirSync(path.join(root, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({ name: 'cognitive-receipts' }));
+  fs.writeFileSync(path.join(root, 'src', 'main.ts'), 'export const value = 1;\n');
+  globalThis.fetch = async () => {
+    throw new Error('No auxiliary model call is expected');
+  };
+
+  try {
+    const preflight = await preflightGatewayTurn({
+      request: 'implementasikan perubahan ini dan jalankan targeted test sampai lulus',
+      sessionId: 'cognitive-receipts-session',
+      turnId: 'cognitive-receipts-turn',
+      platform: 'telegram',
+      host: { model: 'runtime-host', provider: 'test-router' },
+      workspaceRoot: root,
+      hasFiles: true,
+      hasCodeChangeIntent: true,
+      intent: 'mutate',
+      modelOverrides: legacyOverrides(),
+    });
+
+    const postflight = await postflightGatewayTurn({
+      sessionId: 'cognitive-receipts-session',
+      runId: preflight.runId,
+      turnId: 'cognitive-receipts-turn',
+      draft: 'Perubahan selesai dan targeted test lulus.',
+      host: { model: 'runtime-host', provider: 'test-router' },
+      workspaceState: {
+        workspaceRoot: root,
+        gitHead: 'test-head',
+        dirtyDiffSha256: 'a'.repeat(64),
+        changedFiles: [{
+          path: 'src/main.ts',
+          exists: true,
+          sha256: 'b'.repeat(64),
+        }],
+        clean: false,
+        capturedAt: new Date().toISOString(),
+      },
+      executionReceipts: [
+        {
+          receiptId: 'receipt-workspace-1',
+          kind: 'workspace',
+          tool: 'apply_patch',
+          status: 'passed',
+          summary: 'Updated src/main.ts.',
+          changedFiles: ['src/main.ts'],
+          artifactIds: [],
+          metadata: { mutating: true },
+        },
+        {
+          receiptId: 'receipt-validation-1',
+          kind: 'validation',
+          tool: 'terminal',
+          status: 'passed',
+          command: 'npm test -- src/main.test.ts',
+          exitCode: 0,
+          validationKind: 'test',
+          summary: 'Targeted test passed.',
+          changedFiles: [],
+          artifactIds: [],
+          metadata: {},
+        },
+      ],
+      hostUsage: { inputTokens: 420, outputTokens: 65, calls: 2 },
+    });
+
+    assert.equal(postflight.ok, true, JSON.stringify(postflight));
+    assert.equal(postflight.continuation, undefined);
+    assert.equal(postflight.cognitivePhase, 'complete');
+    assert.equal(getRuntimeSession('cognitive-receipts-session')?.status, 'done');
+    const task = getRuntimeStore().getCognitiveTask(preflight.cognitiveTaskId || '');
+    assert.equal(task?.status, 'completed');
+    const checks = (task?.capsule as { acceptanceChecks?: Array<{ status: string }> }).acceptanceChecks || [];
+    assert.ok(checks.length > 0);
+    assert.equal(checks.every(check => check.status === 'passed'), true, JSON.stringify(checks));
+  } finally {
+    globalThis.fetch = originalFetch;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('hidden continuation cycles share one root token governor', async () => {
+  const originalFetch = globalThis.fetch;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zenos-root-budget-'));
+  fs.mkdirSync(path.join(root, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({ name: 'root-budget' }));
+  fs.writeFileSync(path.join(root, 'src', 'main.ts'), 'export const value = 1;\n');
+  globalThis.fetch = async () => {
+    throw new Error('No auxiliary model call is expected');
+  };
+
+  try {
+    const first = await preflightGatewayTurn({
+      request: 'selesaikan perubahan ini sampai test lulus',
+      sessionId: 'root-budget-session',
+      turnId: 'root-budget-turn-1',
+      platform: 'telegram',
+      host: { model: 'runtime-host', provider: 'test-router' },
+      workspaceRoot: root,
+      hasFiles: true,
+      hasCodeChangeIntent: true,
+      intent: 'mutate',
+      modelOverrides: legacyOverrides(),
+    });
+    const firstPostflight = await postflightGatewayTurn({
+      sessionId: 'root-budget-session',
+      runId: first.runId,
+      turnId: 'root-budget-turn-1',
+      draft: 'Implementation is still pending.',
+      host: { model: 'runtime-host', provider: 'test-router' },
+      hostUsage: { inputTokens: 300, outputTokens: 50, calls: 1 },
+    });
+    assert.ok(firstPostflight.continuation?.prompt);
+
+    const second = await preflightGatewayTurn({
+      request: firstPostflight.continuation?.prompt || 'continue internally',
+      sessionId: 'root-budget-session',
+      turnId: 'root-budget-turn-2',
+      platform: 'telegram',
+      host: { model: 'runtime-host', provider: 'test-router' },
+      workspaceRoot: root,
+      hasFiles: true,
+      hasCodeChangeIntent: true,
+      intent: 'mutate',
+      modelOverrides: legacyOverrides(),
+    });
+
+    assert.equal(second.cognitiveTaskId, first.cognitiveTaskId);
+    assert.equal(second.hostBudget.budgetId, first.hostBudget.budgetId);
+    assert.equal(second.hostBudget.budgetId, first.runId);
   } finally {
     globalThis.fetch = originalFetch;
     fs.rmSync(root, { recursive: true, force: true });

@@ -26,6 +26,32 @@ import {
   runZenosPipeline,
 } from '../app/lib/zenos-runtime-executor';
 import { OutcomePassportSchema } from '../app/lib/outcome-ledger';
+import { RuntimeSessionStateSchema } from '../app/lib/zenos-runtime-state';
+
+function seedActiveContinuationParents(
+  store: RuntimeStore,
+  input: { sessionId: string; taskId: string; runId: string; timestamp: string },
+): void {
+  store.saveSession(RuntimeSessionStateSchema.parse({
+    sessionId: input.sessionId,
+    userGoal: 'Continue the active root task.',
+    status: 'working',
+    hostModel: 'test-host',
+    createdAt: input.timestamp,
+    updatedAt: input.timestamp,
+  }));
+  store.saveCognitiveTask({
+    taskId: input.taskId,
+    rootRunId: input.runId,
+    activeRunId: input.runId,
+    sessionId: input.sessionId,
+    status: 'active',
+    phase: 'execute',
+    capsule: { status: 'active', updatedAt: input.timestamp },
+    createdAt: input.timestamp,
+    updatedAt: input.timestamp,
+  });
+}
 
 function signedRequest(options: {
   body: string;
@@ -338,7 +364,7 @@ test('Runtime store quarantines legacy overspent token governors while preservin
     assert.equal(Number(row?.anomaly_count), 1);
     assert.equal(Number(row?.invalid_samples), 1);
     assert.equal(String(row?.status), 'expired');
-    assert.equal(String(version?.value), '9');
+    assert.equal(String(version?.value), '10');
     verified.close();
   } finally {
     rmSync(directory, { recursive: true, force: true });
@@ -368,6 +394,12 @@ test('Runtime store abandons expired leases without waiting for a process restar
 test('continuation recovery reclaims only leases created before the gateway startup cutoff', () => {
   const store = new RuntimeStore(':memory:');
   const createdAt = new Date(Date.now() - 5_000).toISOString();
+  seedActiveContinuationParents(store, {
+    sessionId: 'session-restart-recovery',
+    taskId: 'cognitive-restart-recovery',
+    runId: 'run-restart-recovery',
+    timestamp: createdAt,
+  });
   store.enqueueContinuation({
     continuationId: 'continuation-restart-recovery',
     taskId: 'cognitive-restart-recovery',
@@ -406,6 +438,49 @@ test('continuation recovery reclaims only leases created before the gateway star
   const cancelled = store.cancelContinuationsForRun('run-restart-recovery');
   assert.equal(cancelled[0]?.status, 'cancelled');
   assert.equal(cancelled[0]?.leaseExpiresAt, undefined);
+  store.close();
+});
+
+test('continuation janitor cancels terminal-session leases and orphan cognitive tasks atomically', () => {
+  const store = new RuntimeStore(':memory:');
+  const timestamp = new Date(Date.now() - 5_000).toISOString();
+  seedActiveContinuationParents(store, {
+    sessionId: 'session-continuation-janitor',
+    taskId: 'cognitive-continuation-janitor',
+    runId: 'run-continuation-janitor',
+    timestamp,
+  });
+  store.enqueueContinuation({
+    continuationId: 'continuation-janitor',
+    taskId: 'cognitive-continuation-janitor',
+    runId: 'run-continuation-janitor',
+    sessionId: 'session-continuation-janitor',
+    status: 'queued',
+    prompt: 'Continue the root task.',
+    reason: 'janitor contract',
+    attempt: 1,
+    maxAttempts: 6,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  });
+  const leased = store.claimContinuationForSession('session-continuation-janitor');
+  assert.ok(leased?.leaseToken);
+
+  const session = store.getSession('session-continuation-janitor');
+  assert.ok(session);
+  store.saveSession({
+    ...session!,
+    status: 'cancelled',
+    updatedAt: new Date().toISOString(),
+  });
+  const reconciled = store.reconcileContinuationState();
+
+  assert.equal(reconciled.cancelled, 1);
+  assert.equal(reconciled.tasksCancelled, 1);
+  assert.equal(store.getCognitiveTask('cognitive-continuation-janitor')?.status, 'cancelled');
+  const records = store.cancelContinuationsForRun('run-continuation-janitor');
+  assert.equal(records[0]?.status, 'cancelled');
+  assert.ok(records[0]?.completedAt);
   store.close();
 });
 

@@ -1,5 +1,6 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import {
   RuntimeRunRecord,
@@ -13,7 +14,7 @@ import {
 } from './zenos-runtime-state';
 import { log } from './logger';
 
-const SCHEMA_VERSION = 9;
+const SCHEMA_VERSION = 10;
 
 function defaultDatabasePath(): string {
   if (process.env.ZENOS_RUNTIME_DB_PATH) return process.env.ZENOS_RUNTIME_DB_PATH;
@@ -47,6 +48,18 @@ function asNumber(value: unknown, fallback = 0): number {
   if (typeof value === 'number') return value;
   if (typeof value === 'bigint') return Number(value);
   return fallback;
+}
+
+function continuationTokenHash(token: string): string {
+  return createHash('sha256').update(token, 'utf8').digest('hex');
+}
+
+function continuationTokenMatches(token: string | undefined, expectedHash: string): boolean {
+  if (!expectedHash) return true; // compatibility with leases created before schema v10
+  if (!token) return false;
+  const actual = Buffer.from(continuationTokenHash(token), 'hex');
+  const expected = Buffer.from(expectedHash, 'hex');
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
 }
 
 export type IdempotencyRecord = {
@@ -92,7 +105,12 @@ export type ContinuationQueueRecord = {
   reason: string;
   attempt: number;
   maxAttempts: number;
+  leaseOwner?: string;
+  leaseToken?: string;
   leaseExpiresAt?: string;
+  leaseHeartbeatAt?: string;
+  executionStartedAt?: string;
+  completedAt?: string;
   createdAt: string;
   updatedAt: string;
 };
@@ -108,7 +126,11 @@ function continuationRecordFromRow(row: Record<string, unknown>): ContinuationQu
     reason: asString(row.reason),
     attempt: asNumber(row.attempt),
     maxAttempts: asNumber(row.max_attempts),
+    leaseOwner: row.lease_owner ? asString(row.lease_owner) : undefined,
     leaseExpiresAt: row.lease_expires_at ? asString(row.lease_expires_at) : undefined,
+    leaseHeartbeatAt: row.lease_heartbeat_at ? asString(row.lease_heartbeat_at) : undefined,
+    executionStartedAt: row.execution_started_at ? asString(row.execution_started_at) : undefined,
+    completedAt: row.completed_at ? asString(row.completed_at) : undefined,
     createdAt: asString(row.created_at),
     updatedAt: asString(row.updated_at),
   };
@@ -162,6 +184,10 @@ export class RuntimeStore {
     );
     if (recoveredCodingTasks > 0) {
       log('warn', 'Recovered orphaned coding tasks after process restart', { recoveredCodingTasks });
+    }
+    const continuationRecovery = this.reconcileContinuationState();
+    if (continuationRecovery.requeued || continuationRecovery.cancelled || continuationRecovery.tasksCancelled) {
+      log('warn', 'Reconciled durable continuation state after process restart', continuationRecovery);
     }
   }
 
@@ -328,7 +354,12 @@ export class RuntimeStore {
         reason TEXT NOT NULL,
         attempt INTEGER NOT NULL,
         max_attempts INTEGER NOT NULL,
+        lease_owner TEXT,
+        lease_token_hash TEXT,
         lease_expires_at TEXT,
+        lease_heartbeat_at TEXT,
+        execution_started_at TEXT,
+        completed_at TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
@@ -380,6 +411,16 @@ export class RuntimeStore {
     );
     if (!runColumns.has('heartbeat_at')) this.db.exec('ALTER TABLE runtime_runs ADD COLUMN heartbeat_at TEXT;');
     if (!runColumns.has('lease_expires_at')) this.db.exec('ALTER TABLE runtime_runs ADD COLUMN lease_expires_at TEXT;');
+    const continuationColumns = new Set(
+      this.db.prepare('PRAGMA table_info(continuation_queue)').all().map((row) => asString(row.name)),
+    );
+    if (!continuationColumns.has('lease_owner')) this.db.exec('ALTER TABLE continuation_queue ADD COLUMN lease_owner TEXT;');
+    if (!continuationColumns.has('lease_token_hash')) this.db.exec('ALTER TABLE continuation_queue ADD COLUMN lease_token_hash TEXT;');
+    if (!continuationColumns.has('lease_heartbeat_at')) this.db.exec('ALTER TABLE continuation_queue ADD COLUMN lease_heartbeat_at TEXT;');
+    if (!continuationColumns.has('execution_started_at')) this.db.exec('ALTER TABLE continuation_queue ADD COLUMN execution_started_at TEXT;');
+    if (!continuationColumns.has('completed_at')) this.db.exec('ALTER TABLE continuation_queue ADD COLUMN completed_at TEXT;');
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_continuation_queue_task_attempt ON continuation_queue(task_id, attempt, status);');
+
     const governorColumns = new Set(
       this.db.prepare('PRAGMA table_info(token_governors)').all().map((row) => asString(row.name)),
     );
@@ -1164,103 +1205,242 @@ export class RuntimeStore {
   }
 
   enqueueContinuation(input: ContinuationQueueRecord): ContinuationQueueRecord {
-    this.db.prepare(`
-      INSERT INTO continuation_queue(
-        continuation_id, task_id, run_id, session_id, status, prompt, reason,
-        attempt, max_attempts, lease_expires_at, created_at, updated_at
-      ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(continuation_id) DO UPDATE SET
-        status = excluded.status,
-        prompt = excluded.prompt,
-        reason = excluded.reason,
-        attempt = excluded.attempt,
-        max_attempts = excluded.max_attempts,
-        lease_expires_at = excluded.lease_expires_at,
-        updated_at = excluded.updated_at
-    `).run(
-      input.continuationId,
-      input.taskId,
-      input.runId,
-      input.sessionId,
-      input.status,
-      input.prompt,
-      input.reason,
-      input.attempt,
-      input.maxAttempts,
-      input.leaseExpiresAt || null,
-      input.createdAt,
-      input.updatedAt,
-    );
-    return input;
+    return this.transaction(() => {
+      const existing = this.db.prepare(`
+        SELECT * FROM continuation_queue
+        WHERE task_id = ? AND attempt = ? AND status IN ('queued', 'leased')
+        ORDER BY created_at ASC LIMIT 1
+      `).get(input.taskId, input.attempt);
+      if (existing) return continuationRecordFromRow(existing);
+      this.db.prepare(`
+        INSERT INTO continuation_queue(
+          continuation_id, task_id, run_id, session_id, status, prompt, reason,
+          attempt, max_attempts, lease_owner, lease_token_hash, lease_expires_at,
+          lease_heartbeat_at, execution_started_at, completed_at, created_at, updated_at
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(continuation_id) DO UPDATE SET
+          status = excluded.status,
+          prompt = excluded.prompt,
+          reason = excluded.reason,
+          attempt = excluded.attempt,
+          max_attempts = excluded.max_attempts,
+          lease_owner = excluded.lease_owner,
+          lease_token_hash = excluded.lease_token_hash,
+          lease_expires_at = excluded.lease_expires_at,
+          lease_heartbeat_at = excluded.lease_heartbeat_at,
+          execution_started_at = excluded.execution_started_at,
+          completed_at = excluded.completed_at,
+          updated_at = excluded.updated_at
+      `).run(
+        input.continuationId,
+        input.taskId,
+        input.runId,
+        input.sessionId,
+        input.status,
+        input.prompt,
+        input.reason,
+        input.attempt,
+        input.maxAttempts,
+        input.leaseOwner || null,
+        input.leaseToken ? continuationTokenHash(input.leaseToken) : null,
+        input.leaseExpiresAt || null,
+        input.leaseHeartbeatAt || null,
+        input.executionStartedAt || null,
+        input.completedAt || null,
+        input.createdAt,
+        input.updatedAt,
+      );
+      return input;
+    });
   }
 
   claimContinuationForSession(
     sessionId: string,
     leaseMs = 30 * 60_000,
     recoverLeasedBefore?: string,
+    leaseOwner = 'hermes-gateway',
   ): ContinuationQueueRecord | undefined {
     return this.transaction(() => {
-      const nowIso = new Date().toISOString();
-      const leaseExpiresAt = new Date(Date.now() + Math.max(60_000, leaseMs)).toISOString();
+      const now = new Date();
+      const nowIso = now.toISOString();
+      const leaseExpiresAt = new Date(now.getTime() + Math.max(60_000, leaseMs)).toISOString();
       this.db.prepare(`
         UPDATE continuation_queue
-        SET status = 'queued', lease_expires_at = NULL, updated_at = ?
+        SET status = 'queued', lease_owner = NULL, lease_token_hash = NULL,
+            lease_expires_at = NULL, lease_heartbeat_at = NULL,
+            execution_started_at = NULL, updated_at = ?
         WHERE session_id = ? AND status = 'leased' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?
       `).run(nowIso, sessionId, nowIso);
       if (recoverLeasedBefore) {
         this.db.prepare(`
           UPDATE continuation_queue
-          SET status = 'queued', lease_expires_at = NULL, updated_at = ?
+          SET status = 'queued', lease_owner = NULL, lease_token_hash = NULL,
+              lease_expires_at = NULL, lease_heartbeat_at = NULL,
+              execution_started_at = NULL, updated_at = ?
           WHERE session_id = ? AND status = 'leased' AND updated_at <= ?
         `).run(nowIso, sessionId, recoverLeasedBefore);
       }
       const row = this.db.prepare(`
-        SELECT * FROM continuation_queue
-        WHERE session_id = ? AND status = 'queued'
-        ORDER BY created_at ASC LIMIT 1
+        SELECT q.* FROM continuation_queue q
+        JOIN cognitive_tasks t ON t.task_id = q.task_id
+        JOIN sessions s ON s.session_id = q.session_id
+        WHERE q.session_id = ? AND q.status = 'queued'
+          AND t.status = 'active' AND s.status = 'working'
+        ORDER BY q.created_at ASC LIMIT 1
       `).get(sessionId);
       if (!row) return undefined;
       const continuationId = asString(row.continuation_id);
-      this.db.prepare(`
+      const leaseToken = randomBytes(32).toString('base64url');
+      const safeOwner = String(leaseOwner || 'hermes-gateway').trim().slice(0, 220) || 'hermes-gateway';
+      const changed = this.db.prepare(`
         UPDATE continuation_queue
-        SET status = 'leased', lease_expires_at = ?, updated_at = ?
+        SET status = 'leased', lease_owner = ?, lease_token_hash = ?,
+            lease_expires_at = ?, lease_heartbeat_at = ?, execution_started_at = COALESCE(execution_started_at, ?),
+            updated_at = ?
         WHERE continuation_id = ? AND status = 'queued'
-      `).run(leaseExpiresAt, nowIso, continuationId);
-      return {
-        continuationId,
-        taskId: asString(row.task_id),
-        runId: asString(row.run_id),
-        sessionId: asString(row.session_id),
-        status: 'leased',
-        prompt: asString(row.prompt),
-        reason: asString(row.reason),
-        attempt: asNumber(row.attempt),
-        maxAttempts: asNumber(row.max_attempts),
+      `).run(
+        safeOwner,
+        continuationTokenHash(leaseToken),
         leaseExpiresAt,
-        createdAt: asString(row.created_at),
+        nowIso,
+        nowIso,
+        nowIso,
+        continuationId,
+      );
+      if (Number(changed.changes || 0) !== 1) return undefined;
+      return {
+        ...continuationRecordFromRow(row),
+        status: 'leased',
+        leaseOwner: safeOwner,
+        leaseToken,
+        leaseExpiresAt,
+        leaseHeartbeatAt: nowIso,
+        executionStartedAt: row.execution_started_at ? asString(row.execution_started_at) : nowIso,
         updatedAt: nowIso,
       };
     });
   }
 
-  completeContinuation(continuationId: string, cancelled = false): ContinuationQueueRecord | undefined {
-    const updatedAt = new Date().toISOString();
-    this.db.prepare(`
-      UPDATE continuation_queue
-      SET status = ?, lease_expires_at = NULL, updated_at = ?
-      WHERE continuation_id = ?
-    `).run(cancelled ? 'cancelled' : 'completed', updatedAt, continuationId);
-    const row = this.db.prepare('SELECT * FROM continuation_queue WHERE continuation_id = ?').get(continuationId);
-    return row ? continuationRecordFromRow(row) : undefined;
+  heartbeatContinuation(
+    continuationId: string,
+    leaseToken: string,
+    leaseMs = 30 * 60_000,
+  ): ContinuationQueueRecord | undefined {
+    return this.transaction(() => {
+      const row = this.db.prepare('SELECT * FROM continuation_queue WHERE continuation_id = ?').get(continuationId);
+      if (!row) return undefined;
+      if (asString(row.status) !== 'leased') throw new Error('Continuation is not actively leased');
+      if (!continuationTokenMatches(leaseToken, asString(row.lease_token_hash))) {
+        throw new Error('Continuation lease token is invalid');
+      }
+      const updatedAt = new Date().toISOString();
+      const leaseExpiresAt = new Date(Date.now() + Math.max(60_000, leaseMs)).toISOString();
+      this.db.prepare(`
+        UPDATE continuation_queue
+        SET lease_expires_at = ?, lease_heartbeat_at = ?, updated_at = ?
+        WHERE continuation_id = ? AND status = 'leased'
+      `).run(leaseExpiresAt, updatedAt, updatedAt, continuationId);
+      const updated = this.db.prepare('SELECT * FROM continuation_queue WHERE continuation_id = ?').get(continuationId);
+      return updated ? continuationRecordFromRow(updated) : undefined;
+    });
+  }
+
+  completeContinuation(
+    continuationId: string,
+    cancelled = false,
+    leaseToken?: string,
+  ): ContinuationQueueRecord | undefined {
+    return this.transaction(() => {
+      const row = this.db.prepare('SELECT * FROM continuation_queue WHERE continuation_id = ?').get(continuationId);
+      if (!row) return undefined;
+      const currentStatus = asString(row.status) as ContinuationQueueRecord['status'];
+      if (currentStatus === 'completed' || currentStatus === 'cancelled') return continuationRecordFromRow(row);
+      if (currentStatus !== 'leased') throw new Error('Continuation must be leased before acknowledgement');
+      if (!continuationTokenMatches(leaseToken, asString(row.lease_token_hash))) {
+        throw new Error('Continuation lease token is invalid');
+      }
+      const updatedAt = new Date().toISOString();
+      this.db.prepare(`
+        UPDATE continuation_queue
+        SET status = ?, lease_owner = NULL, lease_token_hash = NULL,
+            lease_expires_at = NULL, lease_heartbeat_at = NULL,
+            completed_at = ?, updated_at = ?
+        WHERE continuation_id = ? AND status = 'leased'
+      `).run(cancelled ? 'cancelled' : 'completed', updatedAt, updatedAt, continuationId);
+      const updated = this.db.prepare('SELECT * FROM continuation_queue WHERE continuation_id = ?').get(continuationId);
+      return updated ? continuationRecordFromRow(updated) : undefined;
+    });
+  }
+
+  reconcileContinuationState(nowIso = new Date().toISOString()): {
+    requeued: number;
+    cancelled: number;
+    tasksCancelled: number;
+  } {
+    return this.transaction(() => {
+      const requeued = this.db.prepare(`
+        UPDATE continuation_queue
+        SET status = 'queued', lease_owner = NULL, lease_token_hash = NULL,
+            lease_expires_at = NULL, lease_heartbeat_at = NULL,
+            execution_started_at = NULL, updated_at = ?
+        WHERE status = 'leased' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?
+          AND EXISTS (SELECT 1 FROM cognitive_tasks t WHERE t.task_id = continuation_queue.task_id AND t.status = 'active')
+          AND EXISTS (SELECT 1 FROM sessions s WHERE s.session_id = continuation_queue.session_id AND s.status = 'working')
+      `).run(nowIso, nowIso);
+      const cancelled = this.db.prepare(`
+        UPDATE continuation_queue
+        SET status = 'cancelled', lease_owner = NULL, lease_token_hash = NULL,
+            lease_expires_at = NULL, lease_heartbeat_at = NULL,
+            completed_at = ?, updated_at = ?
+        WHERE status IN ('queued', 'leased') AND (
+          NOT EXISTS (SELECT 1 FROM cognitive_tasks t WHERE t.task_id = continuation_queue.task_id AND t.status = 'active')
+          OR NOT EXISTS (SELECT 1 FROM sessions s WHERE s.session_id = continuation_queue.session_id AND s.status = 'working')
+        )
+      `).run(nowIso, nowIso);
+
+      const orphanTasks = this.db.prepare(`
+        SELECT t.* FROM cognitive_tasks t
+        LEFT JOIN sessions s ON s.session_id = t.session_id
+        WHERE t.status = 'active'
+          AND (s.session_id IS NULL OR s.status NOT IN ('working', 'paused'))
+          AND NOT EXISTS (
+            SELECT 1 FROM continuation_queue q
+            WHERE q.task_id = t.task_id AND q.status IN ('queued', 'leased')
+          )
+      `).all();
+      const updateTask = this.db.prepare(`
+        UPDATE cognitive_tasks
+        SET status = 'cancelled', capsule_json = ?, updated_at = ?
+        WHERE task_id = ? AND status = 'active'
+      `);
+      let tasksCancelled = 0;
+      for (const row of orphanTasks) {
+        const capsule = parseJson<Record<string, unknown>>(row.capsule_json, {});
+        const nextCapsule = {
+          ...capsule,
+          status: 'cancelled',
+          updatedAt: nowIso,
+        };
+        const result = updateTask.run(json(nextCapsule), nowIso, asString(row.task_id));
+        tasksCancelled += Number(result.changes || 0);
+      }
+      return {
+        requeued: Number(requeued.changes || 0),
+        cancelled: Number(cancelled.changes || 0),
+        tasksCancelled,
+      };
+    });
   }
 
   cancelContinuationsForRun(runId: string): ContinuationQueueRecord[] {
     const updatedAt = new Date().toISOString();
     this.db.prepare(`
       UPDATE continuation_queue
-      SET status = 'cancelled', lease_expires_at = NULL, updated_at = ?
+      SET status = 'cancelled', lease_owner = NULL, lease_token_hash = NULL,
+          lease_expires_at = NULL, lease_heartbeat_at = NULL,
+          completed_at = ?, updated_at = ?
       WHERE run_id = ? AND status IN ('queued', 'leased')
-    `).run(updatedAt, runId);
+    `).run(updatedAt, updatedAt, runId);
     return this.db.prepare(`
       SELECT * FROM continuation_queue WHERE run_id = ? ORDER BY created_at ASC
     `).all(runId).map(continuationRecordFromRow);
