@@ -7,7 +7,12 @@ import {
   continuityPacketToCompactMessages,
   parseContinuityPacketV2,
 } from './continuity-packet';
-import { buildRuntimeLearningCard, renderLearningCard } from './learning-cards';
+import {
+  LearningCard,
+  buildRuntimeLearningCard,
+  buildVerifiedLearningCard,
+  renderLearningCard,
+} from './learning-cards';
 import { log, redactText } from './logger';
 import { incrementMetric, observeDuration, setGauge } from './metrics';
 import { getRuntimeCache, runtimeCacheKey } from './runtime-cache';
@@ -159,7 +164,14 @@ function memoryEnabled(): boolean {
 }
 
 function memorySecret(): string {
-  return process.env.ETLA_MASTER_SECRET || process.env.ZENOS_MEMORY_SECRET || '';
+  return process.env.ZENOS_MEMORY_SIGNING_SECRET
+    || process.env.ZENOS_MEMORY_SECRET
+    || process.env.ETLA_MASTER_SECRET
+    || '';
+}
+
+function memorySigningKid(): string {
+  return (process.env.ZENOS_MEMORY_SIGNING_KID || '').trim();
 }
 
 function memoryApiKey(): string {
@@ -300,17 +312,28 @@ function recordFailure(error: string): void {
 
 function tokenExchangeHeaders(scopes: MemoryScope[]): HeadersInit {
   const secret = memorySecret();
-  if (!secret) throw new Error('ETLA_MASTER_SECRET or ZENOS_MEMORY_SECRET is required for Memory token exchange');
+  if (!secret) throw new Error('A dedicated Zenos Memory signing secret is required for token exchange');
   const timestamp = Date.now();
   const nonce = crypto.randomBytes(18).toString('base64url');
-  const canonical = [
-    'zenos-memory-signature-v2',
-    String(timestamp),
-    nonce,
-    'POST',
-    '/api/auth',
-    EMPTY_SHA256,
-  ].join('\n');
+  const kid = memorySigningKid();
+  const canonical = kid
+    ? [
+        'zenos-memory-signature-v3',
+        kid,
+        String(timestamp),
+        nonce,
+        'POST',
+        '/api/auth',
+        EMPTY_SHA256,
+      ].join('\n')
+    : [
+        'zenos-memory-signature-v2',
+        String(timestamp),
+        nonce,
+        'POST',
+        '/api/auth',
+        EMPTY_SHA256,
+      ].join('\n');
   const signature = crypto.createHmac('sha256', secret).update(canonical, 'utf8').digest('hex');
   return {
     'content-type': 'application/json',
@@ -318,6 +341,7 @@ function tokenExchangeHeaders(scopes: MemoryScope[]): HeadersInit {
     'x-etla-nonce': nonce,
     'x-etla-content-sha256': EMPTY_SHA256,
     'x-etla-signature': signature,
+    ...(kid ? { 'x-etla-kid': kid, 'x-etla-signature-version': '3' } : {}),
     'x-etla-client-id': process.env.ZENOS_MEMORY_CLIENT_ID || 'etla-runtime-v1',
     'x-etla-requested-scopes': scopesKey(scopes),
   };
@@ -1057,6 +1081,68 @@ export async function persistRecallFeedback(input: {
   return results;
 }
 
+export async function persistVerifiedLearningCard(input: {
+  namespace?: string;
+  card: {
+    type: LearningCard['type'];
+    claim: string;
+    evidence: LearningCard['evidence'];
+    verification: Exclude<LearningCard['verification'], 'unverified'>;
+    confidence?: number;
+    validFrom?: string;
+    validTo?: string;
+    supersedes?: string[];
+  };
+  sessionId?: string;
+  runId?: string;
+}): Promise<MemoryClientResult<unknown>> {
+  const card = buildVerifiedLearningCard(input.card);
+  const namespace = input.namespace || process.env.ZENOS_MEMORY_LEARNING_NAMESPACE || 'runtime.learning';
+  const type = card.type === 'project_state'
+    ? 'project'
+    : card.type === 'failure'
+      ? 'insight'
+      : card.type;
+  const content = renderLearningCard(card).slice(0, 12_000);
+  const idempotency = crypto.createHash('sha256').update(JSON.stringify({
+    namespace,
+    type: card.type,
+    claim: card.claim,
+    evidence: card.evidence,
+    validFrom: card.validFrom,
+  })).digest('hex');
+  const result = await memoryFetch('/api/memory/remember', {
+    content,
+    namespace,
+    type,
+    metadata: {
+      confidence: card.confidence,
+      importance: card.verification === 'user_confirmed' ? 10 : card.verification === 'test_passed' ? 9 : 8,
+      tags: [
+        'learning-card',
+        `learning-card-${card.type}`,
+        `verification-${card.verification}`,
+        'hot-recall-eligible',
+      ],
+      entities: ['Zenos Runtime', 'Hermes', card.type],
+      supersedes_ids: card.supersedes,
+      provenance: {
+        created_by: 'zenos-verified-learning-card-v1',
+        run_id: input.runId,
+        session_id: input.sessionId,
+        valid_from: card.validFrom,
+        valid_to: card.validTo,
+      },
+      learning_card: card,
+      hot_recall_eligible: true,
+      deterministic_validation: card.verification === 'test_passed' ? 'passed' : undefined,
+    },
+    idempotency_key: `verified-learning:${idempotency}`,
+  }, { scopes: ['memory:read', 'memory:write'], timeoutMs: 30_000 });
+  if (result.ok) bumpNamespaceRevision(namespace, idempotency);
+  return result;
+}
+
 export async function persistCognitiveOutcome(input: {
   namespace?: string;
   runId: string;
@@ -1332,7 +1418,7 @@ export async function memoryDependencyHealth(): Promise<{
 export function memoryConfigurationSummary(): {
   enabled: boolean;
   baseUrl: string;
-  auth: 'hmac-v2-token' | 'api-key' | 'none';
+  auth: 'hmac-v3-kid-token' | 'hmac-v2-token' | 'api-key' | 'none';
   clientId: string;
   circuit: CircuitState;
   cachedTokens: number;
@@ -1340,7 +1426,9 @@ export function memoryConfigurationSummary(): {
   return {
     enabled: memoryEnabled(),
     baseUrl: memoryBaseUrl(),
-    auth: memorySecret() ? 'hmac-v2-token' : memoryApiKey() ? 'api-key' : 'none',
+    auth: memorySecret()
+      ? memorySigningKid() ? 'hmac-v3-kid-token' : 'hmac-v2-token'
+      : memoryApiKey() ? 'api-key' : 'none',
     clientId: process.env.ZENOS_MEMORY_CLIENT_ID || 'etla-runtime-v1',
     circuit: { ...circuit },
     cachedTokens: tokens.size,

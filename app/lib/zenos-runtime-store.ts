@@ -14,7 +14,7 @@ import {
 } from './zenos-runtime-state';
 import { log } from './logger';
 
-const SCHEMA_VERSION = 12;
+const SCHEMA_VERSION = 13;
 
 function defaultDatabasePath(): string {
   if (process.env.ZENOS_RUNTIME_DB_PATH) return process.env.ZENOS_RUNTIME_DB_PATH;
@@ -232,6 +232,19 @@ export type CommandStepRecord = {
   updatedAt: string;
 };
 
+export type RuntimeAuditRecord = {
+  auditId: string;
+  category: 'model_config' | 'availability_policy' | 'namespace_access' | 'security_config';
+  action: string;
+  actor: string;
+  sessionId?: string;
+  requestId?: string;
+  previousHash?: string;
+  currentHash: string;
+  details: unknown;
+  createdAt: string;
+};
+
 export type OutcomeLedgerRecord = {
   outcomeId: string;
   runId: string;
@@ -274,6 +287,16 @@ export class RuntimeStore {
     const recoveredRuns = this.reconcileAbandonedRuns();
     if (recoveredRuns > 0) {
       log('warn', 'Recovered abandoned Runtime runs after process restart', { recoveredRuns });
+    }
+    const commandRecovery = this.reconcileCommandJobsAfterRestart();
+    if (
+      commandRecovery.requeued
+      || commandRecovery.completed
+      || commandRecovery.failed
+      || commandRecovery.cancelled
+      || commandRecovery.waiting
+    ) {
+      log('warn', 'Reconciled durable CommandJob state after process restart', commandRecovery);
     }
     const recoveredCodingTasks = this.reconcileInactiveCodingTasks(
       'Coding task cancelled because its Runtime run was missing or terminated unsuccessfully.',
@@ -528,6 +551,22 @@ export class RuntimeStore {
       CREATE INDEX IF NOT EXISTS idx_command_steps_job ON command_steps(job_id, ordinal);
       CREATE INDEX IF NOT EXISTS idx_command_steps_status ON command_steps(status, updated_at DESC);
 
+      CREATE TABLE IF NOT EXISTS runtime_audit (
+        audit_id TEXT PRIMARY KEY,
+        category TEXT NOT NULL,
+        action TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        session_id TEXT,
+        request_id TEXT,
+        previous_hash TEXT,
+        current_hash TEXT NOT NULL,
+        details_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_runtime_audit_category ON runtime_audit(category, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_runtime_audit_session ON runtime_audit(session_id, created_at DESC);
+
       CREATE TABLE IF NOT EXISTS outcome_ledger (
         outcome_id TEXT PRIMARY KEY,
         run_id TEXT NOT NULL,
@@ -748,6 +787,173 @@ export class RuntimeStore {
       }
     });
     return abandoned.length;
+  }
+
+  reconcileCommandJobsAfterRestart(): {
+    requeued: number;
+    completed: number;
+    failed: number;
+    cancelled: number;
+    waiting: number;
+  } {
+    const activeJobs = this.db.prepare(`
+      SELECT j.*, t.status AS task_status, t.active_run_id, t.root_run_id,
+             t.capsule_json, t.updated_at AS task_updated_at,
+             r.status AS run_status
+      FROM command_jobs j
+      LEFT JOIN cognitive_tasks t ON t.task_id = j.cognitive_task_id
+      LEFT JOIN runtime_runs r ON r.run_id = t.active_run_id
+      WHERE j.status IN ('queued', 'running', 'paused_for_compaction', 'waiting_for_approval', 'retry_pending')
+      ORDER BY j.updated_at ASC
+    `).all();
+    const result = { requeued: 0, completed: 0, failed: 0, cancelled: 0, waiting: 0 };
+    if (!activeJobs.length) return result;
+    const timestamp = new Date().toISOString();
+    const updateJob = this.db.prepare(`
+      UPDATE command_jobs
+      SET status = ?, active_step_id = ?, checkpoint_id = COALESCE(?, checkpoint_id), updated_at = ?
+      WHERE job_id = ?
+    `);
+    const updateStep = this.db.prepare(`
+      UPDATE command_steps
+      SET status = ?, result_ref = COALESCE(?, result_ref), retry_count = retry_count + ?,
+          metadata_json = ?, updated_at = ?
+      WHERE step_id = ?
+    `);
+    const updateAllSteps = this.db.prepare(`
+      UPDATE command_steps
+      SET status = ?, result_ref = COALESCE(result_ref, ?), metadata_json = ?, updated_at = ?
+      WHERE job_id = ? AND status != 'done'
+    `);
+    const selectSteps = this.db.prepare(`
+      SELECT * FROM command_steps WHERE job_id = ? ORDER BY ordinal ASC
+    `);
+    const selectContinuation = this.db.prepare(`
+      SELECT continuation_id FROM continuation_queue
+      WHERE task_id = ? AND status IN ('queued', 'leased')
+      ORDER BY updated_at DESC LIMIT 1
+    `);
+    const insertContinuation = this.db.prepare(`
+      INSERT OR IGNORE INTO continuation_queue(
+        continuation_id, task_id, run_id, session_id, status, prompt, reason,
+        attempt, max_attempts, created_at, updated_at
+      ) VALUES(?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)
+    `);
+    const updateTask = this.db.prepare(`
+      UPDATE cognitive_tasks SET capsule_json = ?, updated_at = ? WHERE task_id = ?
+    `);
+
+    this.transaction(() => {
+      for (const row of activeJobs) {
+        const jobId = asString(row.job_id);
+        const taskId = asString(row.cognitive_task_id);
+        const taskStatus = asString(row.task_status);
+        const steps = selectSteps.all(jobId);
+        const activeStep = steps.find((step) => asString(step.step_id) === asString(row.active_step_id))
+          || steps.find((step) => asString(step.status) !== 'done');
+        const activeStepId = activeStep ? asString(activeStep.step_id) : '';
+        const checkpointId = row.checkpoint_id ? asString(row.checkpoint_id) : undefined;
+        const recoveryMetadata = json({
+          recoveredAfterRestart: true,
+          recoveredAt: timestamp,
+          previousStatus: asString(row.status),
+        });
+
+        if (!taskId || !taskStatus) {
+          updateAllSteps.run('failed', 'recovery:missing-cognitive-task', recoveryMetadata, timestamp, jobId);
+          updateJob.run('failed', null, checkpointId || null, timestamp, jobId);
+          result.failed += 1;
+          continue;
+        }
+        if (taskStatus === 'completed') {
+          updateAllSteps.run('done', 'recovery:cognitive-task-completed', recoveryMetadata, timestamp, jobId);
+          updateJob.run('completed', null, checkpointId || null, timestamp, jobId);
+          result.completed += 1;
+          continue;
+        }
+        if (taskStatus === 'failed' || taskStatus === 'cancelled') {
+          const terminal = taskStatus === 'cancelled' ? 'cancelled' : 'failed';
+          updateAllSteps.run('failed', `recovery:cognitive-task-${terminal}`, recoveryMetadata, timestamp, jobId);
+          updateJob.run(terminal, null, checkpointId || null, timestamp, jobId);
+          result[terminal] += 1;
+          continue;
+        }
+        if (taskStatus === 'waiting_for_user') {
+          if (activeStep && activeStepId && asString(activeStep.status) !== 'done') {
+            updateStep.run('blocked', 'recovery:waiting-for-user', 0, recoveryMetadata, timestamp, activeStepId);
+          }
+          updateJob.run('waiting_for_approval', activeStepId || null, checkpointId || null, timestamp, jobId);
+          result.waiting += 1;
+          continue;
+        }
+
+        const continuation = selectContinuation.get(taskId);
+        const runStatus = asString(row.run_status);
+        const runUnavailable = !runStatus || ['failed', 'blocked', 'abandoned'].includes(runStatus);
+        if (!continuation && runUnavailable) {
+          const capsule = parseJson<Record<string, unknown>>(row.capsule_json, {});
+          const currentCycle = Math.max(0, asNumber(capsule.cycle));
+          const maxCycles = Math.max(1, asNumber(capsule.maxCycles, 6));
+          const nextAttempt = Math.min(maxCycles, currentCycle + 1);
+          const rootObjective = asString(capsule.rootObjective, 'Continue the durable CommandJob from its first uncommitted step.');
+          const pending = Array.isArray(capsule.pending)
+            ? capsule.pending.filter((item): item is string => typeof item === 'string').slice(0, 20)
+            : [];
+          const acceptanceCriteria = Array.isArray(capsule.acceptanceCriteria)
+            ? capsule.acceptanceCriteria.filter((item): item is string => typeof item === 'string').slice(0, 20)
+            : [];
+          const nextAction = capsule.nextAction && typeof capsule.nextAction === 'object'
+            ? capsule.nextAction as Record<string, unknown>
+            : {};
+          const prompt = [
+            'Continue the same root task as an internal Zenos recovery cycle after a Runtime process restart. This is not a new user request.',
+            `CommandJob: ${jobId}`,
+            `Cognitive task: ${taskId}`,
+            `Objective: ${rootObjective}`,
+            `Resume step: ${activeStep ? asString(activeStep.kind) : 'deliver'}`,
+            checkpointId ? `Verified checkpoint: ${checkpointId}` : '',
+            acceptanceCriteria.length ? `Acceptance criteria:\n${acceptanceCriteria.map((item) => `- ${item}`).join('\n')}` : '',
+            pending.length ? `Pending work:\n${pending.map((item) => `- ${item}`).join('\n')}` : '',
+            asString(nextAction.instruction) ? `Exact next action: ${asString(nextAction.instruction)}` : '',
+            asString(nextAction.stopCondition) ? `Stop condition: ${asString(nextAction.stopCondition)}` : '',
+            'Reconcile workspace HEAD, dirty diff, changed-file hashes, and committed step outcomes before any mutation. Do not repeat a committed patch or ask the user to repeat the original command.',
+          ].filter(Boolean).join('\n\n').slice(0, 24_000);
+          const continuationId = `continuation_recovery_${createHash('sha256').update(`${jobId}\n${activeStepId}\n${asString(row.task_updated_at)}`).digest('hex').slice(0, 32)}`;
+          const recoveryRunId = asString(row.active_run_id) || asString(row.root_run_id) || `recovery_${jobId}`;
+          const inserted = insertContinuation.run(
+            continuationId,
+            taskId,
+            recoveryRunId,
+            asString(row.session_id),
+            prompt,
+            'runtime_restart_recovery',
+            nextAttempt,
+            maxCycles,
+            timestamp,
+            timestamp,
+          );
+          if (Number(inserted.changes) > 0) {
+            capsule.cycle = nextAttempt;
+            capsule.updatedAt = timestamp;
+            updateTask.run(json(capsule), timestamp, taskId);
+          }
+        }
+        if (activeStep && activeStepId && asString(activeStep.status) !== 'done') {
+          const metadata = parseJson<Record<string, unknown>>(activeStep.metadata_json, {});
+          updateStep.run(
+            'retry_pending',
+            'recovery:runtime-restart',
+            1,
+            json({ ...metadata, recoveredAfterRestart: true, recoveredAt: timestamp }),
+            timestamp,
+            activeStepId,
+          );
+        }
+        updateJob.run('retry_pending', activeStepId || null, checkpointId || null, timestamp, jobId);
+        result.requeued += 1;
+      }
+    });
+    return result;
   }
 
   getMetaValue(key: string): string | undefined {
@@ -1279,6 +1485,15 @@ export class RuntimeStore {
       WHERE c.status = 'active'
         AND c.run_id IS NOT NULL
         AND (r.run_id IS NULL OR r.status IN ('failed', 'blocked', 'abandoned'))
+        AND NOT EXISTS (
+          SELECT 1 FROM command_jobs j
+          WHERE j.cognitive_task_id = c.task_id
+            AND j.status IN ('queued', 'running', 'paused_for_compaction', 'retry_pending', 'waiting_for_approval')
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM continuation_queue q
+          WHERE q.task_id = c.task_id AND q.status IN ('queued', 'leased')
+        )
     `).all().map((row) => asString(row.run_id)).filter(Boolean);
     let reconciled = 0;
     for (const runId of runIds) reconciled += this.cancelCodingTasksForRun(runId, reason).length;
@@ -1850,6 +2065,65 @@ export class RuntimeStore {
       input.updatedAt,
     );
     return input;
+  }
+
+  appendRuntimeAudit(input: RuntimeAuditRecord): RuntimeAuditRecord {
+    this.db.prepare(`
+      INSERT OR IGNORE INTO runtime_audit(
+        audit_id, category, action, actor, session_id, request_id,
+        previous_hash, current_hash, details_json, created_at
+      ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      input.auditId,
+      input.category,
+      input.action,
+      input.actor,
+      input.sessionId || null,
+      input.requestId || null,
+      input.previousHash || null,
+      input.currentHash,
+      json(input.details),
+      input.createdAt,
+    );
+    return input;
+  }
+
+  listRuntimeAudit(limit = 100, category?: RuntimeAuditRecord['category']): RuntimeAuditRecord[] {
+    const safeLimit = Math.min(Math.max(limit, 1), 1_000);
+    const rows = category
+      ? this.db.prepare('SELECT * FROM runtime_audit WHERE category = ? ORDER BY created_at DESC LIMIT ?').all(category, safeLimit)
+      : this.db.prepare('SELECT * FROM runtime_audit ORDER BY created_at DESC LIMIT ?').all(safeLimit);
+    return rows.map((row) => ({
+      auditId: asString(row.audit_id),
+      category: asString(row.category) as RuntimeAuditRecord['category'],
+      action: asString(row.action),
+      actor: asString(row.actor),
+      sessionId: row.session_id ? asString(row.session_id) : undefined,
+      requestId: row.request_id ? asString(row.request_id) : undefined,
+      previousHash: row.previous_hash ? asString(row.previous_hash) : undefined,
+      currentHash: asString(row.current_hash),
+      details: parseJson(row.details_json, {}),
+      createdAt: asString(row.created_at),
+    }));
+  }
+
+  latestRuntimeAudit(category: RuntimeAuditRecord['category'], sessionId?: string): RuntimeAuditRecord | undefined {
+    const row = sessionId
+      ? this.db.prepare(`SELECT * FROM runtime_audit WHERE category = ? AND session_id = ? ORDER BY created_at DESC LIMIT 1`).get(category, sessionId)
+      : this.db.prepare(`SELECT * FROM runtime_audit WHERE category = ? ORDER BY created_at DESC LIMIT 1`).get(category);
+    if (!row) return undefined;
+    return {
+      auditId: asString(row.audit_id),
+      category: asString(row.category) as RuntimeAuditRecord['category'],
+      action: asString(row.action),
+      actor: asString(row.actor),
+      sessionId: row.session_id ? asString(row.session_id) : undefined,
+      requestId: row.request_id ? asString(row.request_id) : undefined,
+      previousHash: row.previous_hash ? asString(row.previous_hash) : undefined,
+      currentHash: asString(row.current_hash),
+      details: parseJson(row.details_json, {}),
+      createdAt: asString(row.created_at),
+    };
   }
 
   getCommandStep(stepId: string): CommandStepRecord | undefined {

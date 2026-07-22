@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { GET as healthGet } from '../app/api/health/route';
+import { POST as continuityCheckpointPost } from '../app/api/runtime/continuity/checkpoint/route';
 import { POST as abortPost } from '../app/api/runtime/gateway/abort/route';
 import {
   GET as continuationGet,
@@ -153,6 +154,53 @@ test('public health is live while routing fails closed and validates real HTTP c
   assert.equal(verifiedBody.decision.useWorker, false);
   assert.equal(verifiedBody.decision.useVerifier, true);
   assert.equal(verifiedBody.decision.pipelineMode, 'verified_path');
+});
+
+test('Runtime continuity checkpoint route owns compression and preserves head, middle, and tail evidence', async () => {
+  const messages = Array.from({ length: 180 }, (_, index) => ({
+    role: index % 3 === 0 ? 'user' : index % 3 === 1 ? 'assistant' : 'tool',
+    name: index % 3 === 2 ? 'terminal' : undefined,
+    content: index === 0
+      ? 'Goal: complete the durable Zenos upgrade without losing the original acceptance criteria.'
+      : index === 90
+        ? 'Decision: Runtime is the only checkpoint authority; Hermes must not write a second cloud compact.'
+        : index === 140
+          ? 'Validation passed for app/lib/continuity-service.ts and the changed file hash is recorded.'
+          : index === 179
+            ? 'Pending next action: resume the first uncommitted CommandJob step after compression.'
+            : `routine transcript message ${index}`,
+  }));
+  const response = await continuityCheckpointPost(request('/api/runtime/continuity/checkpoint', {
+    authenticated: true,
+    body: {
+      sessionId: 'runtime-continuity-route-session',
+      turnId: 'runtime-continuity-route-turn',
+      namespace: 'runtime-continuity-route',
+      estimatedTokens: 190_000,
+      checkpointSoftLimitTokens: 160_000,
+      messages,
+      forceCheckpoint: true,
+    },
+  }));
+  const body = await response.json() as {
+    ok: boolean;
+    checkpoint: {
+      action: string;
+      context: string;
+      sourceCursor?: string;
+      strategy?: string;
+      degraded: boolean;
+    };
+  };
+  assert.equal(response.status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(body.checkpoint.action, 'fallback');
+  assert.equal(body.checkpoint.degraded, true);
+  assert.match(body.checkpoint.sourceCursor || '', /^msg:/);
+  assert.match(body.checkpoint.context, /original acceptance criteria/i);
+  assert.match(body.checkpoint.context, /only checkpoint authority/i);
+  assert.match(body.checkpoint.context, /continuity-service\.ts/i);
+  assert.match(body.checkpoint.context, /first uncommitted CommandJob step/i);
 });
 
 test('session route persists through the HTTP boundary', async () => {

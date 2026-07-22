@@ -154,6 +154,18 @@ export const StoredGatewayPreflightSchema = z.object({
   hostPlanCall: z.unknown().optional(),
   workerResult: WorkerResultSchema.optional(),
   workerCall: z.unknown().optional(),
+  autonomousOutcome: z.object({
+    status: z.string().trim().min(1).max(100),
+    summary: z.string().max(8_000),
+    changedFiles: z.array(z.string().trim().min(1).max(4_096)).max(200).default([]),
+    patchCount: z.number().int().nonnegative().max(100).default(0),
+    validationPassed: z.boolean().default(false),
+    toolEvidence: z.array(z.object({
+      tool: z.string().trim().min(1).max(200),
+      status: z.string().trim().min(1).max(100),
+      summary: z.string().max(4_000),
+    })).max(200).default([]),
+  }).optional(),
   bossPreflight: BossDecisionSchema.optional(),
   bossCall: z.unknown().optional(),
   repositoryContext: z.string().optional(),

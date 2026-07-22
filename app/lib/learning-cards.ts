@@ -95,6 +95,42 @@ export function buildRuntimeLearningCard(input: {
   });
 }
 
+export function buildVerifiedLearningCard(input: {
+  type: LearningCard['type'];
+  claim: string;
+  evidence: LearningCard['evidence'];
+  verification: Exclude<LearningCard['verification'], 'unverified'>;
+  confidence?: number;
+  validFrom?: string;
+  validTo?: string;
+  supersedes?: string[];
+}): LearningCard {
+  const defaultConfidence: Record<Exclude<LearningCard['verification'], 'unverified'>, number> = {
+    user_confirmed: 0.98,
+    test_passed: 0.94,
+    tool_observed: 0.84,
+  };
+  if (input.type === 'preference' && input.verification !== 'user_confirmed') {
+    throw new Error('Preference cards require direct user confirmation');
+  }
+  if (input.type === 'procedure' && input.verification !== 'test_passed') {
+    throw new Error('Procedure cards require deterministic test evidence');
+  }
+  if (input.type === 'decision' && !input.evidence.some((item) => item.source === 'user' || item.source === 'commit' || item.source === 'runtime')) {
+    throw new Error('Decision cards require user, commit, or Runtime decision evidence');
+  }
+  return LearningCardSchema.parse({
+    type: input.type,
+    claim: clean(input.claim, 4_000),
+    evidence: input.evidence,
+    confidence: input.confidence ?? defaultConfidence[input.verification],
+    verification: input.verification,
+    validFrom: input.validFrom || new Date().toISOString(),
+    validTo: input.validTo,
+    supersedes: input.supersedes,
+  });
+}
+
 export function renderLearningCard(card: LearningCard): string {
   return [
     `Learning card: ${card.type}`,

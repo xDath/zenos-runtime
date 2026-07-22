@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   LearningCardSchema,
   buildRuntimeLearningCard,
+  buildVerifiedLearningCard,
   renderLearningCard,
 } from '../app/lib/learning-cards';
 
@@ -53,4 +54,40 @@ test('observed failures become failure cards and unverified prose stays low conf
   assert.equal(unverified.type, 'project_state');
   assert.equal(unverified.verification, 'unverified');
   assert.equal(unverified.confidence, 0.45);
+});
+
+test('explicit preference and decision cards require durable evidence and correct verification', () => {
+  const preference = buildVerifiedLearningCard({
+    type: 'preference',
+    claim: 'The user prefers concise technical progress updates.',
+    verification: 'user_confirmed',
+    evidence: [{ source: 'user', ref: 'session:abc:message:42' }],
+    validFrom: '2026-07-21T00:00:00.000Z',
+  });
+  assert.equal(preference.type, 'preference');
+  assert.equal(preference.verification, 'user_confirmed');
+  assert.equal(preference.confidence, 0.98);
+
+  const decision = buildVerifiedLearningCard({
+    type: 'decision',
+    claim: 'Runtime is the only checkpoint authority.',
+    verification: 'tool_observed',
+    evidence: [{ source: 'runtime', ref: 'runtime-run:checkpoint-coordinator' }],
+    supersedes: ['legacy-double-compact-decision'],
+    validFrom: '2026-07-21T00:00:01.000Z',
+  });
+  assert.equal(decision.type, 'decision');
+  assert.deepEqual(decision.supersedes, ['legacy-double-compact-decision']);
+  assert.throws(() => buildVerifiedLearningCard({
+    type: 'preference',
+    claim: 'Inferred preference without confirmation.',
+    verification: 'tool_observed',
+    evidence: [{ source: 'tool', ref: 'tool:guess' }],
+  }), /user confirmation/i);
+  assert.throws(() => buildVerifiedLearningCard({
+    type: 'procedure',
+    claim: 'Untested procedure.',
+    verification: 'tool_observed',
+    evidence: [{ source: 'tool', ref: 'tool:run' }],
+  }), /deterministic test/i);
 });

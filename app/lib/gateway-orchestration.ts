@@ -7,9 +7,11 @@ import {
   WorkerResult,
   choosePipeline,
 } from './zenos-runtime';
+import { AutonomousCodingOutcome, runAutonomousCodingLoop } from './autonomous-coding-loop';
 import {
   RuntimeModelResult,
   RuntimeRunRequestSchema,
+  callRuntimeModel,
   getRuntimeRoleIdentity,
   runBossReviewModel,
   runHostRevision,
@@ -53,6 +55,7 @@ import {
   failCommandJob,
   synchronizeCommandJobPostflight,
   synchronizeCommandJobPreflight,
+  transitionCommandStep,
 } from './command-job';
 import { compileCognitivePacket, renderCognitivePacket } from './cognitive-kernel';
 import { persistCognitiveOutcome, persistRecallFeedback } from './zenos-memory-client';
@@ -72,10 +75,13 @@ import {
   observeLatency,
   roleLatencyTimeout,
 } from './latency-budget';
+import { decideLowTierRouting } from './low-tier-routing';
 import { recordOutcomePassport } from './outcome-ledger';
+import { auditAvailabilityPolicy } from './runtime-audit';
 import { normalizeWorkspacePath } from './execution-boundary';
 import {
   CodingTaskState,
+  PreparedCodexExecution,
   prepareCodexExecution,
   recordCodexPatch,
   recordCodingValidation,
@@ -87,6 +93,13 @@ export { GatewayTurnPostflightRequestSchema, GatewayTurnPreflightRequestSchema }
 
 function now(): string {
   return new Date().toISOString();
+}
+
+function gatewayAutonomousCodingMode(): 'off' | 'shadow' | 'canary' | 'enabled' {
+  const raw = (process.env.ZENOS_RUNTIME_AUTONOMOUS_CODING_GATEWAY_MODE || 'shadow').trim().toLowerCase();
+  return ['off', 'shadow', 'canary', 'enabled'].includes(raw)
+    ? raw as 'off' | 'shadow' | 'canary' | 'enabled'
+    : 'shadow';
 }
 
 function hashRequest(value: unknown): string {
@@ -496,6 +509,7 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
   const store = getRuntimeStore();
   const continuity = preserveUnfinishedCodingContinuity(GatewayTurnPreflightRequestSchema.parse(raw));
   let request = continuity.request;
+  auditAvailabilityPolicy({ sessionId: request.sessionId, requestId: request.turnId, store });
   const gatewayReportedHost = request.host;
   const configuredHost = getRuntimeRoleIdentity('host', request.sessionId, request.modelOverrides);
   const authoritativeHostEnabled = process.env.ZENOS_RUNTIME_AUTHORITATIVE_HOST !== 'false';
@@ -552,12 +566,13 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
   const { repositoryContext, memoryBrief } = preparedContexts;
   const preflightLatency: LatencyObservation[] = [...preparedContexts.observations];
   let codingTask: CodingTaskState | undefined;
+  let preparedCoding: PreparedCodexExecution | undefined;
   let codingContext = '';
   if (
     request.workspaceRoot
     && ['coding_change', 'debugging'].includes(baselineDecision.taskType)
   ) {
-    const preparedCoding = await prepareCodexExecution({
+    preparedCoding = await prepareCodexExecution({
       taskId: activeCodingRecord?.taskId,
       runId,
       sessionId: request.sessionId,
@@ -739,9 +754,103 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
     throw new Error(hostAuthorization.reason || 'Unable to reserve the mandatory Hermes Host token budget');
   }
 
+  let autonomousOutcome: AutonomousCodingOutcome | undefined;
+  const autonomousMode = gatewayAutonomousCodingMode();
+  const lowTierAutonomy = decideLowTierRouting({
+    decision,
+    sessionId: request.sessionId,
+    workspaceAvailable: Boolean(request.workspaceRoot),
+    store,
+  });
+  const autonomousEligible = Boolean(
+    preparedCoding
+    && request.approvalGranted === true
+    && ['coding_change', 'debugging'].includes(decision.taskType)
+    && ['low', 'medium'].includes(decision.risk)
+    && decision.useTools,
+  );
+  const autonomousExecute = autonomousEligible && (
+    autonomousMode === 'enabled'
+    || (autonomousMode === 'canary' && lowTierAutonomy.activate)
+  );
+  if (preparedCoding && autonomousExecute) {
+    autonomousOutcome = await runAutonomousCodingLoop({
+      prepared: preparedCoding,
+      approvalGranted: true,
+      maxRevisions: Math.max(0, Math.min(2, decision.maxRevisionAttempts || 1)),
+      requestIdPrefix: `${runId}:gateway-autonomous`,
+      invokeModel: async ({ stage, system, user, maxTokens, requestId }) => callRuntimeModel('worker', [
+        { role: 'system', content: system },
+        { role: 'user', content: user },
+      ], {
+        json: true,
+        maxTokens: Math.min(maxTokens, budget.worker.outputTokens),
+        maxInputTokens: budget.worker.inputTokens,
+        timeoutMs: budget.worker.timeoutMs,
+        retries: budget.worker.maxRetries,
+        sessionId: request.sessionId,
+        modelOverrides: input.modelOverrides,
+        requestId,
+        temperature: stage === 'plan' ? 0.15 : 0.05,
+        tokenBudgetPlan: budget,
+      }),
+    });
+    codingTask = autonomousOutcome.task;
+    const autonomousContext = [
+      'Runtime gateway autonomous coding outcome:',
+      `status=${autonomousOutcome.status}`,
+      `summary=${autonomousOutcome.summary}`,
+      `changed_files=${autonomousOutcome.task.filesChanged.join(',')}`,
+      `tool_evidence=${autonomousOutcome.toolEvidence.map((item) => `${item.tool}:${item.status}:${item.summary}`).join(' | ')}`,
+      autonomousOutcome.status === 'completed'
+        ? 'Host rule: implementation and deterministic validation are already committed; do not repeat the patch. Inspect evidence and deliver or escalate.'
+        : 'Host rule: continue only from the first uncommitted phase and never repeat a committed patch.',
+    ].join('\n');
+    input.context = [input.context, autonomousContext].filter(Boolean).join('\n\n');
+    input.toolContext = [input.toolContext, autonomousContext].filter(Boolean).join('\n\n');
+    recordActivity(
+      request.sessionId,
+      'worker',
+      `Gateway autonomous coding loop ${autonomousOutcome.status}: ${autonomousOutcome.summary}`,
+      {
+        runId,
+        turnId: request.turnId,
+        mode: autonomousMode,
+        evidenceGate: lowTierAutonomy.evidence,
+        toolEvidence: autonomousOutcome.toolEvidence,
+        changedFiles: autonomousOutcome.task.filesChanged,
+      },
+      autonomousOutcome.status === 'completed' || autonomousOutcome.status === 'no_change'
+        ? 'success'
+        : autonomousOutcome.status === 'failed' || autonomousOutcome.status === 'validation_failed'
+          ? 'failed'
+          : 'started',
+    );
+  } else if (preparedCoding && autonomousMode !== 'off') {
+    recordActivity(
+      request.sessionId,
+      'worker',
+      `Gateway autonomous coding stayed ${autonomousMode === 'shadow' ? 'shadow-only' : 'inactive'}: ${
+        request.approvalGranted !== true
+          ? 'mutation approval is absent'
+          : !lowTierAutonomy.activate && autonomousMode === 'canary'
+            ? lowTierAutonomy.reason
+            : 'task is outside the bounded eligibility policy'
+      }.`,
+      {
+        runId,
+        turnId: request.turnId,
+        mode: autonomousMode,
+        eligible: autonomousEligible,
+        evidenceGate: lowTierAutonomy.evidence,
+      },
+      'skipped',
+    );
+  }
+
   let workerResult: WorkerResult | undefined;
-  let workerCall: RuntimeModelResult | undefined;
-  if (decision.useWorker) {
+  let workerCall: RuntimeModelResult | undefined = autonomousOutcome?.modelCalls.at(-1);
+  if (decision.useWorker && !autonomousOutcome) {
     const worker = await runWorkerCompression(input, undefined, {
       pass: 1,
       totalPasses: 1,
@@ -863,7 +972,7 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
         store,
       })
     : undefined;
-  const commandJob = commandJobPrepared
+  let commandJob = commandJobPrepared
     ? synchronizeCommandJobPreflight({
         jobId: commandJobPrepared.job.jobId,
         routeRef: `runtime-run:${runId}`,
@@ -880,6 +989,53 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
         store,
       })
     : undefined;
+  if (commandJob && autonomousOutcome) {
+    const steps = store.listCommandSteps(commandJob.jobId);
+    const patchStep = steps.find((step) => step.kind === 'patch');
+    const patchCommitted = autonomousOutcome.patches.length > 0
+      || autonomousOutcome.task.filesChanged.length > 0
+      || autonomousOutcome.status === 'no_change';
+    if (patchStep && patchStep.status !== 'done' && patchCommitted) {
+      transitionCommandStep({
+        jobId: commandJob.jobId,
+        kind: 'patch',
+        status: 'done',
+        resultRef: `gateway-autonomous:${runId}:${autonomousOutcome.status}`,
+        metadata: {
+          autonomous: true,
+          status: autonomousOutcome.status,
+          changedFiles: autonomousOutcome.task.filesChanged,
+          patchCount: autonomousOutcome.patches.length,
+          noChange: autonomousOutcome.status === 'no_change',
+        },
+        store,
+      });
+    }
+    const validateStep = store.listCommandSteps(commandJob.jobId).find((step) => step.kind === 'validate');
+    if (
+      validateStep
+      && validateStep.status !== 'done'
+      && (autonomousOutcome.status === 'completed' || autonomousOutcome.status === 'no_change')
+    ) {
+      transitionCommandStep({
+        jobId: commandJob.jobId,
+        kind: 'validate',
+        status: 'done',
+        resultRef: `gateway-autonomous-validation:${runId}`,
+        metadata: {
+          autonomous: true,
+          deterministicValidation: 'passed',
+          toolEvidence: autonomousOutcome.toolEvidence.map((item) => ({
+            tool: item.tool,
+            status: item.status,
+            summary: item.summary,
+          })),
+        },
+        store,
+      });
+    }
+    commandJob = store.getCommandJob(commandJob.jobId) || commandJob;
+  }
 
   recordActivity(
     request.sessionId,
@@ -915,6 +1071,18 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
     hostPlanCall,
     workerResult,
     workerCall,
+    autonomousOutcome: autonomousOutcome ? {
+      status: autonomousOutcome.status,
+      summary: autonomousOutcome.summary,
+      changedFiles: autonomousOutcome.task.filesChanged,
+      patchCount: autonomousOutcome.patches.length,
+      validationPassed: autonomousOutcome.status === 'completed' || autonomousOutcome.status === 'no_change',
+      toolEvidence: autonomousOutcome.toolEvidence.map((item) => ({
+        tool: item.tool,
+        status: item.status,
+        summary: item.summary,
+      })),
+    } : undefined,
     bossPreflight,
     bossCall,
     repositoryContext: repositoryContext || undefined,
@@ -975,6 +1143,9 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
       codingTask
         ? `Transactional coding state:\n- task_id: ${codingTask.taskId}\n- phase: ${codingTask.currentPhase}\n- checkpoint: ${codingTask.checkpoints.at(-1)?.checkpointId || 'pending'}\n- workspace_revision: ${codingTask.workspaceRevision}\n- Rule: before any new mutation after compaction or interruption, reconcile Git HEAD, dirty diff hash, and changed-file hashes. Never deploy or restart before deterministic validation passes.\n- Autonomy rule: do not ask the user to reply \"gas\", \"lanjut\", or confirm ordinary implementation steps. Continue through inspect, patch, targeted validation, and safe non-privileged recovery in the same visible request. Ask only for genuinely missing user-owned input or explicit approval required by a privileged/destructive boundary.`
         : '',
+      autonomousOutcome
+        ? `Runtime autonomous execution evidence:\n- status: ${autonomousOutcome.status}\n- summary: ${autonomousOutcome.summary}\n- changed_files: ${autonomousOutcome.task.filesChanged.join(',') || 'none'}\n- validation_committed: ${autonomousOutcome.status === 'completed' || autonomousOutcome.status === 'no_change'}\n- Do not repeat committed edits. Use this evidence for synthesis or continue only from the first uncommitted step.`
+        : '',
     ].filter(Boolean).join('\n\n'),
     hostWorkingSetTokens: hostWorkingSetForDecision(decision),
     hostBudget: {
@@ -993,7 +1164,13 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
         plannerInvoked: Boolean(hostPlanCall),
         calls: hostPlanCall ? 2 : 1,
       },
-      worker: callIdentity(workerCall),
+      worker: autonomousOutcome
+        ? {
+            ...callIdentity(workerCall),
+            invoked: true,
+            ok: !['failed', 'validation_failed', 'blocked'].includes(autonomousOutcome.status),
+          }
+        : callIdentity(workerCall),
       verifier: { invoked: false },
       boss: { ...callIdentity(bossCall), verdict: bossPreflight?.verdict },
       transformed: false,
@@ -1017,14 +1194,26 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
   let cognitiveCapsule = parsedCognitiveCapsule.success ? parsedCognitiveCapsule.data : undefined;
   const rootBudgetId = cognitiveCapsule?.rootRunId || request.runId;
   const turnStartedAtMs = stored.turnStartedAtMs || Date.parse(run.startedAt) || Date.now();
-  const deterministicValidation = deterministicValidationState(request.toolSummary, request.executionReceipts);
+  const autonomousValidationPassed = stored.autonomousOutcome?.validationPassed === true;
+  const deterministicValidation = autonomousValidationPassed
+    ? 'passed' as const
+    : deterministicValidationState(request.toolSummary, request.executionReceipts);
   const textObservedCoding = observedCodingState(request.toolSummary, request.executionReceipts);
   const workspaceMutated = workspaceMutationObserved(stored.workspaceState, request.workspaceState);
+  const autonomousMutated = Boolean(
+    stored.autonomousOutcome
+    && (stored.autonomousOutcome.patchCount > 0 || stored.autonomousOutcome.changedFiles.length > 0),
+  );
   const observedCoding = {
-    mutated: textObservedCoding.mutated || workspaceMutated,
-    broken: textObservedCoding.broken,
+    mutated: textObservedCoding.mutated || workspaceMutated || autonomousMutated,
+    broken: textObservedCoding.broken || ['failed', 'validation_failed'].includes(stored.autonomousOutcome?.status || ''),
   };
-  const missingWorkspaceEvidence = Boolean(stored.codingTaskId && observedCoding.mutated && !request.workspaceState);
+  const missingWorkspaceEvidence = Boolean(
+    stored.codingTaskId
+    && observedCoding.mutated
+    && !request.workspaceState
+    && !stored.autonomousOutcome,
+  );
   const unresolvedCodingMutation = observedCoding.mutated
     && (observedCoding.broken || deterministicValidation !== 'passed' || missingWorkspaceEvidence);
   const baseInput = RuntimeRunRequestSchema.parse({
@@ -1055,7 +1244,7 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
   let codingTaskState: CodingTaskState | undefined;
   if (stored.codingTaskId) {
     let codingTask = store.getCodingTask(stored.codingTaskId)?.state as CodingTaskState | undefined;
-    if (codingTask && observedCoding.mutated && !request.workspaceState) {
+    if (codingTask && observedCoding.mutated && !request.workspaceState && !stored.autonomousOutcome) {
       codingTask = updateCodingTask(codingTask.taskId, {
         status: 'blocked',
         unresolvedRisks: [

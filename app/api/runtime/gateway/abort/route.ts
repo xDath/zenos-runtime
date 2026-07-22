@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { cancelCommandJob } from '@/app/lib/command-job';
 import { updateCognitiveTask } from '@/app/lib/cognitive-task';
 import { getRuntimeStore } from '@/app/lib/zenos-runtime-store';
 import { parseJsonBody, routeErrorResponse, routeSuccessResponse, secureRequest } from '@/app/lib/http';
@@ -49,12 +50,17 @@ export async function POST(req: Request) {
         failures: [abortReason],
         store,
       }));
+    const commandJobs = cognitiveTasks
+      .map((task) => store.findCommandJobByCognitiveTask(task.taskId))
+      .filter((job): job is NonNullable<typeof job> => Boolean(job))
+      .map((job) => cancelCommandJob({ jobId: job.jobId, reason: abortReason, store }));
     return routeSuccessResponse({
       ok: true,
       run: abandoned,
       codingTask: codingTasks[0]?.state,
       codingTaskRecords: codingTasks,
       cognitiveTasks,
+      commandJobs,
       continuationRecords: continuations,
     }, secured.context, ROUTE);
   } catch (error) {

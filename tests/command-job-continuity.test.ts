@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   ContinuityPacketV2,
   computeContinuityPacketHash,
@@ -13,7 +16,10 @@ import {
   recordContinuityCheckpoint,
 } from '../app/lib/continuity-coordinator';
 import {
+  cancelCommandJob,
   ensureCommandJob,
+  pauseCommandJob,
+  resumeCommandJob,
   synchronizeCommandJobPostflight,
   synchronizeCommandJobPreflight,
   transitionCommandStep,
@@ -21,7 +27,12 @@ import {
 import { prepareCognitiveTask } from '../app/lib/cognitive-task';
 import { CognitivePacketSchema } from '../app/lib/cognitive-kernel';
 import { RouteDecisionSchema } from '../app/lib/zenos-runtime';
-import { getRuntimeStore, resetRuntimeStoreForTests } from '../app/lib/zenos-runtime-store';
+import { RuntimeSessionStateSchema } from '../app/lib/zenos-runtime-state';
+import {
+  RuntimeStore,
+  getRuntimeStore,
+  resetRuntimeStoreForTests,
+} from '../app/lib/zenos-runtime-store';
 
 function packet(overrides: Partial<Omit<ContinuityPacketV2, 'contentHash'>> = {}): ContinuityPacketV2 {
   const base: Omit<ContinuityPacketV2, 'contentHash'> = {
@@ -337,4 +348,151 @@ test('CommandJob is idempotent, predecessor-ordered, resumable, and evidence-gat
   assert.equal(completed.status, 'completed');
   assert.equal(completed.activeStepId, undefined);
   assert.ok(store.listCommandSteps(first.job.jobId).every((step) => step.status === 'done'));
+});
+
+test('CommandJob restart recovery requeues the first uncommitted step without cancelling the root task', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'zenos-command-restart-'));
+  const databasePath = join(directory, 'runtime.db');
+  let store = new RuntimeStore(databasePath);
+  try {
+    const timestamp = new Date().toISOString();
+    store.saveSession(RuntimeSessionStateSchema.parse({
+      sessionId: 'restart-command-session',
+      userGoal: 'Implement durable CommandJob continuity.',
+      status: 'working',
+      hostModel: 'test-host',
+      activeRunId: 'restart-root-run',
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    }));
+    store.saveRun({
+      runId: 'restart-root-run',
+      sessionId: 'restart-command-session',
+      requestHash: 'restart-root-request',
+      status: 'running',
+      decision: codingDecision,
+      errors: [],
+      startedAt: timestamp,
+    });
+    const capsule = prepareCognitiveTask({
+      sessionId: 'restart-command-session',
+      runId: 'restart-root-run',
+      packet: cognitivePacket,
+      workspaceRevision: 'workspace-before-restart',
+      store,
+    });
+    const prepared = ensureCommandJob({
+      sessionId: 'restart-command-session',
+      userTurnId: 'restart-root-turn',
+      requestHash: '1'.repeat(64),
+      capsule,
+      decision: codingDecision,
+      workspaceRoot: '/srv/etla/workspaces/zenos-runtime',
+      budget: { maxCycles: 6, maxModelCalls: 8, maxTokens: 120_000 },
+      checkpointId: 'checkpoint-before-restart',
+      store,
+    });
+    synchronizeCommandJobPreflight({
+      jobId: prepared.job.jobId,
+      routeRef: 'runtime-run:restart-root-run',
+      repositoryContext: 'Repository inspection evidence.',
+      planRef: 'host-plan:restart-root-run',
+      mutationExpected: true,
+      approvalRequired: false,
+      store,
+    });
+    assert.equal(store.listCommandSteps(prepared.job.jobId).find((step) => step.kind === 'patch')?.status, 'running');
+    store.close();
+
+    store = new RuntimeStore(databasePath);
+    const recovered = store.getCommandJob(prepared.job.jobId);
+    assert.equal(recovered?.status, 'retry_pending');
+    assert.equal(recovered?.checkpointId, 'checkpoint-before-restart');
+    assert.equal(store.getCognitiveTask(capsule.taskId)?.status, 'active');
+    assert.equal(store.listCommandSteps(prepared.job.jobId).find((step) => step.kind === 'patch')?.status, 'retry_pending');
+    const continuation = store.claimContinuationForSession('restart-command-session');
+    assert.equal(continuation?.reason, 'runtime_restart_recovery');
+    assert.match(continuation?.prompt || '', /first uncommitted step|Resume step: patch/i);
+    assert.match(continuation?.prompt || '', /checkpoint-before-restart/i);
+  } finally {
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('compression pauses the CommandJob and the next preflight resumes the same active step', () => {
+  const store = getRuntimeStore();
+  const capsule = prepareCognitiveTask({
+    sessionId: 'compact-command-session',
+    runId: 'compact-root-run',
+    packet: cognitivePacket,
+    store,
+  });
+  const prepared = ensureCommandJob({
+    sessionId: 'compact-command-session',
+    userTurnId: 'compact-root-turn',
+    requestHash: '3'.repeat(64),
+    capsule,
+    decision: codingDecision,
+    workspaceRoot: '/srv/etla/workspaces/zenos-runtime',
+    budget: { maxCycles: 6, maxModelCalls: 8, maxTokens: 120_000 },
+    store,
+  });
+  synchronizeCommandJobPreflight({
+    jobId: prepared.job.jobId,
+    routeRef: 'runtime-run:compact-root-run',
+    repositoryContext: 'Repository inspection evidence.',
+    planRef: 'host-plan:compact-root-run',
+    mutationExpected: true,
+    approvalRequired: false,
+    store,
+  });
+  const before = store.getCommandJob(prepared.job.jobId);
+  const paused = pauseCommandJob({
+    jobId: prepared.job.jobId,
+    reason: 'verified context compression boundary',
+    checkpointId: 'compact-checkpoint-1',
+    store,
+  });
+  assert.equal(paused.status, 'paused_for_compaction');
+  assert.equal(paused.activeStepId, before?.activeStepId);
+  assert.equal(store.getCommandStep(paused.activeStepId || '')?.status, 'retry_pending');
+  const resumed = resumeCommandJob({
+    jobId: prepared.job.jobId,
+    checkpointId: 'compact-checkpoint-1',
+    store,
+  });
+  assert.equal(resumed.status, 'running');
+  assert.equal(resumed.activeStepId, paused.activeStepId);
+  assert.equal(store.getCommandStep(resumed.activeStepId || '')?.status, 'running');
+});
+
+test('cancelling a CommandJob terminalizes every uncommitted step', () => {
+  const store = getRuntimeStore();
+  const capsule = prepareCognitiveTask({
+    sessionId: 'cancel-command-session',
+    runId: 'cancel-root-run',
+    packet: cognitivePacket,
+    store,
+  });
+  const prepared = ensureCommandJob({
+    sessionId: 'cancel-command-session',
+    userTurnId: 'cancel-root-turn',
+    requestHash: '2'.repeat(64),
+    capsule,
+    decision: codingDecision,
+    workspaceRoot: '/srv/etla/workspaces/zenos-runtime',
+    budget: { maxCycles: 6, maxModelCalls: 8, maxTokens: 120_000 },
+    store,
+  });
+  const cancelled = cancelCommandJob({
+    jobId: prepared.job.jobId,
+    reason: 'Gateway abort contract test',
+    store,
+  });
+  assert.equal(cancelled.status, 'cancelled');
+  assert.equal(cancelled.activeStepId, undefined);
+  assert.ok(store.listCommandSteps(prepared.job.jobId)
+    .filter((step) => step.status !== 'done')
+    .every((step) => step.status === 'blocked'));
 });

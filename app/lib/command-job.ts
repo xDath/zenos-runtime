@@ -150,7 +150,6 @@ export function ensureCommandJob(input: {
   const byTurn = store.findCommandJob(input.sessionId, input.userTurnId, input.requestHash);
   const existing = byTask || byTurn;
   if (existing) {
-    const steps = store.listCommandSteps(existing.jobId);
     const updated = store.saveCommandJob({
       ...existing,
       checkpointId: input.checkpointId || existing.checkpointId,
@@ -159,7 +158,10 @@ export function ensureCommandJob(input: {
       budget: JobBudgetSchema.parse(input.budget),
       updatedAt: now(),
     });
-    return { job: updated, steps, created: false };
+    const resumed = ['queued', 'paused_for_compaction', 'retry_pending'].includes(updated.status)
+      ? resumeCommandJob({ jobId: updated.jobId, checkpointId: input.checkpointId, store })
+      : updated;
+    return { job: resumed, steps: store.listCommandSteps(resumed.jobId), created: false };
   }
 
   const timestamp = now();
@@ -276,6 +278,38 @@ export function synchronizeCommandJobPreflight(input: {
     return store.saveCommandJob({ ...job, status: 'waiting_for_approval', updatedAt: now() });
   }
   return job;
+}
+
+export function resumeCommandJob(input: {
+  jobId: string;
+  checkpointId?: string;
+  store?: RuntimeStore;
+}): CommandJobRecord {
+  const store = input.store || getRuntimeStore();
+  const job = store.getCommandJob(input.jobId);
+  if (!job) throw new Error(`CommandJob not found: ${input.jobId}`);
+  if (!['queued', 'paused_for_compaction', 'retry_pending'].includes(job.status)) return job;
+  const steps = store.listCommandSteps(input.jobId);
+  const active = steps.find((step) => step.status !== 'done');
+  if (active && active.status === 'retry_pending') {
+    store.saveCommandStep({
+      ...active,
+      status: 'running',
+      metadata: {
+        ...(active.metadata && typeof active.metadata === 'object' ? active.metadata as Record<string, unknown> : {}),
+        resumedAt: now(),
+        resumedFromCheckpoint: input.checkpointId || job.checkpointId,
+      },
+      updatedAt: now(),
+    });
+  }
+  return store.saveCommandJob({
+    ...job,
+    status: 'running',
+    checkpointId: input.checkpointId || job.checkpointId,
+    activeStepId: active?.stepId,
+    updatedAt: now(),
+  });
 }
 
 export function pauseCommandJob(input: {
@@ -457,6 +491,36 @@ export function synchronizeCommandJobPostflight(input: {
     });
   }
   return completeCommandJob({ jobId: input.jobId, resultRef: input.resultRef, store });
+}
+
+export function cancelCommandJob(input: {
+  jobId: string;
+  reason: string;
+  store?: RuntimeStore;
+}): CommandJobRecord {
+  const store = input.store || getRuntimeStore();
+  const job = store.getCommandJob(input.jobId);
+  if (!job) throw new Error(`CommandJob not found: ${input.jobId}`);
+  const timestamp = now();
+  for (const step of store.listCommandSteps(input.jobId)) {
+    if (step.status === 'done') continue;
+    store.saveCommandStep({
+      ...step,
+      status: 'blocked',
+      metadata: {
+        ...(step.metadata && typeof step.metadata === 'object' ? step.metadata as Record<string, unknown> : {}),
+        cancelled: true,
+        cancellationReason: input.reason,
+      },
+      updatedAt: timestamp,
+    });
+  }
+  return store.saveCommandJob({
+    ...job,
+    status: 'cancelled',
+    activeStepId: undefined,
+    updatedAt: timestamp,
+  });
 }
 
 export function failCommandJob(input: {

@@ -1,14 +1,9 @@
 import * as crypto from 'node:crypto';
 import path from 'node:path';
+import { coordinateContinuityCheckpoint } from './continuity-service';
 import { evaluateExecutionBoundary } from './execution-boundary';
-import {
-  ContinuityCheckpointDecision,
-  decideContinuityCheckpoint,
-  evaluateContinuityPressure,
-  recordContinuityCheckpoint,
-} from './continuity-coordinator';
-import { RuntimeFeatureFlags } from './feature-flags';
 import { GatewayMemoryBrief, GatewayTurnPreflightRequest } from './gateway-contracts';
+import { auditNamespaceAccess } from './runtime-audit';
 import { LatencyBudgetPlan, LatencyObservation, observeLatency } from './latency-budget';
 import {
   analyzeChangeImpact,
@@ -19,7 +14,6 @@ import { RouteDecision } from './zenos-runtime';
 import {
   bootstrapMemoryContext,
   cognitiveMemoryBrief,
-  compactMemoryHandoff,
   recallMemoryContext,
 } from './zenos-memory-client';
 import { truncateToTokenBudget } from './token-economy';
@@ -177,81 +171,35 @@ export async function gatewayMemoryContextFor(
   existingSession: boolean,
 ): Promise<GatewayMemoryBrief> {
   const namespaces = memoryNamespaces(request);
+  auditNamespaceAccess({
+    sessionId: request.sessionId,
+    primary: namespaces.primary,
+    shared: namespaces.shared,
+    workspaceRoot: request.workspaceRoot,
+    requestId: request.turnId,
+  });
   const softLimit = hostWorkingSetForDecision(decision);
   const contextBudget = memoryTokenBudget(decision);
   const projectName = request.workspaceRoot ? path.basename(request.workspaceRoot) : '';
   const memoryQuery = projectName
     ? `Active project ${projectName}. ${request.request}`
     : request.request;
-  const coordinatorEnabled = RuntimeFeatureFlags.continuityCoordinator();
-  const continuityDecision: ContinuityCheckpointDecision = coordinatorEnabled
-    ? decideContinuityCheckpoint({
-        sessionId: request.sessionId,
-        packet: request.continuityPacket,
-        estimatedTokens: request.estimatedContextTokens,
-        checkpointSoftLimitTokens: softLimit,
-      })
-    : {
-        action: 'checkpoint',
-        reason: 'ContinuityCoordinator disabled by rollback flag; using legacy compact behavior',
-        pressure: evaluateContinuityPressure(request.estimatedContextTokens, softLimit),
-      };
-  const underPressure = continuityDecision.pressure.shouldCheckpoint;
   const hasHandoffSource = Boolean(request.continuityPacket) || request.handoffMessages.length >= 4;
-
-  if (underPressure && hasHandoffSource && continuityDecision.action === 'reuse' && continuityDecision.latest?.context) {
-    return {
-      context: truncateToTokenBudget(
-        continuityDecision.latest.context,
-        contextBudget,
-        '\n[MEMORY BRIEF TRUNCATED]',
-      ),
-      source: 'handoff',
-      coverage: continuityDecision.latest.coverage as GatewayMemoryBrief['coverage'],
-      degraded: false,
-      cacheHit: true,
-      latencyMs: 0,
-      checkpointId: continuityDecision.latest.checkpointId,
-      sourceCursor: continuityDecision.latest.sourceCursor,
-      previousCheckpointId: continuityDecision.latest.previousCheckpointId,
-    };
-  }
-
-  if (underPressure && hasHandoffSource && continuityDecision.action === 'checkpoint') {
-    const compact = await compactMemoryHandoff({
-      messages: request.handoffMessages,
-      packet: request.continuityPacket,
-      namespace: namespaces.primary,
+  if (hasHandoffSource) {
+    const checkpoint = await coordinateContinuityCheckpoint({
       sessionId: request.sessionId,
-      conversationId: request.turnId,
-      approxTokens: request.estimatedContextTokens,
+      turnId: request.turnId,
+      namespace: namespaces.primary,
+      estimatedTokens: request.estimatedContextTokens,
+      checkpointSoftLimitTokens: softLimit,
+      packet: request.continuityPacket,
+      messages: request.handoffMessages,
       maxChars: 8_000,
       inputMaxChars: 120_000,
       reason: `hermes-host-working-set-pressure:${decision.taskType}:${softLimit}`,
     });
-    if (compact.ok && compact.value?.context) {
-      let context = compact.value.context;
-      const evidenceReceiptAccepted = RuntimeFeatureFlags.evidenceFaithfulness()
-        ? compact.value.checkpointValidated === true
-        : compact.value.checkpointValidated !== false;
-      if (
-        coordinatorEnabled
-        && request.continuityPacket
-        && compact.value.memoryId
-        && evidenceReceiptAccepted
-      ) {
-        recordContinuityCheckpoint({
-          sessionId: request.sessionId,
-          packet: request.continuityPacket,
-          checkpointId: compact.value.memoryId,
-          previousCheckpointId: compact.value.previousCheckpointId,
-          pressure: continuityDecision.pressure,
-          strategy: compact.value.strategy,
-          coverage: compact.value.coverage,
-          context: compact.value.context,
-          signalHash: continuityDecision.signalHash,
-        });
-      }
+    if (checkpoint.context) {
+      let context = checkpoint.context;
       if (decision.taskType === 'memory_question') {
         const recalled = await recallAcrossNamespaces({
           query: memoryQuery,
@@ -265,13 +213,13 @@ export async function gatewayMemoryContextFor(
       return {
         context: truncateToTokenBudget(context, contextBudget, '\n[MEMORY BRIEF TRUNCATED]'),
         source: 'handoff',
-        coverage: compact.value.coverage,
-        degraded: compact.degraded,
-        cacheHit: compact.cacheHit,
-        latencyMs: compact.latencyMs,
-        checkpointId: compact.value.memoryId,
-        sourceCursor: compact.value.sourceCursor,
-        previousCheckpointId: compact.value.previousCheckpointId,
+        coverage: checkpoint.coverage as GatewayMemoryBrief['coverage'],
+        degraded: checkpoint.degraded,
+        cacheHit: checkpoint.cacheHit,
+        latencyMs: checkpoint.latencyMs,
+        checkpointId: checkpoint.checkpointId,
+        sourceCursor: checkpoint.sourceCursor,
+        previousCheckpointId: checkpoint.previousCheckpointId,
       };
     }
   }

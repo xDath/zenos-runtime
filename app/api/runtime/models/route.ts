@@ -1,7 +1,10 @@
+import { recordRuntimeConfigAudit } from '@/app/lib/runtime-audit';
+import { getRuntimeStore } from '@/app/lib/zenos-runtime-store';
 import { getRuntimeModels, getRuntimeSession, updateSessionModelOverrides } from '@/app/lib/zenos-runtime-three-agent';
 import { getRuntimeModelConfigSummary } from '@/app/lib/zenos-runtime-executor';
 import {
   publicModelSlots,
+  readRuntimeModelSlots,
   readSessionModelSlots,
   RuntimeModelSlotsSchema,
   writeRuntimeModelSlots,
@@ -46,7 +49,17 @@ export async function POST(req: Request) {
     const sessionId = sessionIdFrom(req);
     const body = await parseJsonBody(req, RuntimeModelSlotsSchema, 256_000);
     if (sessionId) {
+      const previous = publicModelSlots(readSessionModelSlots(sessionId));
       const saved = writeSessionModelSlots(sessionId, body);
+      recordRuntimeConfigAudit({
+        category: 'model_config',
+        action: 'session-model-config-updated',
+        actor: secured.context.auth.clientId || 'runtime-model-api',
+        sessionId,
+        requestId: secured.context.requestId,
+        details: { previous, current: publicModelSlots(saved) },
+        store: getRuntimeStore(),
+      });
       const session = getRuntimeSession(sessionId) ? updateSessionModelOverrides(sessionId, saved) : null;
       return routeSuccessResponse({
         ok: true,
@@ -57,7 +70,16 @@ export async function POST(req: Request) {
         config: getRuntimeModelConfigSummary(sessionId),
       }, secured.context, `${ROUTE}.set`);
     }
+    const previous = publicModelSlots(readRuntimeModelSlots());
     const saved = writeRuntimeModelSlots(body);
+    recordRuntimeConfigAudit({
+      category: 'model_config',
+      action: 'global-model-config-updated',
+      actor: secured.context.auth.clientId || 'runtime-model-api',
+      requestId: secured.context.requestId,
+      details: { previous, current: publicModelSlots(saved) },
+      store: getRuntimeStore(),
+    });
     return routeSuccessResponse({ ok: true, scope: 'global', saved: publicModelSlots(saved), config: getRuntimeModelConfigSummary() }, secured.context, `${ROUTE}.set`);
   } catch (error) {
     return routeErrorResponse(error, secured.context, `${ROUTE}.set`);

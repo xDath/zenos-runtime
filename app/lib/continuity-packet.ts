@@ -212,3 +212,154 @@ export function continuityPacketToCompactMessages(
 
   return [packetHeader, ...head, ...milestones, ...boundedToolAndWork, ...tail].slice(0, 400);
 }
+
+const GOAL_PATTERN = /\b(?:goal|objective|tujuan|buat|bikin|implement|upgrade|audit|fix|perbaiki|selesaikan|kerjakan|pengen|mau)\b/i;
+const DECISION_PATTERN = /\b(?:decision|decided|final|approved|confirmed|keputusan|diputuskan|pilih|pakai|gunakan)\b/i;
+const CONSTRAINT_PATTERN = /\b(?:must|must not|do not|never|always|jangan|harus|wajib|tanpa|only|hanya|acceptance criteria)\b/i;
+const PATCH_PATTERN = /\b(?:patch|patched|edit|edited|changed|modified|write|replace|mutation|diff|commit)\b/i;
+const VALIDATION_PATTERN = /\b(?:test|tested|typecheck|lint|build|compile|validation|validate|verified|passed|failed)\b/i;
+const BLOCKER_PATTERN = /\b(?:blocker|blocked|error|failed|failure|timeout|denied|broken|invalid|regression|crash|ngadat|gagal)\b/i;
+const PENDING_PATTERN = /\b(?:todo|pending|next|remaining|lanjut|belum|unfinished|retry|approval|required|needs? to)\b/i;
+const PATH_PATTERN = /(?:\/srv\/etla\/workspaces\/|\/usr\/local\/lib\/hermes-agent\/|app\/|gateway\/|tests\/|scripts\/)[A-Za-z0-9_./-]+/g;
+
+function rawContentText(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (content === null || content === undefined) return '';
+  return canonicalContinuityJson(content);
+}
+
+function rawOccurredAt(message: Record<string, unknown>): string {
+  for (const key of ['occurred_at', 'created_at', 'timestamp', 'time']) {
+    const raw = typeof message[key] === 'string' ? String(message[key]) : '';
+    if (!raw) continue;
+    const parsed = new Date(raw);
+    if (!Number.isNaN(parsed.getTime())) return parsed.toISOString();
+  }
+  return '1970-01-01T00:00:00.000Z';
+}
+
+export function compileContinuityPacketFromMessages(input: {
+  messages: Array<Record<string, unknown>>;
+  sessionId: string;
+  turnId: string;
+  estimatedTokens: number;
+  previousCheckpointId?: string;
+}): ContinuityPacketV2 {
+  const entries = input.messages.slice(-400).map((message, index) => {
+    const roleCandidate = String(message.role || '').trim().toLowerCase();
+    const role: ContinuityMessage['role'] = ['user', 'assistant', 'tool', 'system'].includes(roleCandidate)
+      ? roleCandidate as ContinuityMessage['role']
+      : 'system';
+    const content = rawContentText(message.content).trim().slice(0, 32_000);
+    const sourceHash = crypto.createHash('sha256').update(`${role}\n${content}`).digest('hex');
+    return {
+      index,
+      role,
+      content,
+      name: typeof message.name === 'string' ? message.name.slice(0, 200) : undefined,
+      toolCallId: typeof message.tool_call_id === 'string' ? message.tool_call_id.slice(0, 500) : undefined,
+      messageId: typeof message.message_id === 'string' || typeof message.id === 'string'
+        ? String(message.message_id || message.id).slice(0, 500)
+        : `m${index}:${role}:${sourceHash.slice(0, 16)}`,
+      sourceHash,
+      occurredAt: rawOccurredAt(message),
+    };
+  }).filter((entry) => entry.content);
+  if (!entries.length) throw new Error('Cannot compile a ContinuityPacket from empty messages');
+
+  const headCandidates = entries.slice(0, 40).filter((entry) => (
+    ['user', 'system'].includes(entry.role)
+    && (GOAL_PATTERN.test(entry.content) || DECISION_PATTERN.test(entry.content) || CONSTRAINT_PATTERN.test(entry.content))
+  ));
+  const headSource = headCandidates.length ? headCandidates : entries.filter((entry) => ['user', 'system'].includes(entry.role)).slice(0, 8);
+  const head = headSource.slice(0, 8).map((entry): ContinuityMessage => ({
+    role: entry.role,
+    content: entry.content,
+    message_id: entry.messageId,
+    ...(entry.name ? { name: entry.name } : {}),
+    ...(entry.toolCallId ? { tool_call_id: entry.toolCallId } : {}),
+  }));
+
+  const milestones: ContextMilestone[] = [];
+  const activeToolState: ContinuityToolState[] = [];
+  const openWork: ContinuityOpenWork[] = [];
+  for (const entry of entries) {
+    const changedFiles = [...new Set(entry.content.match(PATH_PATTERN) || [])].slice(0, 200);
+    const meaningfulToolResult = entry.role === 'tool' && (
+      BLOCKER_PATTERN.test(entry.content)
+      || VALIDATION_PATTERN.test(entry.content)
+      || PATCH_PATTERN.test(entry.content)
+      || PENDING_PATTERN.test(entry.content)
+      || changedFiles.length > 0
+      || !/^routine (?:transcript )?message \d+$/i.test(entry.content)
+    );
+    let kind: ContextMilestone['kind'] | undefined;
+    if (BLOCKER_PATTERN.test(entry.content)) kind = 'blocker';
+    else if (entry.role === 'user' && GOAL_PATTERN.test(entry.content)) kind = 'goal';
+    else if (VALIDATION_PATTERN.test(entry.content)) kind = 'validation';
+    else if (PATCH_PATTERN.test(entry.content)) kind = 'patch';
+    else if (DECISION_PATTERN.test(entry.content)) kind = 'decision';
+    else if (CONSTRAINT_PATTERN.test(entry.content)) kind = 'constraint';
+    else if (meaningfulToolResult) kind = 'tool_result';
+    if (kind && milestones.length < 100) {
+      milestones.push({
+        kind,
+        text: entry.content.slice(0, 8_000),
+        sourceMessageIds: [entry.messageId],
+        sourceHash: entry.sourceHash,
+        occurredAt: entry.occurredAt,
+      });
+    }
+    if (meaningfulToolResult && activeToolState.length < 80) {
+      activeToolState.push({
+        id: entry.messageId,
+        tool: entry.name || 'tool',
+        status: BLOCKER_PATTERN.test(entry.content) ? 'failed' : 'passed',
+        summary: entry.content.slice(0, 8_000),
+        changedFiles,
+        artifactIds: [],
+        sourceMessageIds: [entry.messageId],
+        sourceHash: entry.sourceHash,
+        occurredAt: entry.occurredAt,
+      });
+    }
+    if ((PENDING_PATTERN.test(entry.content) || BLOCKER_PATTERN.test(entry.content)) && openWork.length < 80) {
+      openWork.push({
+        id: `work:${entry.messageId}`,
+        kind: VALIDATION_PATTERN.test(entry.content) ? 'validate' : PATCH_PATTERN.test(entry.content) ? 'patch' : 'other',
+        text: entry.content.slice(0, 8_000),
+        status: BLOCKER_PATTERN.test(entry.content) ? 'blocked' : /retry/i.test(entry.content) ? 'retry_pending' : 'queued',
+        acceptanceCriteria: entry.content.split(/\r?\n/)
+          .filter((line) => /acceptance|criteria|must|harus|wajib/i.test(line))
+          .map((line) => line.trim().slice(0, 2_000))
+          .filter(Boolean)
+          .slice(0, 20),
+        blockers: BLOCKER_PATTERN.test(entry.content) ? [entry.content.slice(0, 2_000)] : [],
+        sourceMessageIds: [entry.messageId],
+        sourceHash: entry.sourceHash,
+      });
+    }
+  }
+  const recentTail = entries.slice(-160).map((entry): ContinuityMessage => ({
+    role: entry.role,
+    content: entry.content,
+    message_id: entry.messageId,
+    ...(entry.name ? { name: entry.name } : {}),
+    ...(entry.toolCallId ? { tool_call_id: entry.toolCallId } : {}),
+  }));
+  const sourceCursor = `msg:${entries.length}:${entries.at(-1)?.sourceHash.slice(0, 24)}`;
+  const payload: Omit<ContinuityPacketV2, 'contentHash'> = {
+    version: 'continuity-v2',
+    sessionId: input.sessionId,
+    turnId: input.turnId,
+    sourceCursor,
+    estimatedTokens: input.estimatedTokens,
+    head,
+    milestones,
+    recentTail,
+    activeToolState,
+    openWork,
+    previousCheckpointId: input.previousCheckpointId,
+  };
+  return { ...payload, contentHash: computeContinuityPacketHash(payload) };
+}
