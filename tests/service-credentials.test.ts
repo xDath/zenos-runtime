@@ -292,7 +292,7 @@ test('Runtime stores mutable intelligence and checkpoints outside the read-only 
   assert.match(unit, /^Environment=ZENOS_RUNTIME_CODING_CHECKPOINT_DIR=\/var\/lib\/zenos-runtime\/coding-checkpoints$/m);
   assert.match(unit, /^Environment=ZENOS_RUNTIME_CONFIG_PATH=\/var\/lib\/zenos-runtime\/models\.json$/m);
   assert.match(unit, /^Environment=ZENOS_ORCHESTRATION_MODE=host-led$/m);
-  assert.match(unit, /^Environment=ZENOS_COGNITIVE_MAX_CONTINUATIONS=6$/m);
+  assert.match(unit, /^Environment=ZENOS_COGNITIVE_MAX_CONTINUATIONS=10$/m);
   assert.match(unit, /^Environment=ZENOS_COGNITIVE_COMPACT_AT_TOKENS=140000$/m);
   assert.match(unit, /^Environment=ZENOS_HOST_CONTEXT_SOFT_LIMIT_TOKENS=140000$/m);
   assert.doesNotMatch(unit, /^Environment=ZENOS_(?:WORKER|VERIFIER|BOSS)_MODEL=/m);
