@@ -12,6 +12,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 const credentialDirectory = process.env.CREDENTIALS_DIRECTORY || '';
 const credentialFile = credentialDirectory ? path.join(credentialDirectory, 'zenos-runtime.env') : '';
@@ -33,43 +34,67 @@ const baseUrl = (process.env.ZENOS_MEMORY_BASE_URL || process.env.ZENOS_MEMORY_U
 const namespace = process.env.ZENOS_MEMORY_NAMESPACE || 'zenos';
 const outputDir = process.env.ZENOS_MEMORY_SECONDARY_BACKUP_DIR || '/var/backups/zenos-memory';
 const retention = Math.max(3, Math.min(Number(process.env.ZENOS_MEMORY_SECONDARY_BACKUP_KEEP || 14), 90));
-const masterSecret = process.env.ETLA_MASTER_SECRET || process.env.ZENOS_MEMORY_SECRET || '';
+const signingSecret = process.env.ZENOS_MEMORY_SIGNING_SECRET
+  || process.env.ZENOS_MEMORY_SECRET
+  || process.env.ETLA_MASTER_SECRET
+  || '';
+const signingKid = (process.env.ZENOS_MEMORY_SIGNING_KID || '').trim();
 const apiKey = process.env.ZENOS_MEMORY_API_KEY || '';
-const encryptionSecret = process.env.ZENOS_BACKUP_ENCRYPTION_KEY || masterSecret || apiKey;
+const encryptionSecret = process.env.ZENOS_BACKUP_ENCRYPTION_KEY || signingSecret || apiKey;
 
-if (!encryptionSecret) throw new Error('Secondary backup refused: no encryption secret is configured');
-
-function tokenHeaders(scopes = ['memory:read']) {
-  const timestamp = Date.now();
-  const nonce = crypto.randomBytes(18).toString('base64url');
+export function buildTokenExchangeHeaders({
+  secret = '',
+  kid = '',
+  scopes = ['memory:read'],
+  timestamp = Date.now(),
+  nonce = crypto.randomBytes(18).toString('base64url'),
+} = {}) {
+  if (!secret) throw new Error('Zenos Memory signing secret is not configured');
   const emptyHash = crypto.createHash('sha256').update('').digest('hex');
-  const canonical = [
-    'zenos-memory-signature-v2',
-    String(timestamp),
-    nonce,
-    'POST',
-    '/api/auth',
-    emptyHash,
-  ].join('\n');
+  const canonical = kid
+    ? [
+        'zenos-memory-signature-v3',
+        kid,
+        String(timestamp),
+        nonce,
+        'POST',
+        '/api/auth',
+        emptyHash,
+      ].join('\n')
+    : [
+        'zenos-memory-signature-v2',
+        String(timestamp),
+        nonce,
+        'POST',
+        '/api/auth',
+        emptyHash,
+      ].join('\n');
   return {
     'content-type': 'application/json',
     'x-etla-timestamp': String(timestamp),
     'x-etla-nonce': nonce,
     'x-etla-content-sha256': emptyHash,
-    'x-etla-signature': crypto.createHmac('sha256', masterSecret).update(canonical).digest('hex'),
+    'x-etla-signature': crypto.createHmac('sha256', secret).update(canonical).digest('hex'),
+    ...(kid ? { 'x-etla-kid': kid, 'x-etla-signature-version': '3' } : {}),
     'x-etla-client-id': 'zenos-secondary-backup',
     'x-etla-requested-scopes': scopes.join(' '),
   };
 }
 
-async function authorization() {
-  if (!masterSecret) {
-    if (!apiKey) throw new Error('Zenos Memory authentication is not configured');
-    return `Bearer ${apiKey}`;
+export async function authorization({
+  memoryBaseUrl = baseUrl,
+  secret = signingSecret,
+  kid = signingKid,
+  fallbackApiKey = apiKey,
+  fetchImpl = fetch,
+} = {}) {
+  if (!secret) {
+    if (!fallbackApiKey) throw new Error('Zenos Memory authentication is not configured');
+    return `Bearer ${fallbackApiKey}`;
   }
-  const response = await fetch(`${baseUrl}/api/auth`, {
+  const response = await fetchImpl(`${memoryBaseUrl}/api/auth`, {
     method: 'POST',
-    headers: tokenHeaders(),
+    headers: buildTokenExchangeHeaders({ secret, kid }),
     signal: AbortSignal.timeout(15_000),
   });
   if (!response.ok) throw new Error(`Memory token exchange failed with HTTP ${response.status}`);
@@ -77,10 +102,14 @@ async function authorization() {
   if (typeof payload.token !== 'string' || payload.token.length < 16) {
     throw new Error('Memory token exchange returned no usable token');
   }
+  if (kid && payload.kid && payload.kid !== kid) {
+    throw new Error('Memory token exchange returned a token for an unexpected signing key');
+  }
   return `Bearer ${payload.token}`;
 }
 
 function encrypt(payload) {
+  if (!encryptionSecret) throw new Error('Secondary backup refused: no encryption secret is configured');
   const plaintext = Buffer.from(JSON.stringify(payload));
   const checksum = crypto.createHash('sha256').update(plaintext).digest('hex');
   const compressed = gzipSync(plaintext, { level: 9 });
@@ -165,11 +194,16 @@ async function main() {
   }));
 }
 
-main().catch((error) => {
-  console.error(JSON.stringify({
-    ok: false,
-    service: 'zenos-memory-secondary-backup',
-    error: error instanceof Error ? error.message : String(error),
-  }));
-  process.exit(1);
-});
+const isDirectExecution = process.argv[1]
+  && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
+
+if (isDirectExecution) {
+  main().catch((error) => {
+    console.error(JSON.stringify({
+      ok: false,
+      service: 'zenos-memory-secondary-backup',
+      error: error instanceof Error ? error.message : String(error),
+    }));
+    process.exit(1);
+  });
+}
