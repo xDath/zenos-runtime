@@ -11,8 +11,9 @@ import {
   postflightGatewayTurn,
   preflightGatewayTurn,
 } from '../app/lib/gateway-orchestration';
+import { ContinuationCapsuleSchema } from '../app/lib/cognitive-task';
 import { getRuntimeSession } from '../app/lib/zenos-runtime-three-agent';
-import { resetRuntimeStoreForTests } from '../app/lib/zenos-runtime-store';
+import { getRuntimeStore, resetRuntimeStoreForTests } from '../app/lib/zenos-runtime-store';
 
 function modelResponse(content: unknown): Response {
   return Response.json({
@@ -141,6 +142,104 @@ test('native gateway direct path persists a real Runtime turn while skipping unn
     assert.equal(session?.budget.modelCallsUsed, 3);
     assert.ok(session?.events.some((event) => event.metadata.role === 'host'));
     assert.ok(session?.events.some((event) => event.metadata.role === 'worker' && event.metadata.outcome === 'skipped'));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('background research scratch scripts preserve the active root task and continue without coding fail-closed', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_input: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body || '{}')) as { model?: string };
+    if (body.model === 'runtime-host') {
+      return modelResponse(hostPlan({
+        useWorker: false,
+        rationale: 'Host continues the bounded evidence-gathering task.',
+      }));
+    }
+    throw new Error(`Unexpected model ${body.model || 'unknown'}`);
+  };
+
+  try {
+    const root = await preflightGatewayTurn({
+      request: 'telusuri graph wallet dan transaksi dua-hop sampai kandidatnya terbukti',
+      sessionId: 'hermes_long_research_scratch',
+      turnId: 'turn-research-root',
+      platform: 'telegram',
+      host: { model: 'grok', provider: 'etla-router' },
+      requiresFreshData: true,
+      intent: 'analyze',
+      modelOverrides: modelOverrides(),
+    });
+    assert.ok(root.cognitiveTaskId);
+
+    const background = await preflightGatewayTurn({
+      request: [
+        '[IMPORTANT: Background process proc_research completed normally (exit code 0).',
+        'Command: python3 /tmp/kiki_hook_cross2.py > /tmp/kiki_hook_cross2_out.txt 2>&1',
+        'Output: graph segment ready',
+        ']',
+      ].join('\n'),
+      sessionId: 'hermes_long_research_scratch',
+      turnId: 'turn-research-background',
+      platform: 'telegram',
+      host: { model: 'grok', provider: 'etla-router' },
+      intent: 'analyze',
+      modelOverrides: modelOverrides(),
+    });
+
+    assert.equal(background.cognitiveTaskId, root.cognitiveTaskId);
+    assert.notEqual(background.decision.taskType, 'coding_change');
+    const activeBeforePostflight = getRuntimeStore().getCognitiveTask(root.cognitiveTaskId || '');
+    const activeCapsule = ContinuationCapsuleSchema.parse(activeBeforePostflight?.capsule);
+    assert.equal(activeCapsule.rootObjective, 'telusuri graph wallet dan transaksi dua-hop sampai kandidatnya terbukti');
+    assert.equal(activeCapsule.maxCycles, 10);
+
+    const postflight = await postflightGatewayTurn({
+      sessionId: 'hermes_long_research_scratch',
+      runId: background.runId,
+      turnId: 'turn-research-background',
+      draft: 'Cross Hookats kelar. Kandidat belum terpin. Lanjut silent.',
+      host: background.hostOverride,
+      toolSummary: [
+        'Writing /tmp/kiki_2hop.py',
+        'terminal: failed — python3 /tmp/kiki_2hop.py exited code 1 with Traceback',
+        'terminal: passed — next graph segment collected',
+      ].join('\n'),
+      executionReceipts: [
+        {
+          receiptId: 'scratch-python-failed',
+          kind: 'tool',
+          tool: 'terminal',
+          status: 'failed',
+          command: 'python3 /tmp/kiki_2hop.py',
+          exitCode: 1,
+          summary: 'Traceback in disposable research helper',
+          changedFiles: ['/tmp/kiki_2hop.py'],
+          metadata: { mutating: true },
+        },
+        {
+          receiptId: 'research-evidence-passed',
+          kind: 'tool',
+          tool: 'terminal',
+          status: 'passed',
+          command: 'python3 /tmp/kiki_hook_cross2.py',
+          exitCode: 0,
+          summary: 'Cross-chain graph segment collected',
+          changedFiles: ['/tmp/kiki_hook_cross2_out.txt'],
+        },
+      ],
+      hostUsage: { inputTokens: 2_000, outputTokens: 180, calls: 5 },
+    });
+
+    assert.equal(postflight.ok, true);
+    assert.equal(postflight.failed, false);
+    assert.equal(postflight.transformed, false);
+    assert.equal(postflight.finalAnswer, 'Cross Hookats kelar. Kandidat belum terpin. Lanjut silent.');
+    assert.equal(postflight.continuation?.required, true);
+    assert.equal(postflight.continuation?.taskId, root.cognitiveTaskId);
+    assert.match(postflight.continuation?.reason || '', /host_interrupted|acceptance_pending/);
+    assert.doesNotMatch(postflight.finalAnswer, /mengubah source code|Runtime memblokirnya/i);
   } finally {
     globalThis.fetch = originalFetch;
   }

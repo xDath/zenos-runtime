@@ -301,8 +301,21 @@ export function compileCognitivePacket(input: {
 }): CognitivePacket {
   const capabilities = capabilitiesFor(input.request, input.decision);
   const phase = initialPhase(input.request, input.decision, input.repositoryContext);
-  const configuredCycles = Number(process.env.ZENOS_COGNITIVE_MAX_CONTINUATIONS || 6);
+  const configuredCycles = Number(process.env.ZENOS_COGNITIVE_MAX_CONTINUATIONS || 10);
   const configuredCompactAt = Number(process.env.ZENOS_COGNITIVE_COMPACT_AT_TOKENS || 140_000);
+  const taskCycleBudget = input.request.requiresFreshData
+    ? 10
+    : input.decision.useTools || capabilities.length >= 2 || input.request.estimatedContextTokens >= 20_000
+      ? 8
+      : 6;
+  const maxCycles = Math.max(
+    1,
+    Math.min(
+      Number.isFinite(configuredCycles) ? configuredCycles : 10,
+      taskCycleBudget,
+      12,
+    ),
+  );
   return CognitivePacketSchema.parse({
     version: 'zenos-cognitive-packet-v1',
     rootObjective: input.request.request,
@@ -320,8 +333,10 @@ export function compileCognitivePacket(input: {
     repositoryContextAvailable: Boolean(input.repositoryContext),
     nextAction: nextActionFor(phase, capabilities, input.decision),
     continuation: {
-      enabled: input.decision.taskType !== 'simple_chat',
-      maxCycles: Math.max(1, Math.min(Number.isFinite(configuredCycles) ? configuredCycles : 6, 12)),
+      enabled: input.decision.taskType !== 'simple_chat'
+        || input.request.requiresFreshData
+        || input.decision.useTools,
+      maxCycles,
       compactAtTokens: Math.max(8_000, Math.min(Number.isFinite(configuredCompactAt) ? configuredCompactAt : 140_000, 500_000)),
       preserveRecentMessages: 10,
       askUserOnlyForBlockingFields: true,

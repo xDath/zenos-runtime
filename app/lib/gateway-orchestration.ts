@@ -1,4 +1,5 @@
 import * as crypto from 'node:crypto';
+import * as path from 'node:path';
 import { z } from 'zod';
 import {
   RouteDecision,
@@ -220,9 +221,10 @@ const CODING_UNFINISHED_PATTERN = /\b(?:indentationerror|syntaxerror|compile\s+e
 const CODING_COMPLETED_PATTERN = /\b(?:all\s+tests?\s+passed|tests?\s+passed|validation\s+passed|typecheck\s+passed|lint\s+passed|build\s+passed|compile\s+passed|working\s+tree\s+clean|completed\s+successfully|selesai\s+dan\s+tervalidasi)\b/i;
 const CODING_FOLLOW_UP_PATTERN = /^\s*(?:tapi|dan|terus|juga|sekalian|lanjut(?:kan)?|nah|yang\s+tadi|itu|ini|gas+|soalnya|fix(?:in|kan)?|tolong\s+(?:fix|lanjut|terusin|beresin|kerjain)|beresin|kerjain|terusin|continue|resume)\b/i;
 const WORKSPACE_ROOT_PATTERN = /(?:\/srv\/etla\/workspaces|\/root\/openclaw-projects)\/[A-Za-z0-9._-]+/g;
-const HOST_CONFIRMATION_PATTERN = /(?:\b(?:gas|lanjut|continue|proceed)\??\s*$|\b(?:mau|boleh)\s+(?:gue|aku|saya)\s+(?:lanjut|fix|kerjain|restart|test)|\bwant\s+me\s+to\s+(?:continue|proceed)|\bshall\s+i\s+(?:continue|proceed))/i;
+const HOST_CONFIRMATION_PATTERN = /(?:\b(?:gas|lanjut|continue|proceed)\??\s*$|\b(?:lanjut|continue)\s+(?:silent|silently|otomatis)\b|\b(?:mau|boleh)\s+(?:gue|aku|saya)\s+(?:lanjut|fix|kerjain|restart|test)|\bwant\s+me\s+to\s+(?:continue|proceed)|\bshall\s+i\s+(?:continue|proceed))/i;
 const TOOL_EXHAUSTION_PATTERN = /(?:maximum\s+number\s+of\s+tool[- ]calling\s+iterations|tool[- ]calling\s+limit|context\s+compaction|output\s+length\s+limit|continue\s+exactly\s+where\s+you\s+left\s+off)/i;
 const COGNITIVE_CONTINUATION_PATTERN = /continue the same root task as an internal zenos cognitive runtime cycle/i;
+const BACKGROUND_PROCESS_EVENT_PATTERN = /\b(?:important:\s*)?background process\s+\S+\s+(?:completed normally|finished with exit code|is still running|matched)\b/i;
 const GENUINE_USER_INPUT_PATTERN = /(?:\b(?:missing|need|requires?)\s+(?:an?\s+)?(?:api\s+key|credential|secret|token|password|wallet\s+key|email\s+address|recipient|destination|nomor\s+tujuan|alamat\s+email)|\b(?:butuh|perlu)\s+(?:alamat\s+email|email\s+tujuan|nomor\s+tujuan|penerima|credential|api\s+key)\b|\b(?:pilih|choose|which\s+option)\b|\bexplicit\s+approval\b|\bauthori[sz]ation\s+required\b)/i;
 const MUTATING_TOOL_PATTERN = /\b(?:apply_patch|patch|edit_file|write_file|replace_in_file|str_replace|create_file|delete_file|editing|updated|modified|wrote|applied\s+patch)\b/i;
 const BROKEN_CODE_PATTERN = /\b(?:indentationerror|syntaxerror|compileerror|compile\s+error|typecheck\s+error|traceback|test(?:s)?\s+failed|lint\s+failed|build\s+failed|patch\s+failed|exit\s+(?:code\s*)?[1-9])\b/i;
@@ -328,29 +330,60 @@ function workspaceMutationObserved(
     || before.changedFiles.some((file) => !after.changedFiles.some((candidate) => candidate.path === file.path));
 }
 
+function isTemporaryScratchPath(candidate: string): boolean {
+  const normalized = path.resolve(candidate);
+  return ['/tmp', '/var/tmp', '/dev/shm'].some(root => (
+    normalized === root || normalized.startsWith(`${root}${path.sep}`)
+  ));
+}
+
+function isPathInsideWorkspace(candidate: string, workspaceRoot?: string): boolean {
+  if (!workspaceRoot) return false;
+  const root = path.resolve(workspaceRoot);
+  const resolved = path.isAbsolute(candidate)
+    ? path.resolve(candidate)
+    : path.resolve(root, candidate);
+  const relative = path.relative(root, resolved);
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function isRepositoryCodeArtifact(candidate: string, workspaceRoot?: string): boolean {
+  if (!CODE_ARTIFACT_PATTERN.test(candidate) || isTemporaryScratchPath(candidate)) return false;
+  return workspaceRoot ? isPathInsideWorkspace(candidate, workspaceRoot) : path.isAbsolute(candidate);
+}
+
 function observedCodingState(
   toolSummary: string,
   receipts: GatewayExecutionReceipt[] = [],
+  options: {
+    preflightCodingIntent?: boolean;
+    workspaceRoot?: string;
+  } = {},
 ): { mutated: boolean; broken: boolean } {
   const text = String(toolSummary || '');
-  const hasCodeArtifact = CODE_ARTIFACT_PATTERN.test(text);
-  const receiptMutation = receipts.some(receipt => (
-    receipt.changedFiles.length > 0
-    || (receipt.kind === 'workspace'
-      && Boolean(receipt.workspaceRevisionBefore)
-      && receipt.workspaceRevisionBefore !== receipt.workspaceRevisionAfter)
-    || receipt.metadata.mutating === true
+  const preflightCodingIntent = options.preflightCodingIntent === true;
+  const receiptFileMutation = receipts.some(receipt => receipt.changedFiles.some(file => (
+    isRepositoryCodeArtifact(file, options.workspaceRoot)
+  )));
+  const receiptWorkspaceMutation = receipts.some(receipt => (
+    receipt.kind === 'workspace'
+    && Boolean(receipt.workspaceRevisionBefore)
+    && receipt.workspaceRevisionBefore !== receipt.workspaceRevisionAfter
   ));
-  const textMutation = MUTATING_TOOL_PATTERN.test(text)
-    || (hasCodeArtifact && CODING_MUTATION_PATTERN.test(text));
-  const mutated = receiptMutation || textMutation;
+  const declaredMutation = preflightCodingIntent
+    && receipts.some(receipt => receipt.metadata.mutating === true);
+  const textMutation = preflightCodingIntent && (
+    MUTATING_TOOL_PATTERN.test(text)
+    || (CODE_ARTIFACT_PATTERN.test(text) && CODING_MUTATION_PATTERN.test(text))
+  );
+  const mutated = receiptFileMutation || receiptWorkspaceMutation || declaredMutation || textMutation;
   const receiptBroken = receipts.some(receipt => (
     (receipt.kind === 'validation' || receipt.kind === 'workspace')
     && (receipt.status === 'failed' || receipt.status === 'blocked')
   ));
   return {
     mutated,
-    broken: mutated && (receiptBroken || BROKEN_CODE_PATTERN.test(text)),
+    broken: mutated && (receiptBroken || (preflightCodingIntent && BROKEN_CODE_PATTERN.test(text))),
   };
 }
 
@@ -693,7 +726,9 @@ export async function preflightGatewayTurn(raw: GatewayTurnPreflightInput) {
     runId,
     packet: cognitivePacket,
     workspaceRevision: codingTask?.workspaceRevision || request.workspaceState?.dirtyDiffSha256,
-    reuseActive: deterministicContinuation || COGNITIVE_CONTINUATION_PATTERN.test(request.request),
+    reuseActive: deterministicContinuation
+      || COGNITIVE_CONTINUATION_PATTERN.test(request.request)
+      || BACKGROUND_PROCESS_EVENT_PATTERN.test(request.request),
     store,
   });
   ensureGatewaySession(input, decision, runId, {
@@ -1198,7 +1233,13 @@ export async function postflightGatewayTurn(raw: GatewayTurnPostflightInput) {
   const deterministicValidation = autonomousValidationPassed
     ? 'passed' as const
     : deterministicValidationState(request.toolSummary, request.executionReceipts);
-  const textObservedCoding = observedCodingState(request.toolSummary, request.executionReceipts);
+  const preflightCodingIntent = Boolean(stored.codingTaskId)
+    || stored.input.hasCodeChangeIntent
+    || ['coding_change', 'debugging', 'deploy_or_destructive_action'].includes(storedDecision.taskType);
+  const textObservedCoding = observedCodingState(request.toolSummary, request.executionReceipts, {
+    preflightCodingIntent,
+    workspaceRoot: stored.input.workspaceRoot,
+  });
   const workspaceMutated = workspaceMutationObserved(stored.workspaceState, request.workspaceState);
   const autonomousMutated = Boolean(
     stored.autonomousOutcome
