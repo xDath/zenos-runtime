@@ -347,7 +347,7 @@ def prepare_hermes_config(source: Path, destination: Path) -> None:
         "handoff_history_chars": 240_000,
         "handoff_max_messages": 300,
         "disable_streaming_when_verified": True,
-        "report_failures": True,
+        "report_failures": False,
         "authoritative_host": True,
         "enforce_host_token_budget": False,
         "enforce_host_working_set_limit": False,

@@ -136,6 +136,7 @@ test('deployment prepares separate least-privilege Runtime and full Hermes crede
     assert.match(preparedHermesConfig, /mode: ['"]?off['"]?/);
     assert.match(preparedHermesConfig, /cron_mode: approve/);
     assert.match(preparedHermesConfig, /hooks_auto_accept: true/);
+    assert.match(preparedHermesConfig, /report_failures: false/);
     assert.match(preparedHermesConfig, /discover_models: true/);
     assert.match(preparedHermesConfig, /\n\s+deepseek:\n/);
     assert.match(preparedHermesConfig, /\n\s+dsw\/deepseek-v4-pro:\n/);
