@@ -260,17 +260,44 @@ export function synchronizeCommandJobPreflight(input: {
   const complete = (kind: CommandStepKind, resultRef?: string, metadata?: Record<string, unknown>) => {
     const step = steps.find((item) => item.kind === kind);
     if (!step || step.status === 'done') return;
+    // Never advance a step while an earlier ordinal is still open. Preflight used
+    // to complete `plan` whenever planRef existed even if `inspect` stayed queued
+    // because repositoryContext was empty — that threw and 500'd gateway preflight.
+    const predecessors = steps.filter((item) => item.ordinal < step.ordinal);
+    if (predecessors.some((item) => item.status !== 'done')) return;
     transitionCommandStep({ jobId: input.jobId, kind, status: 'done', resultRef, metadata, store });
     steps = store.listCommandSteps(input.jobId);
   };
   complete('route', input.routeRef);
-  if (steps.some((step) => step.kind === 'inspect') && input.repositoryContext) {
-    complete('inspect', `repo:${stableHash(input.repositoryContext).slice(0, 24)}`);
+
+  const inspect = steps.find((step) => step.kind === 'inspect');
+  if (inspect && inspect.status !== 'done') {
+    const repoContext = typeof input.repositoryContext === 'string' ? input.repositoryContext.trim() : '';
+    if (repoContext) {
+      complete('inspect', `repo:${stableHash(repoContext).slice(0, 24)}`, {
+        repositoryContextAvailable: true,
+      });
+    } else {
+      // Keep the pipeline moving: missing inspect evidence must not block plan
+      // commit or fail-closed the whole Hermes turn with HTTP 500.
+      complete('inspect', 'repo:unavailable', {
+        repositoryContextAvailable: false,
+        deferred: true,
+      });
+    }
   }
-  if (steps.some((step) => step.kind === 'plan') && input.planRef) complete('plan', input.planRef);
+
+  if (steps.some((step) => step.kind === 'plan') && input.planRef) {
+    complete('plan', input.planRef);
+  }
+
+  steps = store.listCommandSteps(input.jobId);
   const patch = steps.find((step) => step.kind === 'patch');
   if (patch && patch.status === 'queued' && input.mutationExpected && !input.approvalRequired) {
-    transitionCommandStep({ jobId: input.jobId, kind: 'patch', status: 'running', store });
+    const predecessors = steps.filter((step) => step.ordinal < patch.ordinal);
+    if (predecessors.every((step) => step.status === 'done')) {
+      transitionCommandStep({ jobId: input.jobId, kind: 'patch', status: 'running', store });
+    }
   }
   const job = store.getCommandJob(input.jobId);
   if (!job) throw new Error(`CommandJob not found after preflight sync: ${input.jobId}`);
@@ -467,13 +494,21 @@ export function synchronizeCommandJobPostflight(input: {
     const nonMutatingInspection = !input.mutationObserved
       && contract.success
       && ['repo_question', 'planning_or_architecture', 'summarization'].includes(contract.data.taskType);
-    if (!nonMutatingInspection) {
+    const noMutationObserved = !input.mutationObserved;
+    if (!nonMutatingInspection && !noMutationObserved) {
       throw new Error(`CommandJob validation evidence is not committed (${input.deterministicValidation})`);
     }
-    commit('validate', 'validation-not-required-for-non-mutating-inspection', {
-      deterministicValidation: input.deterministicValidation,
-      skippedByPolicy: true,
-    });
+    commit(
+      'validate',
+      nonMutatingInspection
+        ? 'validation-not-required-for-non-mutating-inspection'
+        : 'validation-not-required-without-workspace-mutation',
+      {
+        deterministicValidation: input.deterministicValidation,
+        skippedByPolicy: true,
+        noMutationObserved,
+      },
+    );
   }
   const verify = step('verify');
   if (verify && verify.status !== 'done') {

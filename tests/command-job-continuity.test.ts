@@ -350,6 +350,54 @@ test('CommandJob is idempotent, predecessor-ordered, resumable, and evidence-gat
   assert.ok(store.listCommandSteps(first.job.jobId).every((step) => step.status === 'done'));
 });
 
+test('misclassified coding job with no workspace mutation does not throw an internal validation error', () => {
+  const store = getRuntimeStore();
+  const capsule = prepareCognitiveTask({
+    sessionId: 'command-noop-session',
+    runId: 'run-noop',
+    packet: cognitivePacket,
+    store,
+  });
+  const decision = RouteDecisionSchema.parse({
+    ...codingDecision,
+    useVerifier: false,
+    verifierTier: 'none',
+    allowEscalation: false,
+  });
+  const prepared = ensureCommandJob({
+    sessionId: 'command-noop-session',
+    userTurnId: 'turn-noop',
+    requestHash: 'd'.repeat(64),
+    capsule,
+    decision,
+    workspaceRoot: '/srv/etla/workspaces/zenos-runtime',
+    budget: { maxCycles: 6, maxModelCalls: 8, maxTokens: 120_000 },
+    store,
+  });
+  synchronizeCommandJobPreflight({
+    jobId: prepared.job.jobId,
+    routeRef: 'runtime-run:run-noop',
+    repositoryContext: 'Repository context was available.',
+    planRef: 'host-plan:run-noop',
+    mutationExpected: false,
+    approvalRequired: false,
+    store,
+  });
+
+  const completed = synchronizeCommandJobPostflight({
+    jobId: prepared.job.jobId,
+    mutationObserved: false,
+    deterministicValidation: 'unknown',
+    resultRef: 'runtime-run:run-noop',
+    store,
+  });
+
+  assert.equal(completed.status, 'completed');
+  const validation = store.listCommandSteps(prepared.job.jobId).find((step) => step.kind === 'validate');
+  assert.equal(validation?.status, 'done');
+  assert.equal((validation?.metadata as Record<string, unknown> | undefined)?.noMutationObserved, true);
+});
+
 test('CommandJob restart recovery requeues the first uncommitted step without cancelling the root task', () => {
   const directory = mkdtempSync(join(tmpdir(), 'zenos-command-restart-'));
   const databasePath = join(directory, 'runtime.db');
@@ -495,4 +543,71 @@ test('cancelling a CommandJob terminalizes every uncommitted step', () => {
   assert.ok(store.listCommandSteps(prepared.job.jobId)
     .filter((step) => step.status !== 'done')
     .every((step) => step.status === 'blocked'));
+});
+
+test('preflight with empty repositoryContext still commits inspect before plan (no 500)', () => {
+  const store = getRuntimeStore();
+  const debuggingDecision = RouteDecisionSchema.parse({
+    ...codingDecision,
+    taskType: 'debugging',
+    pipelineMode: 'grounded_path',
+    useWorker: false,
+    useVerifier: false,
+    maxWorkerCalls: 0,
+  });
+  const debugPacket = CognitivePacketSchema.parse({
+    ...cognitivePacket,
+    rootObjective: 'Debug Zenos Runtime preflight 500.',
+    taskType: 'debugging',
+    repositoryContextAvailable: false,
+    capabilities: [{
+      profile: 'ops-observer',
+      goal: 'Collect service evidence.',
+      parallelSafe: true,
+      mutating: false,
+      evidenceRequired: ['logs'],
+    }],
+    nextAction: {
+      owner: 'host',
+      instruction: 'Inspect runtime logs and recover preflight.',
+      stopCondition: 'Root cause identified and preflight healthy.',
+    },
+  });
+  const capsule = prepareCognitiveTask({
+    sessionId: 'empty-repo-preflight-session',
+    runId: 'empty-repo-preflight-run',
+    packet: debugPacket,
+    store,
+  });
+  const prepared = ensureCommandJob({
+    sessionId: 'empty-repo-preflight-session',
+    userTurnId: 'empty-repo-preflight-turn',
+    requestHash: '4'.repeat(64),
+    capsule,
+    decision: debuggingDecision,
+    workspaceRoot: '/srv/etla/workspaces/zenos-runtime',
+    budget: { maxCycles: 6, maxModelCalls: 8, maxTokens: 120_000 },
+    store,
+  });
+
+  // Historical failure mode: planRef present + empty repositoryContext left inspect
+  // queued, then complete(plan) threw predecessor error → gateway preflight HTTP 500.
+  assert.doesNotThrow(() => synchronizeCommandJobPreflight({
+    jobId: prepared.job.jobId,
+    routeRef: 'runtime-run:empty-repo-preflight-run',
+    repositoryContext: '',
+    planRef: 'deterministic-plan:empty-repo-preflight-run',
+    mutationExpected: false,
+    approvalRequired: false,
+    store,
+  }));
+
+  const steps = store.listCommandSteps(prepared.job.jobId);
+  assert.equal(steps.find((step) => step.kind === 'route')?.status, 'done');
+  assert.equal(steps.find((step) => step.kind === 'inspect')?.status, 'done');
+  assert.equal(steps.find((step) => step.kind === 'inspect')?.resultRef, 'repo:unavailable');
+  assert.equal(steps.find((step) => step.kind === 'plan')?.status, 'done');
+  assert.equal(steps.find((step) => step.kind === 'validate')?.status, 'queued');
+  assert.equal(steps.find((step) => step.kind === 'deliver')?.status, 'queued');
+  assert.equal(store.getCommandJob(prepared.job.jobId)?.status, 'running');
 });
